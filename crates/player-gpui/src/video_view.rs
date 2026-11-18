@@ -12,17 +12,26 @@
 //! ```
 
 use gpui::{
-    App, Bounds, Div, Entity, Pixels, SharedString, Stateful, canvas, div, point, prelude::*, px,
-    size,
+    App, Bounds, Div, Entity, Pixels, Rgba, SharedString, Stateful, canvas, div, point, prelude::*,
+    px, relative, size,
 };
-use player_core::SyncStats;
+use player_core::{SpectrumBars, SyncStats};
 
 use crate::VideoPlayer;
 use crate::icons::{Icon, LARGE_ICON_SIZE, icon};
 use crate::video_player::PlaybackState;
 
-/// Размер иконки-заглушки для файла без видео.
-const AUDIO_ICON_SIZE: f32 = 64.0;
+/// Отступы и пропорции визуализатора звука.
+const SPECTRUM_PADDING: f32 = 24.0;
+/// Почти вся высота окна: столбики растут от нижнего края вверх.
+const SPECTRUM_HEIGHT_RATIO: f32 = 0.9;
+const SPECTRUM_GAP: f32 = 2.0;
+/// Минимальная высота столбика: даже в тишине видна ровная полоса-основание.
+const SPECTRUM_MIN_BAR: f32 = 0.035;
+
+/// Цвета столбиков взятые с иконки приложения: оранжевый низ, жёлтый верх.
+const BAR_LOW_COLOR: u32 = 0xef_8a_2e;
+const BAR_HIGH_COLOR: u32 = 0xff_d9_3d;
 
 /// Что делает кнопка под сообщением о конце или ошибке.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +50,7 @@ enum Action {
 /// растягивает картинку. Размер и скругления задаёт вызывающий код —
 /// `.size_full()`, `.rounded_md()` и так далее.
 pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
-    let (state, has_video, has_frame, stats_text, can_retry, placeholder) = {
+    let (state, has_video, has_frame, stats_text, can_retry, placeholder, spectrum) = {
         let video = player.read(cx);
         (
             video.state(),
@@ -50,6 +59,7 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             stats_overlay(video.stats(), video.stats_visible()),
             video.can_retry(),
             describe(video.state(), video.error()),
+            video.spectrum(),
         )
     };
 
@@ -73,11 +83,9 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         .text_color(gpui::white());
 
     // Файл без видео: кадра не будет никогда, поэтому вместо чёрного поля —
-    // нота и подпись. Состояния `Idle` и `Failed` остаются текстовыми.
-    if !has_video && !matches!(state, PlaybackState::Idle | PlaybackState::Failed) {
-        let mut root = root
-            .child(icon(Icon::Note, AUDIO_ICON_SIZE, gpui::rgb(0xee_ee_ee)))
-            .child(div().text_lg().child("Аудио файл"));
+    // спектроанализатор. Состояния `Idle` и `Failed` остаются текстовыми.
+    if shows_spectrum(state, has_video) {
+        let mut root = root.child(spectrum_view(spectrum));
         if let Some(action) = action {
             root = root.child(action);
         }
@@ -146,6 +154,58 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         root = root.child(action);
     }
     root
+}
+
+/// Рисуем ли спектр: только для файла без видео и не в текстовых состояниях.
+fn shows_spectrum(state: PlaybackState, has_video: bool) -> bool {
+    !has_video && !matches!(state, PlaybackState::Idle | PlaybackState::Failed)
+}
+
+/// Визуализатор звука: столбики растут от нижнего края окна вверх, как
+/// кирпичики на иконке.
+fn spectrum_view(spectrum: Option<SpectrumBars>) -> Div {
+    let levels = spectrum.unwrap_or(SpectrumBars::ZERO);
+    let mut bars = div()
+        .w_full()
+        .h(relative(SPECTRUM_HEIGHT_RATIO))
+        .px(px(SPECTRUM_PADDING))
+        .flex()
+        .items_end()
+        .gap(px(SPECTRUM_GAP));
+
+    for level in levels.levels() {
+        bars = bars.child(
+            div()
+                .flex_1()
+                .h(relative(bar_fraction(*level)))
+                .rounded_sm()
+                .bg(bar_color(*level)),
+        );
+    }
+
+    // Абсолютное положение не зависит от выравнивания корня: основание
+    // столбиков всегда на нижнем крае окна.
+    bars.absolute().left_0().bottom_0()
+}
+
+/// Высота столбика: доля высоты ряда, всегда хотя бы видимая полоска.
+fn bar_fraction(level: f32) -> f32 {
+    level.clamp(0.0, 1.0).max(SPECTRUM_MIN_BAR)
+}
+
+/// Цвет столбика по уровню: тихие — оранжевые, громкие — жёлтые.
+fn bar_color(level: f32) -> Rgba {
+    gpui::rgb(bar_rgb(level))
+}
+
+fn bar_rgb(level: f32) -> u32 {
+    let ratio = level.clamp(0.0, 1.0);
+    let channel = |shift: u32| {
+        let low = (BAR_LOW_COLOR >> shift) & 0xff;
+        let high = (BAR_HIGH_COLOR >> shift) & 0xff;
+        (low as f32 + (high as f32 - low as f32) * ratio).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 /// Круглая кнопка «Повторить» под сообщением о завершении или ошибке.
@@ -356,5 +416,33 @@ mod tests {
     fn ready_state_has_no_placeholder_text() {
         assert!(describe(PlaybackState::Ready, None).is_none());
         assert!(describe(PlaybackState::Paused, None).is_none());
+    }
+
+    #[test]
+    fn spectrum_is_only_for_audio_files() {
+        assert!(shows_spectrum(PlaybackState::Ready, false));
+        assert!(shows_spectrum(PlaybackState::Playing, false));
+        assert!(shows_spectrum(PlaybackState::Paused, false));
+        assert!(shows_spectrum(PlaybackState::Ended, false));
+        assert!(!shows_spectrum(PlaybackState::Idle, false));
+        assert!(!shows_spectrum(PlaybackState::Failed, false));
+        assert!(!shows_spectrum(PlaybackState::Playing, true));
+    }
+
+    #[test]
+    fn silent_bars_keep_a_visible_baseline() {
+        assert_eq!(bar_fraction(-1.0), SPECTRUM_MIN_BAR);
+        assert_eq!(bar_fraction(0.0), SPECTRUM_MIN_BAR);
+        assert!(bar_fraction(0.5) > bar_fraction(0.0));
+        assert_eq!(bar_fraction(2.0), 1.0);
+    }
+
+    #[test]
+    fn bar_color_moves_from_orange_to_yellow() {
+        assert_eq!(bar_rgb(0.0), BAR_LOW_COLOR);
+        assert_eq!(bar_rgb(1.0), BAR_HIGH_COLOR);
+
+        let middle = bar_rgb(0.5);
+        assert!(middle != BAR_LOW_COLOR && middle != BAR_HIGH_COLOR);
     }
 }

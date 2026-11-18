@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::SpectrumBars;
 use crate::SyncStats;
 
 /// Что ядро сообщает UI.
@@ -16,6 +17,10 @@ pub enum Event {
     PositionChanged(Duration),
     /// Статистика синхронизации видео (этап 5).
     Stats(SyncStats),
+    /// Уровни столбиков спектроанализатора (этап 13).
+    ///
+    /// Приходят только для файла без видео и только во время воспроизведения.
+    Spectrum(SpectrumBars),
     /// Файл доигран до конца.
     Ended,
     /// Ошибка во время воспроизведения; текст готов к показу.

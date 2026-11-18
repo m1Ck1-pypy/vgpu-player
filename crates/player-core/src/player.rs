@@ -23,6 +23,9 @@ use tracing::{debug, error, info};
 
 use crate::audio::{AudioChunk, AudioDecoder};
 use crate::clock::AudioClock;
+use crate::spectrum::{
+    SAMPLE_RING_CAPACITY, SpectrumAnalyzer, SpectrumBars, SpectrumRing, SpectrumTap,
+};
 use crate::sync::{FrameAction, FrameScheduler, SyncStats, VideoTimer};
 use crate::video::{VideoDecoder, VideoFrame, VideoInfo};
 use crate::{Command, Event, PlayerError};
@@ -66,6 +69,12 @@ const MAX_FRAMES_PER_TICK: usize = 4;
 
 /// Как часто отправлять `Stats` в UI.
 const SYNC_STATS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Как часто отправлять `Spectrum` в UI.
+///
+/// 33 мс ≈ 30 кадров в секунду: столбики двигаются плавно, а цикл событий
+/// не забивается лишними перерисовками.
+const SPECTRUM_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Ручка управления воспроизведением.
 ///
@@ -425,6 +434,8 @@ fn probe_tracks(path: &Path) -> ProbedTracks {
 struct AudioSink {
     player: rodio::Player,
     _device: MixerDeviceSink,
+    /// Кольцо моно-сэмплов для визуализатора: пишет поток вывода, читает движок.
+    spectrum: Arc<SpectrumRing>,
 }
 
 impl AudioSink {
@@ -442,6 +453,7 @@ impl AudioSink {
         Ok(Self {
             player,
             _device: device,
+            spectrum: Arc::new(SpectrumRing::new(SAMPLE_RING_CAPACITY)),
         })
     }
 }
@@ -489,6 +501,11 @@ fn run_engine(
     let mut audio_chunks = 0_u64;
     // Свободные BGRA-буферы: кадр пишется в готовый, без новой аллокации.
     let mut buffer_pool: Vec<Vec<u8>> = Vec::new();
+    // Визуализатор есть только у файла без видео: у видео картинка своя.
+    let mut spectrum = spectrum_analyzer(&media);
+    let mut spectrum_cursor = 0_u64;
+    let mut spectrum_samples: Vec<f32> = Vec::new();
+    let mut last_spectrum_at = Instant::now();
 
     if let Some(duration) = media.duration() {
         let _ = events.send(Event::DurationKnown(duration));
@@ -574,6 +591,9 @@ fn run_engine(
                     &mut video_finished,
                     &mut end_reported,
                 );
+                // Старый звук в кольце к новой позиции не относится.
+                reset_spectrum(&mut spectrum, output.as_ref(), &mut spectrum_cursor, events);
+                last_spectrum_at = Instant::now();
                 report_position(
                     events,
                     current_position(clock.as_ref(), video_timer_ref(&media, &video_timer)),
@@ -601,6 +621,7 @@ fn run_engine(
                     .audio
                     .as_ref()
                     .map(|audio| AudioClock::new(audio.channels(), audio.sample_rate()));
+                spectrum = spectrum_analyzer(&media);
                 // У нового файла может быть другое разрешение: старые буферы
                 // только займут память.
                 pending_frame = None;
@@ -619,6 +640,8 @@ fn run_engine(
                     &mut video_finished,
                     &mut end_reported,
                 );
+                reset_spectrum(&mut spectrum, output.as_ref(), &mut spectrum_cursor, events);
+                last_spectrum_at = Instant::now();
                 if let Some(duration) = media.duration() {
                     let _ = events.send(Event::DurationKnown(duration));
                 }
@@ -652,6 +675,7 @@ fn run_engine(
         if let (Some(audio), Some(sink), Some(clock)) =
             (media.audio.as_mut(), output.as_ref(), clock.as_ref())
         {
+            let spectrum_tap = spectrum.as_ref().map(|_| Arc::clone(&sink.spectrum));
             while !audio_finished && sink.player.len() < QUEUED_CHUNKS {
                 match audio.next_chunk()? {
                     Some(chunk) => {
@@ -670,13 +694,33 @@ fn run_engine(
                                 "аудиоблок"
                             );
                         }
-                        sink.player.append(chunk_to_source(chunk, clock.counter())?);
+                        sink.player.append(chunk_to_source(
+                            chunk,
+                            clock.counter(),
+                            spectrum_tap.clone(),
+                        )?);
                     }
                     None => {
                         debug!("аудио закончилось");
                         audio_finished = true;
                     }
                 }
+            }
+        }
+
+        // Свежие сэмплы превращаем в столбики не чаще `SPECTRUM_INTERVAL`:
+        // декодер отдаёт блоки быстрее, чем UI успевает их нарисовать.
+        if let (Some(analyzer), Some(sink)) = (spectrum.as_mut(), output.as_ref()) {
+            if sink
+                .spectrum
+                .read(&mut spectrum_cursor, &mut spectrum_samples)
+                > 0
+            {
+                analyzer.push(&spectrum_samples);
+            }
+            if !paused && last_spectrum_at.elapsed() >= SPECTRUM_INTERVAL {
+                let _ = events.send(Event::Spectrum(analyzer.update()));
+                last_spectrum_at = Instant::now();
             }
         }
 
@@ -793,6 +837,10 @@ fn run_engine(
             info!("файл доигран до конца");
             if media.video.is_some() {
                 let _ = events.send(Event::Stats(stats.snapshot()));
+            }
+            // Столбики не должны замереть на последнем уровне.
+            if spectrum.is_some() {
+                let _ = events.send(Event::Spectrum(SpectrumBars::ZERO));
             }
             let _ = events.send(Event::Ended);
         }
@@ -951,13 +999,45 @@ fn video_timer_ref<'a>(media: &Media, timer: &'a VideoTimer) -> Option<&'a Video
     media.video.is_some().then_some(timer)
 }
 
+/// Анализатор создаётся только для файла без видео.
+///
+/// Поверх кадра визуализатор не показывается, а лишние события и FFT в цикле
+/// ядра для видео ни к чему.
+fn spectrum_analyzer(media: &Media) -> Option<SpectrumAnalyzer> {
+    if media.video.is_some() {
+        return None;
+    }
+    let audio = media.audio.as_ref()?;
+    Some(SpectrumAnalyzer::new(audio.sample_rate()))
+}
+
+/// Сбрасывает визуализатор после открытия файла или перемотки.
+///
+/// Курсор переставляется на текущую позицию записи, поэтому уже накопленный
+/// звук старой позиции в анализ не попадает.
+fn reset_spectrum(
+    analyzer: &mut Option<SpectrumAnalyzer>,
+    sink: Option<&AudioSink>,
+    cursor: &mut u64,
+    events: &Sender<Event>,
+) {
+    let Some(analyzer) = analyzer.as_mut() else {
+        return;
+    };
+    analyzer.reset();
+    if let Some(sink) = sink {
+        *cursor = sink.spectrum.latest();
+    }
+    let _ = events.send(Event::Spectrum(SpectrumBars::ZERO));
+}
+
 /// Источник звука, который считает отданные сэмплы.
 ///
 /// rodio забирает сэмплы из источника в своём потоке вывода, поэтому этот
 /// счётчик — честная мера того, что уже прозвучало: он не зависит от того,
 /// насколько декодер убежал вперёд.
 struct CountingSource {
-    inner: SamplesBuffer,
+    inner: SpectrumTap<SamplesBuffer>,
     counter: Arc<AtomicU64>,
 }
 
@@ -994,9 +1074,13 @@ impl Source for CountingSource {
 }
 
 /// Превращает блок ядра в источник звука для rodio.
+///
+/// Тап ставится здесь, между буфером и счётчиком: он видит ровно те сэмплы,
+/// которые rodio забирает на вывод, и потому столбики не убегают вперёд звука.
 fn chunk_to_source(
     chunk: AudioChunk,
     counter: Arc<AtomicU64>,
+    spectrum: Option<Arc<SpectrumRing>>,
 ) -> Result<CountingSource, PlayerError> {
     let invalid = || PlayerError::InvalidAudioParams {
         channels: chunk.channels,
@@ -1007,7 +1091,10 @@ fn chunk_to_source(
     let sample_rate = NonZeroU32::new(chunk.sample_rate).ok_or_else(invalid)?;
 
     Ok(CountingSource {
-        inner: SamplesBuffer::new(channels, sample_rate, chunk.samples),
+        inner: SpectrumTap::new(
+            SamplesBuffer::new(channels, sample_rate, chunk.samples),
+            spectrum,
+        ),
         counter,
     })
 }
@@ -1021,7 +1108,10 @@ mod tests {
         let channels = NonZeroU16::new(2).expect("два канала");
         let sample_rate = NonZeroU32::new(8_000).expect("частота");
         CountingSource {
-            inner: SamplesBuffer::new(channels, sample_rate, vec![0.5_f32; samples]),
+            inner: SpectrumTap::new(
+                SamplesBuffer::new(channels, sample_rate, vec![0.5_f32; samples]),
+                None,
+            ),
             counter,
         }
     }

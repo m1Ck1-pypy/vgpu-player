@@ -5,7 +5,8 @@
 //! - [`VideoPlayer`] — сущность GPUI (`Entity<VideoPlayer>`) с состоянием и
 //!   командами; сама общается с ядром `player-core`;
 //! - [`video_view`] — виджет кадра; возвращает обычный `Div`, поэтому
-//!   стилизуется как любой элемент;
+//!   стилизуется как любой элемент; для файла без видео рисует
+//!   спектроанализатор.
 //! - [`controls_view`] — необязательная панель с кнопками-иконками
 //!   (Play/Pause, звук, fullscreen) и слайдерами.
 //!
@@ -53,8 +54,8 @@ pub use gpui;
 /// показать своё окно с плеером.
 pub use gpui_platform;
 
-/// Типы метаданных файла, которые возвращает [`VideoPlayer::media_info`].
-pub use player_core::{AudioTrackInfo, MediaInfo, VideoTrackInfo};
+/// Типы, которые возвращает [`VideoPlayer`]: метаданные файла и уровни спектра.
+pub use player_core::{AudioTrackInfo, MediaInfo, SPECTRUM_BARS, SpectrumBars, VideoTrackInfo};
 
 mod app;
 mod controls;

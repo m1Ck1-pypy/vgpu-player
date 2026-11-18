@@ -32,8 +32,6 @@ pub(crate) enum Icon {
     Mute,
     /// Ещё (три точки) — меню панели.
     More,
-    /// Нота — заглушка для файла без видео.
-    Note,
     /// Развернуть на весь экран (уголки наружу).
     Fullscreen,
     /// Выйти из полноэкранного режима (уголки внутрь).
@@ -53,7 +51,6 @@ impl Icon {
             Self::Volume => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M4 9.5h3.2L12 5.4v13.2L7.2 14.5H4z"/><path d="M15.5 8.7a4.6 4.6 0 0 1 0 6.6" fill="none" stroke="#000" stroke-width="1.9" stroke-linecap="round"/><path d="M18.2 6.2a8 8 0 0 1 0 11.6" fill="none" stroke="#000" stroke-width="1.9" stroke-linecap="round"/></svg>"##,
             Self::Mute => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M4 9.5h3.2L12 5.4v13.2L7.2 14.5H4z"/><path d="M15.8 9.5l5 5m0-5-5 5" fill="none" stroke="#000" stroke-width="1.9" stroke-linecap="round"/></svg>"##,
             Self::More => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>"#,
-            Self::Note => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><ellipse cx="8" cy="17" rx="3.6" ry="2.8"/><rect x="10.6" y="4.5" width="1.8" height="12.6" rx="0.9"/><path d="M12.4 4.5c3 .9 4.4 2.7 4.4 5.2 0 .9-.2 1.7-.5 2.4-.2-1.7-1.3-2.9-3.9-3.5z"/></svg>"#,
             Self::Fullscreen => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M9 4H5.5A1.5 1.5 0 0 0 4 5.5V9" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##,
             Self::FullscreenExit => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M9 4v3.5A1.5 1.5 0 0 1 7.5 9H4" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 4v3.5A1.5 1.5 0 0 0 16.5 9H20" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 15h-3.5A1.5 1.5 0 0 0 15 16.5V20" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15h3.5A1.5 1.5 0 0 1 9 16.5V20" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##,
         }
@@ -73,14 +70,13 @@ pub(crate) fn icon(kind: Icon, size: f32, color: Rgba) -> Svg {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 9] = [
+    const ALL: [Icon; 8] = [
         Icon::Play,
         Icon::Pause,
         Icon::Replay,
         Icon::Volume,
         Icon::Mute,
         Icon::More,
-        Icon::Note,
         Icon::Fullscreen,
         Icon::FullscreenExit,
     ];

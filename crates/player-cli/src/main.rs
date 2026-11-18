@@ -183,6 +183,8 @@ fn play(path: &Path) -> anyhow::Result<()> {
                     return Err(anyhow::Error::msg(message));
                 }
                 Event::Stats(stats) => last_stats = Some(stats),
+                // CLI не рисует визуализатор: уровни нужны только окну.
+                Event::Spectrum(_) => {}
             }
         }
 

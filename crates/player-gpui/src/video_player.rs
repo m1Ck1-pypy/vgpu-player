@@ -13,7 +13,8 @@ use gpui::{
     PathPromptOptions, Pixels, Size, Task, WeakEntity, Window, point, size,
 };
 use player_core::{
-    Command, Event, MediaInfo, Player, SyncStats, VideoFrame, VideoInfo, preview_frame,
+    Command, Event, MediaInfo, Player, SpectrumBars, SyncStats, VideoFrame, VideoInfo,
+    preview_frame,
 };
 use tracing::{error, info};
 
@@ -80,6 +81,10 @@ pub struct VideoPlayer {
     frame_serial: u64,
     texture: Option<VideoTexture>,
     stats: Option<SyncStats>,
+    /// Последние уровни спектроанализатора (файлы без видео).
+    ///
+    /// Ядро присылает их ~30 раз в секунду; UI только рисует.
+    spectrum: Option<SpectrumBars>,
     /// Показывать ли оверлей статистики поверх кадра.
     ///
     /// Это настройка представления, а не воспроизведения: она живёт в плеере,
@@ -125,6 +130,7 @@ impl VideoPlayer {
             frame_serial: 0,
             texture: None,
             stats: None,
+            spectrum: None,
             stats_visible: false,
             fullscreen: false,
             volume_hover: None,
@@ -166,6 +172,7 @@ impl VideoPlayer {
                 self.media_info = Some(core.media_info().clone());
                 self.reset_video();
                 self.stats = None;
+                self.spectrum = None;
                 self.core = Some(core);
                 self.state = PlaybackState::Ready;
                 self.duration = None;
@@ -198,6 +205,7 @@ impl VideoPlayer {
                 self.media_info = None;
                 self.reset_video();
                 self.stats = None;
+                self.spectrum = None;
                 self.state = PlaybackState::Failed;
                 self.error = Some(open_error.to_string());
             }
@@ -331,6 +339,7 @@ impl VideoPlayer {
             self.media_info = None;
             self.reset_video();
             self.stats = None;
+            self.spectrum = None;
             cx.notify();
         }
     }
@@ -402,6 +411,14 @@ impl VideoPlayer {
     /// Последняя статистика синхронизации, если ядро её прислало.
     pub fn stats(&self) -> Option<SyncStats> {
         self.stats
+    }
+
+    /// Последние уровни спектроанализатора.
+    ///
+    /// `None` — данных ещё нет (файл не открыт, видеофайл или тишина до первого
+    /// события). Для файла без видео уровни приходят во время воспроизведения.
+    pub fn spectrum(&self) -> Option<SpectrumBars> {
+        self.spectrum
     }
 
     /// Показывается ли оверлей статистики.
@@ -657,6 +674,7 @@ impl VideoPlayer {
                 Event::DurationKnown(duration) => self.duration = Some(duration),
                 Event::PositionChanged(position) => self.position = position,
                 Event::Stats(stats) => self.stats = Some(stats),
+                Event::Spectrum(bars) => self.spectrum = Some(bars),
                 Event::Ended => {
                     info!("воспроизведение завершено");
                     self.state = PlaybackState::Ended;
