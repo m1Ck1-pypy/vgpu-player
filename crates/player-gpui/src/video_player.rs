@@ -94,6 +94,11 @@ pub struct VideoPlayer {
     /// процента в подсказке. `None` — курсор вне ползунка.
     volume_hover: Option<f32>,
     muted: bool,
+    /// Начинать воспроизведение сразу после открытия файла.
+    ///
+    /// Настройка поведения, а не конкретного файла: живёт в памяти процесса и
+    /// меняется пунктом меню «Запускать сразу».
+    autoplay: bool,
     /// Позиция, выбранная на полосе прогресса, но ещё не отправленная в ядро.
     scrub: Option<Duration>,
     volume_scrubbing: bool,
@@ -124,6 +129,7 @@ impl VideoPlayer {
             fullscreen: false,
             volume_hover: None,
             muted: false,
+            autoplay: true,
             scrub: None,
             volume_scrubbing: false,
             progress_bounds: None,
@@ -132,7 +138,7 @@ impl VideoPlayer {
         }
     }
 
-    /// Создаёт сущность сразу с открытым файлом.
+    /// Создаёт сущность сразу с открытым файлом и запускает воспроизведение.
     ///
     /// Ошибка открытия не паникует: она попадает в [`Self::error`] и в
     /// [`PlaybackState::Failed`], чтобы приложение могло её показать.
@@ -145,7 +151,7 @@ impl VideoPlayer {
         })
     }
 
-    /// Открывает (или меняет) файл.
+    /// Открывает (или меняет) файл и сразу начинает воспроизведение.
     ///
     /// Путь запоминается в любом случае: после ошибки пользователь может
     /// повторить открытие той же кнопкой, не вызывая диалог.
@@ -166,8 +172,20 @@ impl VideoPlayer {
                 self.position = Duration::ZERO;
                 self.error = None;
 
-                // Ядро декодирует видео только по `Play`, поэтому первый кадр
-                // для превью берём сами — один раз при открытии.
+                // Новое ядро начинает со своей громкости: переносим уровень
+                // из UI (с учтённым mute), иначе смена файла его сбрасывала.
+                self.send(Command::SetVolume(self.engine_volume()), cx);
+
+                // Файл открывают, чтобы его посмотреть: при включённой настройке
+                // команду `Play` шлём сразу, без ожидания кнопки. Так ведут
+                // себя все пути открытия — двойной клик и «Открыть с помощью»
+                // (§15.5), drop, диалог.
+                if self.autoplay {
+                    self.play(cx);
+                }
+
+                // Пока ядро раскручивается, показываем первый кадр, чтобы окно
+                // не оставалось чёрным.
                 if let Some(frame) = preview_frame(&path) {
                     self.frame = Some(frame);
                     self.frame_serial = self.frame_serial.wrapping_add(1);
@@ -287,11 +305,16 @@ impl VideoPlayer {
     ///
     /// Значения вне `[0, 1]` и `NaN` отбрасываются, а не обрезаются молча:
     /// у вызывающего кода должен быть предсказуемый диапазон.
+    ///
+    /// Громкость запоминается и без открытого файла: новое ядро получит её при
+    /// `Open`, поэтому уровень не сбрасывается при смене файла, а сохранённую
+    /// настройку можно применить до открытия.
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
             return;
         }
-        if self.send(Command::SetVolume(volume), cx) {
+        self.send(Command::SetVolume(volume), cx);
+        if self.volume != volume {
             self.volume = volume;
             cx.notify();
         }
@@ -384,6 +407,27 @@ impl VideoPlayer {
     /// Показывается ли оверлей статистики.
     pub fn stats_visible(&self) -> bool {
         self.stats_visible
+    }
+
+    /// Включено ли автовоспроизведение при открытии файла.
+    pub fn autoplay(&self) -> bool {
+        self.autoplay
+    }
+
+    /// Включает и выключает автовоспроизведение.
+    ///
+    /// Новое значение действует со следующего открытия файла: текущее
+    /// воспроизведение не останавливается и не запускается.
+    pub fn set_autoplay(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.autoplay != enabled {
+            self.autoplay = enabled;
+            cx.notify();
+        }
+    }
+
+    /// Переключает автовоспроизведение (пункт меню «⋯»).
+    pub fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
+        self.set_autoplay(!self.autoplay, cx);
     }
 
     /// Включает и выключает оверлей статистики.
@@ -569,6 +613,11 @@ impl VideoPlayer {
         let volume = ratio_at(bounds, x);
         self.muted = false;
         self.set_volume(volume, cx);
+    }
+
+    /// Громкость, которую надо отдать ядру с учётом выключенного звука.
+    fn engine_volume(&self) -> f32 {
+        if self.muted { 0.0 } else { self.volume }
     }
 
     /// Отправляет команду ядру; при ошибке переводит плеер в `Failed`.

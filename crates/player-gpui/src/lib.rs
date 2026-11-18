@@ -59,6 +59,7 @@ pub use player_core::{AudioTrackInfo, MediaInfo, VideoTrackInfo};
 mod app;
 mod controls;
 mod icons;
+mod settings;
 mod video_player;
 mod video_view;
 

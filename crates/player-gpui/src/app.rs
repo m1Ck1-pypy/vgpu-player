@@ -20,10 +20,11 @@ use gpui::{
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use player_core::{FfmpegVersions, MediaInfo};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::controls::{format_clock, volume_percent};
 use crate::icons::{ICON_SIZE, Icon, icon};
+use crate::settings::Settings;
 use crate::{VideoPlayer, controls_view, video_view};
 
 /// Заголовок окна.
@@ -113,6 +114,14 @@ struct PlayerWindow {
     file_info_open: bool,
     /// Скрывать панель управления после бездействия (пункт меню).
     auto_hide_enabled: bool,
+    /// Файл настроек; `None` — каталог пользователя не определить, и тогда
+    /// настройки живут только в памяти.
+    settings_path: Option<PathBuf>,
+    /// Снимок, который уже лежит в файле (или загружен из него).
+    ///
+    /// Нужен, чтобы не писать файл на каждый клик и каждый шаг колесом, когда
+    /// значение не изменилось.
+    saved_settings: Settings,
     /// Версии FFmpeg спрашиваем один раз при старте: они нужны «О программе».
     versions: FfmpegVersions,
     /// Над окном сейчас тащат файлы: показываем подсказку «отпустите файл».
@@ -128,10 +137,24 @@ struct PlayerWindow {
 
 impl PlayerWindow {
     fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let player = match path {
-            Some(path) => VideoPlayer::create(path, cx),
-            None => cx.new(VideoPlayer::new),
-        };
+        let settings_path = Settings::default_path();
+        let settings = settings_path
+            .as_deref()
+            .map(Settings::load)
+            .unwrap_or_default();
+
+        // Настройки применяем до открытия файла: иначе автовоспроизведение
+        // успело бы сработать с умолчаниями.
+        let player = cx.new(VideoPlayer::new);
+        player.update(cx, |video, cx| {
+            video.set_autoplay(settings.autoplay, cx);
+            video.set_stats_visible(settings.stats_visible, cx);
+            video.set_volume(settings.volume, cx);
+        });
+        if let Some(path) = path {
+            player.update(cx, |video, cx| video.open(path, cx));
+        }
+
         let focus_handle = cx.focus_handle();
         let auto_hide = spawn_auto_hide(cx);
 
@@ -143,7 +166,9 @@ impl PlayerWindow {
             menu_open: false,
             about_open: false,
             file_info_open: false,
-            auto_hide_enabled: true,
+            auto_hide_enabled: settings.auto_hide,
+            settings_path,
+            saved_settings: settings,
             versions: FfmpegVersions::detect(),
             dragging: false,
             skip_next_click: false,
@@ -151,6 +176,37 @@ impl PlayerWindow {
             last_activity: Instant::now(),
             _auto_hide: auto_hide,
         }
+    }
+
+    /// Записывает текущие настройки в файл.
+    ///
+    /// Вызывается после каждого изменения настроек — из меню и из изменения
+    /// громкости; лишних записей нет, потому что совпадение со снимком в файле
+    /// проверяется до записи. Ошибка записи не мешает воспроизведению: она
+    /// только логируется, каталог пользователя может быть недоступен.
+    fn save_settings(&mut self, cx: &App) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        // Значения копируем, чтобы не держать заимствование плеера на записи.
+        let (autoplay, stats_visible, volume) = {
+            let video = self.player.read(cx);
+            (video.autoplay(), video.stats_visible(), video.volume())
+        };
+        let settings = Settings {
+            autoplay,
+            stats_visible,
+            auto_hide: self.auto_hide_enabled,
+            volume,
+        };
+        if settings == self.saved_settings {
+            return;
+        }
+        if let Err(error) = settings.save(&path) {
+            warn!(path = %path.display(), %error, "не удалось сохранить настройки");
+            return;
+        }
+        self.saved_settings = settings;
     }
 
     /// Отмечает активность пользователя и возвращает панель.
@@ -190,6 +246,10 @@ impl PlayerWindow {
             video.finish_scrub(cx);
             video.finish_volume(cx);
         });
+        // Громкость сохраняется здесь, а не по флагу перетаскивания: дочерний
+        // слайдер мог уже снять флаг в своём `on_mouse_up`, а этот обработчик
+        // вызывается после него. Запись пропускается, если ничего не менялось.
+        self.save_settings(cx);
     }
 
     fn handle_key_down(
@@ -285,6 +345,9 @@ impl PlayerWindow {
         if let Some(volume) = stepped {
             self.volume_notice = Some((volume, Instant::now()));
             cx.notify();
+            // Громкость колесом сохраняем сразу: окно могут закрыть раньше,
+            // чем истечёт плашка.
+            self.save_settings(cx);
         }
     }
 
@@ -323,6 +386,7 @@ impl PlayerWindow {
     fn toggle_stats(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.close_menu(cx);
         self.player.update(cx, |video, cx| video.toggle_stats(cx));
+        self.save_settings(cx);
     }
 
     /// Меню → «О программе».
@@ -347,6 +411,17 @@ impl PlayerWindow {
     fn toggle_auto_hide(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.auto_hide_enabled = !self.auto_hide_enabled;
         self.close_menu(cx);
+        self.save_settings(cx);
+    }
+
+    /// Меню → «Запускать сразу».
+    ///
+    /// Настройка живёт в `VideoPlayer`: её читают все пути открытия файла.
+    fn toggle_autoplay(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.player
+            .update(cx, |video, cx| video.toggle_autoplay(cx));
+        self.close_menu(cx);
+        self.save_settings(cx);
     }
 
     /// Перематывает на шаг вперёд или назад, не выходя за границы файла.
@@ -491,6 +566,7 @@ impl PlayerWindow {
     /// абсолютное позиционирование.
     fn menu_panel(&self, cx: &mut Context<Self>) -> Div {
         let stats_visible = self.player.read(cx).stats_visible();
+        let autoplay = self.player.read(cx).autoplay();
         let has_file = self.player.read(cx).media_info().is_some();
 
         let mut items = div()
@@ -529,6 +605,12 @@ impl PlayerWindow {
                 stats_item_label(stats_visible),
                 Some(stats_visible),
                 cx.listener(PlayerWindow::toggle_stats),
+            ))
+            .child(menu_item(
+                "vgpu-menu-autoplay",
+                "Запускать сразу",
+                Some(autoplay),
+                cx.listener(PlayerWindow::toggle_autoplay),
             ))
             .child(menu_item(
                 "vgpu-menu-about",
