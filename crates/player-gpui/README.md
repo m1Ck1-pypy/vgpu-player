@@ -3,27 +3,28 @@
 Библиотека UI видеоплеера на [GPUI](https://github.com/longbridge/gpui-fast)
 (`gpui-fast`). Внутри — три независимые части:
 
-| Часть                        | Что делает                                                                        |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| `VideoPlayer`                | сущность GPUI: состояние воспроизведения и команды, сама общается с `player-core` |
-| `video_view(&player, cx)`    | виджет кадра; возвращает обычный `Div`, поэтому стилизуется как любой элемент     |
-| `controls_view(&player, cx)` | необязательная панель: кнопки-иконки (play/pause, звук, fullscreen) и слайдеры    |
+| Часть                        | Что делает                                                                                                             |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `VideoPlayer`                | сущность GPUI: состояние воспроизведения и команды, сама общается с `player-core`                                      |
+| `video_view(&player, cx)`    | виджет кадра; возвращает обычный `Div`, поэтому стилизуется как любой элемент; для файла без видео — спектроанализатор |
+| `controls_view(&player, cx)` | необязательная панель: кнопки-иконки (play/pause, звук, fullscreen) и слайдеры                                         |
 
 Движок (`player-core`) — отдельный крейт без GPUI: демультиплексирование,
 декодирование, часы и синхронизация.
 
 ## Состояние
 
-Реализованы этапы 0–11: звук и видео, A/V-синхронизация по аудио-часам,
+Реализованы этапы 0–13: звук и видео, A/V-синхронизация по аудио-часам,
 перемотка, громкость, fullscreen, горячие клавиши, состояния ошибки/завершения
 с кнопкой «Повторить», пул буферов кадров и открытие файла через системный
 диалог GPUI по `O`/`Ctrl+O`, из меню и перетаскиванием в окно — без `rfd`.
 Кнопки панели и оверлея — иконки (встроенные монохромные SVG); файл без видео
-показывает ноту и «Аудио файл». Открытый файл сразу играет (`autoplay`, по
-умолчанию `true`; `set_autoplay(false)` — открывать на паузе с превью первого
-кадра). В демо-окне есть меню «⋯»: открыть файл, информация о файле, оверлей
-статистики, «Запускать сразу», «О программе» с версиями FFmpeg из рантайма,
-автоскрытие панели.
+показывает спектроанализатор — 48 логарифмических столбиков в цветах иконки
+приложения, с компенсацией наклона спектра. Открытый файл сразу играет
+(`autoplay`, по умолчанию `true`; `set_autoplay(false)` — открывать на паузе с
+превью первого кадра). В демо-окне есть меню «⋯»: открыть файл, информация о
+файле, оверлей статистики, «Запускать сразу», «О программе» с версиями FFmpeg
+из рантайма, автоскрытие панели.
 
 Готовая обёртка [`run_app`] хранит автовоспроизведение, оверлей, автоскрытие и
 громкость в `%APPDATA%\vgpu-player\settings.cfg`; чужому приложению это не
@@ -167,6 +168,7 @@ fn read_state(player: &Entity<VideoPlayer>, cx: &App) {
     let _state = video.state();
     let _position = video.position();
     let _duration = video.duration();
+    let _spectrum = video.spectrum(); // Some(SpectrumBars) для файла без видео
 }
 ```
 
@@ -212,26 +214,27 @@ impl Screen {
 
 Сущность `VideoPlayer`:
 
-| Группа     | Методы                                                                                                                         |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Создание   | `new(cx)`, `create(path, cx)`                                                                                                  |
-| Открытие   | `open(path, cx)`, `open_dialog(cx)`, `open_dropped(paths, cx)`                                                                 |
-| Управление | `play`, `pause`, `toggle_playback`, `seek`, `set_volume`, `toggle_mute`, `restart`, `retry`, `stop`                            |
-| Чтение     | `state`, `position`, `duration`, `volume`, `muted`, `path`, `video_info`, `media_info`, `frame`, `stats`, `error`, `can_retry` |
-| Статистика | `stats_visible`, `set_stats_visible`, `toggle_stats`                                                                           |
-| Окно       | `fullscreen`, `set_fullscreen(bool, cx)` — иконка кнопки в `controls_view`                                                     |
+| Группа     | Методы                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Создание   | `new(cx)`, `create(path, cx)`                                                                                                              |
+| Открытие   | `open(path, cx)`, `open_dialog(cx)`, `open_dropped(paths, cx)`                                                                             |
+| Управление | `play`, `pause`, `toggle_playback`, `seek`, `set_volume`, `toggle_mute`, `restart`, `retry`, `stop`                                        |
+| Чтение     | `state`, `position`, `duration`, `volume`, `muted`, `path`, `video_info`, `media_info`, `frame`, `stats`, `spectrum`, `error`, `can_retry` |
+| Статистика | `stats_visible`, `set_stats_visible`, `toggle_stats`                                                                                       |
+| Окно       | `fullscreen`, `set_fullscreen(bool, cx)` — иконка кнопки в `controls_view`                                                                 |
 
 Функции и типы:
 
-| Экспорт                                         | Назначение                                                              |
-| ----------------------------------------------- | ----------------------------------------------------------------------- |
-| `video_view(&player, cx)`                       | кадр с letterbox, превью, оверлеем статистики и кнопкой «Повторить»     |
-| `controls_view(&player, cx)`                    | готовая панель с кнопками-иконками (включая fullscreen) и слайдерами    |
-| `run_app(Option<PathBuf>)`                      | готовое демо-окно — для бинарника и примеров                            |
-| `PlaybackState`                                 | `Idle`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()` |
-| `MediaInfo`, `VideoTrackInfo`, `AudioTrackInfo` | метаданные открытого файла: контейнер, кодеки, параметры дорожек        |
-| `LaunchError`, `WINDOW_TITLE`                   | ошибка запуска окна и заголовок демо-окна                               |
-| `gpui`, `gpui_platform`                         | реэкспорт, чтобы у библиотеки и потребителя была одна версия GPUI       |
+| Экспорт                                         | Назначение                                                                                                   |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `video_view(&player, cx)`                       | кадр с letterbox, превью, оверлеем статистики и кнопкой «Повторить»; для файла без видео — спектроанализатор |
+| `controls_view(&player, cx)`                    | готовая панель с кнопками-иконками (включая fullscreen) и слайдерами                                         |
+| `run_app(Option<PathBuf>)`                      | готовое демо-окно — для бинарника и примеров                                                                 |
+| `PlaybackState`                                 | `Idle`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()`                                      |
+| `SpectrumBars`, `SPECTRUM_BARS`                 | уровни визуализатора: 48 чисел `0…1`; `SpectrumBars::levels()`                                               |
+| `MediaInfo`, `VideoTrackInfo`, `AudioTrackInfo` | метаданные открытого файла: контейнер, кодеки, параметры дорожек                                             |
+| `LaunchError`, `WINDOW_TITLE`                   | ошибка запуска окна и заголовок демо-окна                                                                    |
+| `gpui`, `gpui_platform`                         | реэкспорт, чтобы у библиотеки и потребителя была одна версия GPUI                                            |
 
 ## Примеры
 
@@ -257,13 +260,13 @@ cargo run -p player-gpui --example embed_in_app -- assets/test/sync_test.mp4
 
 1. Поставить тег, чтобы зависимость была воспроизводимой:
    ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.2.1
+   git push origin v0.2.1
    ```
 2. В чужом проекте подключить тег (предпочтительно) или ветку:
    ```toml
    [dependencies]
-   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.2.0", package = "player-gpui" }
+   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.2.1", package = "player-gpui" }
    # или
    player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", branch = "main", package = "player-gpui" }
    ```
