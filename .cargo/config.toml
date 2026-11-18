@@ -1,0 +1,18 @@
+# Локальные настройки сборки.
+#
+# FFmpeg для разработки ставится через vcpkg в .tools/vcpkg: там лежат
+# заголовки, .lib и .pc-файлы. Каталог .tools/ в git не попадает и на каждой
+# машине создаётся заново:
+#   git clone --depth 1 https://github.com/microsoft/vcpkg.git .tools/vcpkg
+#   .tools/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+#   .tools/vcpkg/vcpkg install ffmpeg --triplet x64-windows
+#
+# PKG_CONFIG_PATH нужен ffmpeg-sys-next, чтобы найти libavcodec и остальные
+# библиотеки. Путь относителен корня воркспейса.
+#
+# Сборка динамическая, поэтому DLL FFmpeg должны лежать рядом с бинарниками.
+# После первого клонирования и после `cargo clean`:
+#   cp .tools/vcpkg/installed/x64-windows/bin/*.dll target/debug/
+#   cp .tools/vcpkg/installed/x64-windows/bin/*.dll target/debug/deps/
+[env]
+PKG_CONFIG_PATH = { value = ".tools/vcpkg/installed/x64-windows/lib/pkgconfig", relative = true }

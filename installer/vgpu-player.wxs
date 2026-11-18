@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Build from the repository root:
+       .tools\wix\candle.exe -arch x64 -dSourceDir=dist\vgpu-player -o target\wix\ installer\vgpu-player.wxs installer\AppFiles.wxs
+       .tools\wix\light.exe -ext .tools\wix\WixUIExtension.dll -pdbout target\wix\vgpu-player.wixpdb -o dist\vgpu-player-0.1.0.msi target\wix\vgpu-player.wixobj target\wix\AppFiles.wixobj
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="VGPU Player"
+        Language="1033"
+        Version="0.1.0"
+        Manufacturer="VGPU Player"
+        UpgradeCode="{C2D7A4F0-5B8E-4A31-9C6D-3F1E8B2A7D90}"
+    >
+        <Package
+            InstallerVersion="500"
+            Compressed="yes"
+            InstallScope="perUser"
+            Platform="x64"
+        />
+
+        <MajorUpgrade
+            DowngradeErrorMessage="A newer version of VGPU Player is already installed."
+        />
+        <MediaTemplate EmbedCab="yes" />
+
+        <Icon Id="AppIcon" SourceFile="assets\app-icon.ico" />
+        <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="LocalAppDataFolder">
+                <Directory Id="INSTALLFOLDER" Name="vgpu-player" />
+            </Directory>
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="VGPU Player" />
+            </Directory>
+        </Directory>
+
+        <DirectoryRef Id="ApplicationProgramsFolder">
+            <Component
+                Id="StartMenuShortcut"
+                Guid="{6A1E3C8B-2F47-4D95-B8A0-1C5E7D9F2A31}"
+            >
+                <Shortcut
+                    Id="StartMenuShortcut"
+                    Name="VGPU Player"
+                    Target="[INSTALLFOLDER]player-app.exe"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon"
+                />
+                <RemoveFolder
+                    Id="RemoveApplicationProgramsFolder"
+                    On="uninstall"
+                />
+                <RegistryValue
+                    Root="HKCU"
+                    Key="Software\vgpu-player"
+                    Name="StartMenuShortcut"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes"
+                />
+            </Component>
+        </DirectoryRef>
+
+        <Feature Id="MainFeature" Title="VGPU Player" Level="1">
+            <ComponentGroupRef Id="AppFiles" />
+            <ComponentRef Id="StartMenuShortcut" />
+        </Feature>
+
+        <UIRef Id="WixUI_Minimal" />
+    </Product>
+</Wix>

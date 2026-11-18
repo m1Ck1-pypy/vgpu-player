@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/player-core",
+    "crates/player-gpui",
+    "crates/player-cli",
+    "crates/player-app",
+]
+default-members = ["crates/player-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/m1Ck1-pypy/vgpu-player"
+publish = false
+
+[workspace.dependencies]
+# --- внутренние крейты ---
+player-core = { path = "crates/player-core" }
+player-gpui = { path = "crates/player-gpui" }
+
+# # --- UI (этап 0+): GPUI Fast как drop-in замена upstream gpui ---
+# Фичи wayland/x11 включаются только в player-gpui под cfg(target_os = "linux"):
+# на Windows и macOS этих бэкендов нет.
+gpui = { package = "gpui-fast", version = "0.1.16" }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.16" }
+#
+# # --- аудио (этапы 1-2) ---
+# rodio — только вывод звука. Его собственные декодеры выключены: демаксинг и
+# декодирование делаем сами через Symphonia, иначе не получим свои часы и
+# синхронизацию с видео (этапы 2-5).
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
+symphonia = { version = "0.5.5", features = ["all"] }
+#
+# # --- видео (этап 3+) ---
+# Сборка требует dev-библиотек FFmpeg 9 (заголовки + .lib).
+# На Windows они ставятся через vcpkg в .tools/ (см. .cargo/config.toml).
+# ffmpeg-next собирается в библиотеку с именем `ffmpeg`, поэтому и ключ
+# зависимости называем так же: код использует `ffmpeg::...` без переименований.
+ffmpeg = { package = "ffmpeg-next", version = "9.1" }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+] } # PNG-дампы кадров для тестов
+#
+# # --- общее ---
+crossbeam-channel = "0.5" # каналы команд/событий/кадров
+thiserror = "2" # ошибки библиотек (этап 7)
+anyhow = "1" # ошибки в бинарниках (этап 7)
+tracing = "0.1" # логи через фасад в библиотеках (этап 7)
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+] } # подписчик только в бинарниках
+# clap = { version = "4", features = ["derive"] }  # CLI
+# rfd = "0.15"                                     # диалог выбора файла (этап 9); версию уточни через cargo add
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Без оптимизации декодеры в debug слишком медленные: звук будет щёлкать, видео тормозить
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1         # символы для профилирования

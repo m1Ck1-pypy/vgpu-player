@@ -1,0 +1,21 @@
+[package]
+name = "player-app"
+description = "Демонстрационное приложение плеера на библиотеке player-gpui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+player-gpui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+embed-resource = "3"

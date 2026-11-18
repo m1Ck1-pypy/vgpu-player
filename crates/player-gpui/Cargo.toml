@@ -1,0 +1,23 @@
+[package]
+name = "player-gpui"
+description = "Слой представления плеера на GPUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+player-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# wayland и x11 — это Linux-бэкенды; на других платформах фичи не включаются.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }

@@ -1,0 +1,1091 @@
+//! Демонстрационное окно и запуск приложения.
+//!
+//! Это удобная обёртка для бинарника и пример того, как собрать плеер из
+//! библиотечных частей. Чужому приложению она не обязательна: достаточно
+//! [`crate::VideoPlayer`], [`crate::video_view`] и, при желании,
+//! [`crate::controls_view`].
+//!
+//! Здесь же живут вещи уровня окна: горячие клавиши, fullscreen и автоскрытие
+//! панели управления.
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use gpui::{
+    App, AsyncApp, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, ExternalPaths,
+    FileDropEvent, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollDelta, ScrollEvent, SharedString, Stateful, Task,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+};
+use player_core::{FfmpegVersions, MediaInfo};
+use tracing::{debug, error, info};
+
+use crate::controls::{format_clock, volume_percent};
+use crate::icons::{ICON_SIZE, Icon, icon};
+use crate::{VideoPlayer, controls_view, video_view};
+
+/// Заголовок окна.
+///
+/// Отображаемое имя продукта; имена файлов, каталогов и крейтов остаются
+/// `vgpu-player`, чтобы не ломать пути и артефакты сборки.
+pub const WINDOW_TITLE: &str = "VGPU Player";
+
+/// Через сколько бездействия панель управления скрывается.
+const AUTO_HIDE_DELAY: Duration = Duration::from_secs(2);
+
+/// Как часто проверяем, не пора ли скрыть панель.
+const AUTO_HIDE_TICK: Duration = Duration::from_millis(250);
+
+/// Сколько висит плашка с громкостью после шага колесом.
+const VOLUME_NOTICE_DURATION: Duration = Duration::from_millis(1_500);
+
+/// Шаг перемотки стрелками.
+const SEEK_STEP: Duration = Duration::from_secs(5);
+
+/// Высота панели управления с отступом — насколько меню «⋯» поднимается
+/// над нижним краем кадра.
+///
+/// Панель — наложение: `py_3` (24 px) + строка кнопок (28 px) плюс зазор 8 px.
+const CONTROLS_HEIGHT: f32 = 60.0;
+
+/// Ошибка запуска: окно не удалось создать.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct LaunchError {
+    message: String,
+}
+
+/// Действие, привязанное к клавише.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shortcut {
+    TogglePlayback,
+    SeekBackward,
+    SeekForward,
+    ToggleFullscreen,
+    OpenFile,
+    CloseOverlays,
+}
+
+/// Сопоставляет клавишу действию.
+///
+/// Модификаторы не учитываем: в окне нет текстового ввода, а Ctrl/Alt-сочетания
+/// лучше не перехватывать.
+fn shortcut(key: &str) -> Option<Shortcut> {
+    match key {
+        "space" => Some(Shortcut::TogglePlayback),
+        "left" => Some(Shortcut::SeekBackward),
+        "right" => Some(Shortcut::SeekForward),
+        "f" | "F" => Some(Shortcut::ToggleFullscreen),
+        "o" | "O" => Some(Shortcut::OpenFile),
+        "escape" => Some(Shortcut::CloseOverlays),
+        _ => None,
+    }
+}
+
+/// Пора ли скрыть панель управления.
+fn should_hide(playing: bool, enabled: bool, idle: Duration) -> bool {
+    enabled && playing && idle >= AUTO_HIDE_DELAY
+}
+
+/// Следующая громкость после одного щелчка колеса: ровно 1 %.
+///
+/// Считаем в целых процентах, чтобы серия шагов не накапливала ошибку
+/// округления `f32`.
+fn volume_after_step(current: f32, up: bool) -> f32 {
+    let percent = (current.clamp(0.0, 1.0) * 100.0).round() as i32;
+    let next = if up { percent + 1 } else { percent - 1 };
+    next.clamp(0, 100) as f32 / 100.0
+}
+
+/// Корневое окно демонстрационного приложения.
+struct PlayerWindow {
+    player: Entity<VideoPlayer>,
+    focus_handle: FocusHandle,
+    focused: bool,
+    controls_visible: bool,
+    /// Открыто меню «⋯» в панели управления.
+    menu_open: bool,
+    /// Показана панель «О программе» поверх кадра.
+    about_open: bool,
+    /// Показана панель «Информация о файле» поверх кадра.
+    file_info_open: bool,
+    /// Скрывать панель управления после бездействия (пункт меню).
+    auto_hide_enabled: bool,
+    /// Версии FFmpeg спрашиваем один раз при старте: они нужны «О программе».
+    versions: FfmpegVersions,
+    /// Над окном сейчас тащат файлы: показываем подсказку «отпустите файл».
+    dragging: bool,
+    /// Мышиный клик только что закрыл меню/панели: этот же клик не должен
+    /// переключать воспроизведение.
+    skip_next_click: bool,
+    /// Плашка с громкостью: значение и момент последнего шага колесом.
+    volume_notice: Option<(f32, Instant)>,
+    last_activity: Instant,
+    _auto_hide: Task<()>,
+}
+
+impl PlayerWindow {
+    fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        let player = match path {
+            Some(path) => VideoPlayer::create(path, cx),
+            None => cx.new(VideoPlayer::new),
+        };
+        let focus_handle = cx.focus_handle();
+        let auto_hide = spawn_auto_hide(cx);
+
+        Self {
+            player,
+            focus_handle,
+            focused: false,
+            controls_visible: true,
+            menu_open: false,
+            about_open: false,
+            file_info_open: false,
+            auto_hide_enabled: true,
+            versions: FfmpegVersions::detect(),
+            dragging: false,
+            skip_next_click: false,
+            volume_notice: None,
+            last_activity: Instant::now(),
+            _auto_hide: auto_hide,
+        }
+    }
+
+    /// Отмечает активность пользователя и возвращает панель.
+    fn note_activity(&mut self, cx: &mut Context<Self>) {
+        self.last_activity = Instant::now();
+        if !self.controls_visible {
+            self.controls_visible = true;
+            cx.notify();
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        _event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.note_activity(cx);
+    }
+
+    /// Завершает перетаскивание, даже если кнопку отпустили вне слайдера.
+    ///
+    /// Заодно снимает подсказку о перетаскивании: если drop почему-то не
+    /// пришёл (например, файл отпустили над неокном), она не должна зависнуть.
+    fn handle_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging {
+            self.dragging = false;
+            cx.notify();
+        }
+        self.note_activity(cx);
+        self.player.update(cx, |video, cx| {
+            video.finish_scrub(cx);
+            video.finish_volume(cx);
+        });
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shortcut) = shortcut(&event.keystroke.key) else {
+            return;
+        };
+
+        self.note_activity(cx);
+        match shortcut {
+            Shortcut::TogglePlayback => {
+                self.player
+                    .update(cx, |video, cx| video.toggle_playback(cx));
+            }
+            Shortcut::SeekBackward => self.seek_relative(SEEK_STEP, false, cx),
+            Shortcut::SeekForward => self.seek_relative(SEEK_STEP, true, cx),
+            Shortcut::ToggleFullscreen => window.toggle_fullscreen(),
+            Shortcut::OpenFile => {
+                self.player.update(cx, |video, cx| video.open_dialog(cx));
+            }
+            Shortcut::CloseOverlays => {
+                let closed = self.close_overlays(cx);
+                if !closed && window.is_fullscreen() {
+                    window.toggle_fullscreen();
+                }
+            }
+        }
+    }
+
+    /// Открывает и закрывает меню «⋯».
+    fn toggle_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu_open = !self.menu_open;
+        self.note_activity(cx);
+        cx.notify();
+    }
+
+    /// Клик по кадру убирает всё, что открыто поверх него.
+    ///
+    /// Если меню/панели были открыты, следующий `on_click` только закроет их,
+    /// а не переключит паузу: иначе клик «убери меню» заодно ставил бы видео
+    /// на паузу.
+    fn handle_video_click(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.skip_next_click = false;
+        self.note_activity(cx);
+        if self.close_overlays(cx) {
+            self.skip_next_click = true;
+        }
+    }
+
+    /// Клик по кадру — пауза или продолжение воспроизведения.
+    fn toggle_playback_on_click(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.skip_next_click {
+            self.skip_next_click = false;
+            return;
+        }
+
+        self.note_activity(cx);
+        self.player
+            .update(cx, |video, cx| video.toggle_playback(cx));
+    }
+
+    /// Колесо мыши меняет громкость шагами по 1 %.
+    fn handle_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let delta = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+        };
+        if delta == 0.0 || !delta.is_finite() {
+            return;
+        }
+
+        self.note_activity(cx);
+        let stepped = self.player.update(cx, |video, cx| {
+            let (before, was_muted) = (video.volume(), video.muted());
+            // Любое изменение громкости колесом включает звук, иначе шаги
+            // меняли бы скрытую громкость при выключенном mute.
+            if was_muted {
+                video.toggle_mute(cx);
+            }
+            let volume = volume_after_step(video.volume(), delta > 0.0);
+            video.set_volume(volume, cx);
+
+            // Плашку показываем только когда что-то действительно изменилось:
+            // без открытого файла или на границе диапазона шага нет.
+            let changed = video.volume() != before || video.muted() != was_muted;
+            changed.then(|| video.volume())
+        });
+
+        if let Some(volume) = stepped {
+            self.volume_notice = Some((volume, Instant::now()));
+            cx.notify();
+        }
+    }
+
+    /// Закрывает меню и панели поверх кадра (`Escape`, клик по кадру).
+    ///
+    /// Возвращает `true`, если что-то действительно было открыто: по этому
+    /// признаку `Escape` переключается на выход из fullscreen.
+    fn close_overlays(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.menu_open || self.about_open || self.file_info_open {
+            self.menu_open = false;
+            self.about_open = false;
+            self.file_info_open = false;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Закрывает меню и возвращает таймер автоскрытия к нулю.
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu_open {
+            self.menu_open = false;
+            cx.notify();
+        }
+        self.note_activity(cx);
+    }
+
+    /// Меню → «Открыть…»: то же, что клавиша `O` и кнопка-папка.
+    fn open_from_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        self.player.update(cx, |video, cx| video.open_dialog(cx));
+    }
+
+    /// Меню → «Показать/Скрыть оверлей статистики».
+    fn toggle_stats(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        self.player.update(cx, |video, cx| video.toggle_stats(cx));
+    }
+
+    /// Меню → «О программе».
+    fn show_about(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.file_info_open = false;
+        self.about_open = true;
+        self.note_activity(cx);
+        cx.notify();
+    }
+
+    /// Меню → «Информация о файле».
+    fn show_file_info(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.about_open = false;
+        self.file_info_open = true;
+        self.note_activity(cx);
+        cx.notify();
+    }
+
+    /// Меню → «Автоскрытие панели».
+    fn toggle_auto_hide(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.auto_hide_enabled = !self.auto_hide_enabled;
+        self.close_menu(cx);
+    }
+
+    /// Перематывает на шаг вперёд или назад, не выходя за границы файла.
+    fn seek_relative(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
+        self.player.update(cx, |video, cx| {
+            let current = video.position();
+            let mut target = if forward {
+                current.saturating_add(step)
+            } else {
+                current.saturating_sub(step)
+            };
+            if let Some(duration) = video.duration() {
+                target = target.min(duration);
+            }
+            video.seek(target, cx);
+        });
+    }
+
+    /// Перетаскивание файла в окно: играем первый подходящий.
+    fn handle_drop(&mut self, paths: &ExternalPaths, _window: &mut Window, cx: &mut Context<Self>) {
+        debug!(count = paths.0.len(), "файлы отпущены над окном");
+        self.dragging = false;
+        self.note_activity(cx);
+        self.player
+            .update(cx, |video, cx| video.open_dropped(&paths.0, cx));
+        cx.notify();
+    }
+
+    /// Файлы ведут над окном: показываем подсказку, куда их отпустить.
+    ///
+    /// `on_drag_move` не требует наведения на конкретный элемент, поэтому
+    /// по логу видно, дошло ли перетаскивание от ОС до приложения.
+    fn handle_drag_move(
+        &mut self,
+        _event: &DragMoveEvent<ExternalPaths>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dragging {
+            debug!("файлы над окном");
+            self.dragging = true;
+            cx.notify();
+        }
+    }
+
+    /// Файлы увели из окна, не отпустив.
+    fn handle_drag_exit(
+        &mut self,
+        _event: &FileDropEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging {
+            debug!("перетаскивание отменено");
+            self.dragging = false;
+            cx.notify();
+        }
+    }
+
+    /// Скрывает панель после бездействия, но только во время воспроизведения.
+    ///
+    /// Пока открыто меню или панели поверх кадра, панель не прячем: иначе меню
+    /// исчезло бы вместе с кнопкой, которая его открыла.
+    fn tick_auto_hide(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, shown_at)) = self.volume_notice
+            && shown_at.elapsed() >= VOLUME_NOTICE_DURATION
+        {
+            self.volume_notice = None;
+            cx.notify();
+        }
+
+        if self.menu_open || self.about_open || self.file_info_open {
+            return;
+        }
+
+        let playing = self.player.read(cx).state().is_playing();
+        if self.controls_visible
+            && should_hide(
+                playing,
+                self.auto_hide_enabled,
+                self.last_activity.elapsed(),
+            )
+        {
+            self.controls_visible = false;
+            cx.notify();
+        }
+    }
+
+    /// Кнопка «⋯» в панели управления.
+    fn menu_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("vgpu-menu-button")
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(gpui::rgb(0x44_44_44))
+            .cursor_pointer()
+            .aria_label("Ещё")
+            .child(icon(Icon::More, ICON_SIZE, gpui::rgb(0xee_ee_ee)))
+            .on_click(cx.listener(PlayerWindow::toggle_menu))
+    }
+
+    /// Панель управления поверх кадра, у нижнего края.
+    ///
+    /// Панель — наложение (`.absolute()`), а не элемент раскладки: её появление
+    /// и скрытие по автоскрытию не меняют размер кадра, видео всегда занимает
+    /// всё окно. Фон полупрозрачный, чтобы под панелью просвечивал кадр.
+    ///
+    /// `on_mouse_down` с `stop_propagation` обязателен: под панелью лежит
+    /// полноэкранная область «клик по кадру», а GPUI считает наведённым любой
+    /// хитбокс под курсором, не только верхний. Без этого клик по любой кнопке
+    /// панели ещё и переключал бы воспроизведение. Дети панели регистрируют
+    /// обработчики раньше (paint родителя идёт до paint детей), поэтому в
+    /// bubble-фазе кнопка успевает записать свой клик, а затем панель гасит
+    /// всплытие до области кадра.
+    fn controls_panel(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .left_0()
+            .bottom_0()
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_4()
+            .bg(gpui::rgba(0x11_11_11_cc))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(controls_view(&self.player, cx).flex_1())
+            .child(self.menu_button(cx))
+    }
+
+    /// Меню «⋯»: слой поверх кадра и список у правого нижнего угла.
+    ///
+    /// Слой — `.absolute().size_full()` внутри области кадра, как у кнопки
+    /// «Повторить»: у такого элемента есть точный размер, поэтому и сам слой,
+    /// и его содержимое однозначно ловят мышь. Список — обычный flex-ребёнок
+    /// слоя (не `absolute` с автовысотой): его размер считает раскладка, а не
+    /// абсолютное позиционирование.
+    fn menu_panel(&self, cx: &mut Context<Self>) -> Div {
+        let stats_visible = self.player.read(cx).stats_visible();
+        let has_file = self.player.read(cx).media_info().is_some();
+
+        let mut items = div()
+            .w(px(280.0))
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::rgb(0x44_44_44))
+            .bg(gpui::rgb(0x22_22_22))
+            .flex()
+            .flex_col()
+            // GPUI считает наведённым любой хитбокс под курсором, а не
+            // только верхний, поэтому «клик по кадру» сработал бы и по
+            // меню (оно лежит поверх области кадра). Гасим всплытие.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(menu_item(
+                "vgpu-menu-open",
+                "Открыть…",
+                None,
+                cx.listener(PlayerWindow::open_from_menu),
+            ));
+
+        // Информация о файле есть смысл только когда файл открыт.
+        if has_file {
+            items = items.child(menu_item(
+                "vgpu-menu-file",
+                "Информация о файле",
+                None,
+                cx.listener(PlayerWindow::show_file_info),
+            ));
+        }
+
+        items = items
+            .child(menu_item(
+                "vgpu-menu-stats",
+                stats_item_label(stats_visible),
+                Some(stats_visible),
+                cx.listener(PlayerWindow::toggle_stats),
+            ))
+            .child(menu_item(
+                "vgpu-menu-about",
+                "О программе",
+                None,
+                cx.listener(PlayerWindow::show_about),
+            ))
+            .child(menu_item(
+                "vgpu-menu-auto-hide",
+                "Автоскрытие панели",
+                Some(self.auto_hide_enabled),
+                cx.listener(PlayerWindow::toggle_auto_hide),
+            ));
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_end()
+            .justify_end()
+            .pr(px(16.0))
+            .pb(px(CONTROLS_HEIGHT))
+            .child(items)
+    }
+
+    /// Строки панели «Информация о файле».
+    ///
+    /// Берём всё, что реально известно: путь и размер с диска, контейнер и
+    /// имена кодеков из заголовка, размеры и частоту из декодера, каналы и
+    /// частоту звука из аудиодекодера, длительность из звука или видео.
+    fn file_info_lines(&self, cx: &App) -> Vec<String> {
+        let video = self.player.read(cx);
+        let (Some(path), Some(media)) = (video.path(), video.media_info()) else {
+            return vec!["файл не открыт".to_owned()];
+        };
+
+        file_info_lines(path, media, video.duration())
+    }
+
+    /// Панель с несколькими строками текста поверх кадра.
+    ///
+    /// Клик по ней закрывает панель: так же работает «О программе». Высота не
+    /// фиксирована — строкам с длинным путём нужно переноситься.
+    fn message_panel(width: f32, lines: &[String]) -> Div {
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(width))
+            .p_4()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::rgb(0x44_44_44))
+            .bg(gpui::rgb(0x22_22_22))
+            .text_sm();
+
+        for line in lines {
+            content = content.child(line.clone());
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00_00_00_66))
+            .child(content)
+    }
+}
+
+impl Render for PlayerWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focused {
+            self.focused = true;
+            window.focus(&self.focus_handle, cx);
+        }
+
+        // Полноэкранный режим меняет платформа, причём не мгновенно: в `render`
+        // берём фактическое состояние окна, чтобы иконка кнопки не врала.
+        let fullscreen = window.is_fullscreen();
+        self.player
+            .update(cx, |video, cx| video.set_fullscreen(fullscreen, cx));
+
+        let mut root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(gpui::rgb(0x11_11_11))
+            .text_color(gpui::rgb(0xee_ee_ee))
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(PlayerWindow::handle_key_down))
+            .on_mouse_move(cx.listener(PlayerWindow::handle_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(PlayerWindow::handle_mouse_up),
+            )
+            .on_drop(cx.listener(PlayerWindow::handle_drop))
+            .on_drag_move(cx.listener(PlayerWindow::handle_drag_move))
+            .on_file_drop_exit(cx.listener(PlayerWindow::handle_drag_exit))
+            .on_scroll(cx.listener(PlayerWindow::handle_scroll));
+
+        // Клик по кадру — обычный жест «убрать то, что открыто поверх»:
+        // закрывает меню «⋯» и панели с информацией. Сами пункты меню гасят
+        // всплытие (`stop_propagation`), иначе этот же обработчик закрывал бы
+        // меню уже на mouse down — до того, как придёт `on_click`.
+        //
+        // Вложенный `div` нужен ради `on_click`: клик по кадру ставит видео
+        // на паузу и продолжает его. Кнопка «Повторить» внутри `video_view`
+        // гасит всплытие, чтобы не переключать воспроизведение дважды.
+        let mut video_area = div()
+            .id("vgpu-video-area")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(PlayerWindow::handle_video_click),
+            )
+            .child(
+                div()
+                    .id("vgpu-video-click")
+                    .size_full()
+                    .on_click(cx.listener(PlayerWindow::toggle_playback_on_click))
+                    .child(video_view(&self.player, cx).size_full()),
+            );
+
+        // Плашка громкости — отдельное наложение: она не сдвигает ни панель,
+        // ни кадр и видна даже при скрытой панели управления.
+        if let Some((volume, _)) = self.volume_notice {
+            video_area = video_area.child(
+                div()
+                    .absolute()
+                    .right(px(16.0))
+                    .bottom(px(CONTROLS_HEIGHT))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(gpui::rgba(0x22_22_22_ee))
+                    .text_sm()
+                    .child(format!("{}%", volume_percent(volume))),
+            );
+        }
+
+        if self.about_open {
+            let lines: Vec<String> = about_text(&self.versions)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            video_area = video_area.child(Self::message_panel(340.0, &lines));
+        }
+
+        if self.file_info_open {
+            let lines = self.file_info_lines(cx);
+            video_area = video_area.child(Self::message_panel(520.0, &lines));
+        }
+
+        if self.menu_open {
+            video_area = video_area.child(self.menu_panel(cx));
+        }
+
+        // Панель — последним ребёнком: она лежит поверх кадра и не участвует
+        // в раскладке, поэтому видео не уменьшается.
+        if self.controls_visible {
+            video_area = video_area.child(self.controls_panel(cx));
+        }
+
+        root = root.child(video_area);
+
+        // Подсказка поверх всего, пока файлы ведут над окном. Она же — самый
+        // верхний элемент под курсором, поэтому `on_drop` на ней сработает
+        // даже если хитбокс контейнера почему-то не считается наведённым.
+        if self.dragging {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::rgba(0x00_00_00_66))
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(gpui::rgb(0xee_ee_ee))
+                            .text_color(gpui::rgb(0x11_11_11))
+                            .child("Отпустите файл, чтобы открыть"),
+                    )
+                    .on_drop(cx.listener(PlayerWindow::handle_drop)),
+            );
+        }
+
+        root
+    }
+}
+
+/// Пункт меню: подпись, необязательная галочка и обработчик клика.
+///
+/// Под галочку всегда отведено место, даже у обычных пунктов: иначе подписи
+/// переключателей и действий начинались бы с разного отступа.
+///
+/// `on_mouse_down` с `stop_propagation` нужен, чтобы нажатие на пункт не
+/// всплыло до области кадра: там висит «клик по кадру закрывает меню», и без
+/// этого меню исчезало бы на mouse down, не дожив до `on_click`.
+fn menu_item(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    checked: Option<bool>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let label = label.into();
+    let mark = match checked {
+        Some(true) => "✓",
+        _ => "",
+    };
+
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .aria_label(label.clone())
+        .hover(|style| style.bg(gpui::rgb(0x33_33_33)))
+        .child(div().w(px(14.0)).child(mark))
+        .child(div().text_sm().child(label))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(on_click)
+}
+
+/// Подпись переключателя оверлея: действие, которое сделает клик.
+fn stats_item_label(visible: bool) -> &'static str {
+    if visible {
+        "Скрыть оверлей статистики"
+    } else {
+        "Показать оверлей статистики"
+    }
+}
+
+/// Текст панели «О программе».
+///
+/// Каждая библиотека — отдельной строкой: так сразу видно, какая DLL рядом с
+/// exe не та, что ожидалась.
+fn about_text(versions: &FfmpegVersions) -> String {
+    format!(
+        "VGPU Player {}\nlibavutil {}\nlibavformat {}\nlibavcodec {}",
+        env!("CARGO_PKG_VERSION"),
+        versions.util,
+        versions.format,
+        versions.codec
+    )
+}
+
+/// Строки панели «Информация о файле».
+///
+/// Первая строка — имя файла, вторая — полный путь, третья — факты о файле,
+/// дальше по строке на дорожку.
+fn file_info_lines(path: &Path, media: &MediaInfo, duration: Option<Duration>) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    lines.push(name);
+    lines.push(path.display().to_string());
+
+    let mut facts = Vec::new();
+    if let Ok(metadata) = std::fs::metadata(path) {
+        facts.push(format_size(metadata.len()));
+    }
+    if let Some(container) = &media.container {
+        facts.push(container.clone());
+    }
+    if let Some(duration) = duration {
+        facts.push(format!("длительность {}", format_clock(duration)));
+    }
+    if !facts.is_empty() {
+        lines.push(facts.join(" · "));
+    }
+
+    if let Some(video) = &media.video {
+        let mut parts = Vec::new();
+        if let Some(codec) = &video.codec {
+            parts.push(codec.clone());
+        }
+        parts.push(format!("{}×{}", video.width, video.height));
+        if let Some(fps) = video.frame_rate {
+            parts.push(format!("{} fps", format_frame_rate(fps)));
+        }
+        lines.push(format!("видео: {}", parts.join(" · ")));
+    }
+
+    if let Some(audio) = &media.audio {
+        let mut parts = Vec::new();
+        if let Some(codec) = &audio.codec {
+            parts.push(codec.clone());
+        }
+        parts.push(channels_label(audio.channels));
+        parts.push(format!("{} Гц", audio.sample_rate));
+        lines.push(format!("звук: {}", parts.join(" · ")));
+    }
+
+    lines
+}
+
+/// Размер файла по-человечески: `819 КБ`, `42.7 МБ`, `1.25 ГБ`.
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.2} ГБ", value / GIB)
+    } else if value >= MIB {
+        format!("{:.1} МБ", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0} КБ", value / KIB)
+    } else {
+        format!("{bytes} Б")
+    }
+}
+
+/// Частота кадров без лишних нулей: `30`, `29.97`.
+fn format_frame_rate(fps: f64) -> String {
+    let rounded = (fps * 100.0).round() / 100.0;
+    if rounded.fract().abs() < f64::EPSILON {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.2}")
+    }
+}
+
+/// Число каналов по-русски: `1 канал`, `2 канала`, `6 каналов`.
+fn channels_label(channels: u16) -> String {
+    let tens = channels % 100;
+    let word = match channels % 10 {
+        1 if tens != 11 => "канал",
+        2..=4 if !(12..=14).contains(&tens) => "канала",
+        _ => "каналов",
+    };
+    format!("{channels} {word}")
+}
+
+/// Фоновая задача автоскрытия панели.
+///
+/// Цикл заканчивается сам, когда окно закрыто: `weak.update` вернёт ошибку.
+fn spawn_auto_hide(cx: &mut Context<PlayerWindow>) -> Task<()> {
+    cx.spawn(
+        async move |this: WeakEntity<PlayerWindow>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(AUTO_HIDE_TICK).await;
+                if this
+                    .update(cx, |window, cx| window.tick_auto_hide(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        },
+    )
+}
+
+/// Открывает главное окно в уже запущенном приложении.
+fn open_main_window(cx: &mut App, path: Option<PathBuf>) -> gpui::Result<()> {
+    let bounds = Bounds::centered(None, size(px(960.0), px(540.0)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(WINDOW_TITLE.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    info!("открытие главного окна");
+    cx.open_window(options, |_window, cx| {
+        cx.new(|cx| PlayerWindow::new(path, cx))
+    })?;
+    Ok(())
+}
+
+/// Запускает демонстрационное приложение и блокирует поток до закрытия окна.
+///
+/// `Application::run` не умеет возвращать значение из колбэка, поэтому ошибку
+/// создания окна складываем в слот, останавливаем приложение и отдаём её уже
+/// после выхода из цикла событий.
+pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
+    let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let failure_slot = Rc::clone(&failure);
+
+    gpui_platform::application().run(move |cx: &mut App| {
+        if let Err(err) = open_main_window(cx, path) {
+            error!(%err, "не удалось открыть окно");
+            *failure_slot.borrow_mut() = Some(err.to_string());
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+    });
+
+    match failure.borrow_mut().take() {
+        Some(message) => Err(LaunchError { message }),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use player_core::FfmpegVersion;
+
+    #[test]
+    fn shortcut_maps_player_keys() {
+        assert_eq!(shortcut("space"), Some(Shortcut::TogglePlayback));
+        assert_eq!(shortcut("left"), Some(Shortcut::SeekBackward));
+        assert_eq!(shortcut("right"), Some(Shortcut::SeekForward));
+        assert_eq!(shortcut("f"), Some(Shortcut::ToggleFullscreen));
+        assert_eq!(shortcut("o"), Some(Shortcut::OpenFile));
+        assert_eq!(shortcut("O"), Some(Shortcut::OpenFile));
+        assert_eq!(shortcut("escape"), Some(Shortcut::CloseOverlays));
+        assert_eq!(shortcut("q"), None);
+    }
+
+    #[test]
+    fn auto_hide_only_while_enabled_and_playing() {
+        assert!(should_hide(true, true, AUTO_HIDE_DELAY));
+        assert!(!should_hide(true, false, AUTO_HIDE_DELAY));
+        assert!(!should_hide(
+            true,
+            true,
+            AUTO_HIDE_DELAY - Duration::from_millis(1)
+        ));
+        assert!(!should_hide(false, true, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn wheel_steps_volume_by_one_percent() {
+        assert!((volume_after_step(0.50, true) - 0.51).abs() < f32::EPSILON);
+        assert!((volume_after_step(0.50, false) - 0.49).abs() < f32::EPSILON);
+        assert_eq!(volume_after_step(1.0, true), 1.0);
+        assert_eq!(volume_after_step(0.0, false), 0.0);
+        assert!((volume_after_step(0.004, false) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stats_item_names_the_action() {
+        assert_eq!(stats_item_label(true), "Скрыть оверлей статистики");
+        assert_eq!(stats_item_label(false), "Показать оверлей статистики");
+    }
+
+    #[test]
+    fn about_text_lists_app_and_ffmpeg_versions() {
+        let versions = FfmpegVersions {
+            util: FfmpegVersion::from_bits((60 << 16) | (8 << 8) | 100),
+            format: FfmpegVersion::from_bits((62 << 16) | (3 << 8) | 100),
+            codec: FfmpegVersion::from_bits((62 << 16) | (11 << 8) | 100),
+        };
+
+        let text = about_text(&versions);
+
+        assert!(text.starts_with("VGPU Player "));
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains("libavutil 60.8.100"));
+        assert!(text.contains("libavformat 62.3.100"));
+        assert!(text.contains("libavcodec 62.11.100"));
+    }
+
+    fn sample_file() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("vgpu-player-info-{}.mp4", std::process::id()));
+        std::fs::write(&path, vec![0_u8; 2048]).expect("создать файл для проверки");
+        path
+    }
+
+    #[test]
+    fn file_info_lists_path_facts_and_tracks() {
+        let path = sample_file();
+        let media = MediaInfo {
+            container: Some("QuickTime / MOV".to_owned()),
+            video: Some(player_core::VideoTrackInfo {
+                codec: Some("h264".to_owned()),
+                width: 1920,
+                height: 1080,
+                frame_rate: Some(29.97),
+            }),
+            audio: Some(player_core::AudioTrackInfo {
+                codec: Some("aac".to_owned()),
+                channels: 2,
+                sample_rate: 48_000,
+            }),
+        };
+
+        let lines = file_info_lines(&path, &media, Some(Duration::from_secs(125)));
+        let _ = std::fs::remove_file(&path);
+
+        let text = lines.join("\n");
+        assert!(text.contains("vgpu-player-info-"), "имя файла: {text}");
+        assert!(text.contains("2 КБ"), "размер файла: {text}");
+        assert!(text.contains("QuickTime / MOV"), "контейнер: {text}");
+        assert!(text.contains("02:05"), "длительность: {text}");
+        assert!(
+            text.contains("видео: h264 · 1920×1080 · 29.97 fps"),
+            "видео: {text}"
+        );
+        assert!(
+            text.contains("звук: aac · 2 канала · 48000 Гц"),
+            "звук: {text}"
+        );
+    }
+
+    #[test]
+    fn file_info_without_tracks_keeps_the_file_lines() {
+        let path = PathBuf::from("missing.mp4");
+        let lines = file_info_lines(&path, &MediaInfo::default(), None);
+
+        assert_eq!(
+            lines,
+            vec!["missing.mp4".to_owned(), "missing.mp4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn sizes_use_readable_units() {
+        assert_eq!(format_size(512), "512 Б");
+        assert_eq!(format_size(2_048), "2 КБ");
+        assert_eq!(format_size(4_400_000), "4.2 МБ");
+        assert_eq!(format_size(1_342_177_280), "1.25 ГБ");
+    }
+
+    #[test]
+    fn frame_rate_drops_trailing_zeros() {
+        assert_eq!(format_frame_rate(30.0), "30");
+        assert_eq!(format_frame_rate(29.97), "29.97");
+        assert_eq!(format_frame_rate(23.976), "23.98");
+    }
+
+    #[test]
+    fn channel_counts_are_pluralized() {
+        assert_eq!(channels_label(1), "1 канал");
+        assert_eq!(channels_label(2), "2 канала");
+        assert_eq!(channels_label(6), "6 каналов");
+        assert_eq!(channels_label(11), "11 каналов");
+        assert_eq!(channels_label(21), "21 канал");
+    }
+}

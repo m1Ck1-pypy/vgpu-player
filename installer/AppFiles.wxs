@@ -1,0 +1,56 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<!-- Files of the per-user MSI. One component with an HKCU keypath: ICE38/ICE64
+     require it for a component installed into the user profile. Component GUID
+     is fixed so upgrades keep the same component identity. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <ComponentGroup Id="AppFiles">
+            <Component
+                Id="AppFilesComponent"
+                Directory="INSTALLFOLDER"
+                Guid="{A3F1C2D4-6B7E-4A90-8C1D-2E5F7A9B3C60}"
+            >
+                <File
+                    Id="PlayerAppExe"
+                    Source="$(var.SourceDir)\player-app.exe"
+                />
+                <File
+                    Id="AvcodecDll"
+                    Source="$(var.SourceDir)\avcodec-63.dll"
+                />
+                <File
+                    Id="AvdeviceDll"
+                    Source="$(var.SourceDir)\avdevice-63.dll"
+                />
+                <File
+                    Id="AvfilterDll"
+                    Source="$(var.SourceDir)\avfilter-12.dll"
+                />
+                <File
+                    Id="AvformatDll"
+                    Source="$(var.SourceDir)\avformat-63.dll"
+                />
+                <File Id="AvutilDll" Source="$(var.SourceDir)\avutil-61.dll" />
+                <File
+                    Id="SwresampleDll"
+                    Source="$(var.SourceDir)\swresample-7.dll"
+                />
+                <File
+                    Id="SwscaleDll"
+                    Source="$(var.SourceDir)\swscale-10.dll"
+                />
+                <File Id="Dav1dDll" Source="$(var.SourceDir)\dav1d.dll" />
+
+                <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+                <RegistryValue
+                    Root="HKCU"
+                    Key="Software\vgpu-player"
+                    Name="InstallFolder"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes"
+                />
+            </Component>
+        </ComponentGroup>
+    </Fragment>
+</Wix>

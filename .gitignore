@@ -1,0 +1,16 @@
+/target
+
+# Служебные файлы Windows/macOS.
+Thumbs.db
+.DS_Store
+
+# Артефакты упаковки (портативная папка, установщик) — не в git.
+/dist/
+
+# Локальные инструменты и dev-библиотеки (vcpkg + FFmpeg), создаются заново
+/.tools/
+
+# Тестовые медиафайлы генерируются локально и в git не попадают.
+# Скрипт генерации — в assets/test/README.md.
+/assets/test/*
+!/assets/test/README.md

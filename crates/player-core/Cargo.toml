@@ -1,0 +1,23 @@
+[package]
+name = "player-core"
+description = "Ядро плеера: демультиплексирование, декодирование, синхронизация A/V"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+ffmpeg.workspace = true
+rodio.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+image.workspace = true

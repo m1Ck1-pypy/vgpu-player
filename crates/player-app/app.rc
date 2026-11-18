@@ -1,0 +1,4 @@
+; GPUI (gpui-fast-windows) загружает иконку окна через
+; LoadImageW(module, MAKEINTRESOURCE(1), ...), поэтому ID ресурса должен быть
+; числовым 1, а не именем IDI_ICON1.
+1 ICON "../../assets/app-icon.ico"
