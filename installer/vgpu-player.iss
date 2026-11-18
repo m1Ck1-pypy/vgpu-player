@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files\Inno Setup 7\ISCC.exe" installer\vgpu-player.iss
 
 #define MyAppName "VGPU Player"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "VGPU Player"
 #define MyAppExeName "player-app.exe"
 

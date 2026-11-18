@@ -1,14 +1,15 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!-- Build from the repository root:
        .tools\wix\candle.exe -arch x64 -dSourceDir=dist\vgpu-player -o target\wix\ installer\vgpu-player.wxs installer\AppFiles.wxs
-       .tools\wix\light.exe -ext .tools\wix\WixUIExtension.dll -pdbout target\wix\vgpu-player.wixpdb -o dist\vgpu-player-0.1.0.msi target\wix\vgpu-player.wixobj target\wix\AppFiles.wixobj
+       .tools\wix\light.exe -ext .tools\wix\WixUIExtension.dll -pdbout target\wix\vgpu-player.wixpdb -o dist\vgpu-player-<version>.msi target\wix\vgpu-player.wixobj target\wix\AppFiles.wixobj
+       (the version comes from Cargo.toml, see `just installer-msi`)
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
     <Product
         Id="*"
         Name="VGPU Player"
         Language="1033"
-        Version="0.1.0"
+        Version="0.2.0"
         Manufacturer="VGPU Player"
         UpgradeCode="{C2D7A4F0-5B8E-4A31-9C6D-3F1E8B2A7D90}"
     >
