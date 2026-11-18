@@ -2,7 +2,15 @@ name: ci
 
 on:
   push:
+    paths:
+      - "crates/**"
+      - "assets/**"
+      - ".github/**"
   pull_request:
+    paths:
+      - "crates/**"
+      - "assets/**"
+      - ".github/**"
 
 # Один прогон на ref: новый коммит отменяет предыдущий.
 concurrency:
