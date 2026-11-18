@@ -312,7 +312,7 @@ README.md                    # описание, сборка, запуск, у�
 LICENSE-MIT, LICENSE-APACHE   # лицензия MIT OR Apache-2.0
 Cargo.toml                   # workspace
 justfile                     # portable / installers / примеры
-.github/workflows/ci.yml     # fmt + clippy + test на каждый push/PR
+.github/workflows/ci.yml     # fmt + clippy + test при изменениях кода/сборки
 crates/
   player-core/               # движок: demux, decode, A/V-синхронизация; без зависимости от GPUI
   player-gpui/               # БИБЛИОТЕКА UI: VideoPlayer, video_view, controls_view; без main
@@ -1449,11 +1449,10 @@ Programs\vgpu-player`, `%LOCALAPPDATA%\vgpu-player`), файлов устано�
 ### 15.3 CI
 
 - `.github/workflows/ci.yml` запускается только при изменениях в
-  `crates/**`, `assets/**` и `.github/**` (фильтры `paths` для `push`
-  и `pull_request`). Правки только в `docs/` или в корневых файлах
-  (`Cargo.toml`, `Cargo.lock`, `justfile`) прогон не запускают — это
-  осознанное упрощение; при смене зависимостей тесты надо запустить вручную
-  либо добавить пути в фильтр.
+  `crates/**`, `assets/**`, `.github/**`, `Cargo.toml`, `Cargo.lock`
+  и `.cargo/**` (фильтры `paths` для `push` и `pull_request`).
+  Поэтому правки зависимостей и конфигурации сборки проверяются
+  автоматически, а чисто документационные коммиты прогон не запускают.
 - После изменений 2026-11-18 правок в нём не потребовалось: новых
   зависимостей и платформенного кода нет, тесты не требуют
   медиа/дисплея/звукового устройства (клипы генерируются системным `ffmpeg`

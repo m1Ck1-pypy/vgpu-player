@@ -6,11 +6,17 @@ on:
       - "crates/**"
       - "assets/**"
       - ".github/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
   pull_request:
     paths:
       - "crates/**"
       - "assets/**"
       - ".github/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
 
 # Один прогон на ref: новый коммит отменяет предыдущий.
 concurrency:
