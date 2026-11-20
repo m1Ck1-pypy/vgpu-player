@@ -122,6 +122,9 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             video.volume_hover(),
         )
     };
+    // Пока источник открывается, управление не действует: `Play`, `Seek` и
+    // `restart` в этом состоянии игнорируются и в `VideoPlayer`.
+    let loading = state == PlaybackState::Loading;
 
     let time_text = match duration {
         Some(duration) => format!("{} / {}", format_clock(position), format_clock(duration)),
@@ -156,6 +159,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         effective_volume,
         player,
         SliderKind::Volume,
+        true,
     ));
 
     // Процент — только по наведению: постоянная надпись отнимала место у
@@ -164,29 +168,37 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         volume_control = volume_control.child(volume_hint(volume_percent(ratio), ratio));
     }
 
+    let play_button = icon_button(
+        "vgpu-play-pause",
+        play_pause_icon,
+        play_pause_label,
+        gpui::rgb(0xee_ee_ee),
+        gpui::rgb(0x11_11_11),
+        move |_, cx| {
+            play_pause_target.update(cx, |video, cx| match play_action(video.state()) {
+                PlayAction::OpenFile => video.open_dialog(cx),
+                PlayAction::TogglePlayback => video.toggle_playback(cx),
+            })
+        },
+    );
+    let play_button = if loading {
+        play_button.opacity(0.5).cursor_default()
+    } else {
+        play_button
+    };
+
     div()
         .flex()
         .items_center()
         .gap_4()
-        .child(icon_button(
-            "vgpu-play-pause",
-            play_pause_icon,
-            play_pause_label,
-            gpui::rgb(0xee_ee_ee),
-            gpui::rgb(0x11_11_11),
-            move |_, cx| {
-                play_pause_target.update(cx, |video, cx| match play_action(video.state()) {
-                    PlayAction::OpenFile => video.open_dialog(cx),
-                    PlayAction::TogglePlayback => video.toggle_playback(cx),
-                })
-            },
-        ))
+        .child(play_button)
         .child(
             slider(
                 "vgpu-progress",
                 progress_ratio(position, duration),
                 player,
                 SliderKind::Progress,
+                !loading,
             )
             .flex_1(),
         )
@@ -283,6 +295,7 @@ fn slider(
     ratio: f32,
     player: &Entity<VideoPlayer>,
     kind: SliderKind,
+    enabled: bool,
 ) -> Stateful<Div> {
     let ratio = ratio.clamp(0.0, 1.0);
     let top = (SLIDER_HEIGHT - SLIDER_TRACK_HEIGHT) / 2.0;
@@ -311,66 +324,82 @@ fn slider(
     let up_entity = player.clone();
     let up_out_entity = player.clone();
 
-    div()
+    let mut root = div()
         .id(id)
         .relative()
         .h(px(SLIDER_HEIGHT))
-        .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |event, _, cx: &mut App| {
-            click_entity.update(cx, |video, cx| down(video, event.position.x, cx));
-        })
-        .on_mouse_move(move |event, _, cx: &mut App| {
-            if event.dragging() {
-                drag_entity.update(cx, |video, cx| drag(video, event.position.x, cx));
-            }
-            if matches!(kind, SliderKind::Volume) {
-                hover_entity.update(cx, |video, cx| {
-                    video.hover_volume_from_x(event.position.x, cx);
-                });
-            }
-        })
-        .on_hover(move |hovered, _, cx: &mut App| {
-            if !hovered && matches!(kind, SliderKind::Volume) {
-                hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
-            }
-        })
-        .on_mouse_up(MouseButton::Left, move |_, _, cx: &mut App| {
+        .opacity(if enabled { 1.0 } else { 0.5 });
+    root = if enabled {
+        root.cursor_pointer()
+    } else {
+        root.cursor_default()
+    };
+
+    root.on_mouse_down(MouseButton::Left, move |event, _, cx: &mut App| {
+        if !enabled {
+            return;
+        }
+        click_entity.update(cx, |video, cx| down(video, event.position.x, cx));
+    })
+    .on_mouse_move(move |event, _, cx: &mut App| {
+        if !enabled {
+            return;
+        }
+        if event.dragging() {
+            drag_entity.update(cx, |video, cx| drag(video, event.position.x, cx));
+        }
+        if matches!(kind, SliderKind::Volume) {
+            hover_entity.update(cx, |video, cx| {
+                video.hover_volume_from_x(event.position.x, cx);
+            });
+        }
+    })
+    .on_hover(move |hovered, _, cx: &mut App| {
+        if !hovered && matches!(kind, SliderKind::Volume) {
+            hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
+        }
+    })
+    .on_mouse_up(MouseButton::Left, move |_, _, cx: &mut App| {
+        if enabled {
             up_entity.update(cx, up);
-        })
-        .on_mouse_up_out(MouseButton::Left, move |_, _, cx: &mut App| {
+        }
+    })
+    .on_mouse_up_out(MouseButton::Left, move |_, _, cx: &mut App| {
+        if enabled {
             up_out_entity.update(cx, up);
-        })
-        .child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(top))
-                .w_full()
-                .h(px(SLIDER_TRACK_HEIGHT))
-                .rounded_full()
-                .bg(gpui::rgb(0x44_44_44)),
-        )
-        .child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(top))
-                .w(relative(ratio))
-                .h(px(SLIDER_TRACK_HEIGHT))
-                .rounded_full()
-                .bg(gpui::rgb(0xee_ee_ee)),
-        )
-        .child(
-            div().absolute().top_0().left_0().size_full().child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        bounds_entity.update(cx, |video, _| set_bounds(video, bounds));
-                    },
-                    |_, _, _, _| {},
-                )
-                .size_full(),
-            ),
-        )
+        }
+    })
+    .child(
+        div()
+            .absolute()
+            .left_0()
+            .top(px(top))
+            .w_full()
+            .h(px(SLIDER_TRACK_HEIGHT))
+            .rounded_full()
+            .bg(gpui::rgb(0x44_44_44)),
+    )
+    .child(
+        div()
+            .absolute()
+            .left_0()
+            .top(px(top))
+            .w(relative(ratio))
+            .h(px(SLIDER_TRACK_HEIGHT))
+            .rounded_full()
+            .bg(gpui::rgb(0xee_ee_ee)),
+    )
+    .child(
+        div().absolute().top_0().left_0().size_full().child(
+            canvas(
+                move |bounds, _window, cx| {
+                    bounds_entity.update(cx, |video, _| set_bounds(video, bounds));
+                },
+                |_, _, _, _| {},
+            )
+            .size_full(),
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -390,6 +419,7 @@ mod tests {
     fn play_button_opens_the_dialog_when_nothing_is_loaded() {
         assert_eq!(play_action(PlaybackState::Idle), PlayAction::OpenFile);
         for state in [
+            PlaybackState::Loading,
             PlaybackState::Ready,
             PlaybackState::Playing,
             PlaybackState::Paused,

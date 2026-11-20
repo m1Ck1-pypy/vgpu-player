@@ -5,14 +5,14 @@
 
 use std::time::Duration;
 
-use crate::SpectrumBars;
 use crate::SyncStats;
+use crate::{MediaReady, SpectrumBars};
 
 /// Что ядро сообщает UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Известна длительность файла.
-    DurationKnown(Duration),
+    /// Источник открыт: метаданные, длительность и возможность перемотки.
+    Ready(Box<MediaReady>),
     /// Позиция воспроизведения изменилась (этап 2).
     PositionChanged(Duration),
     /// Статистика синхронизации видео (этап 5).

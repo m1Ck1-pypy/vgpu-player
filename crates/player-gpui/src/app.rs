@@ -19,7 +19,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Render, ScrollDelta, ScrollEvent, SharedString, Stateful, Task,
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
-use player_core::{FfmpegVersions, MediaInfo};
+use player_core::{FfmpegVersions, MediaInfo, Source};
 use tracing::{debug, error, info, warn};
 
 use crate::controls::{format_clock, volume_percent};
@@ -136,7 +136,7 @@ struct PlayerWindow {
 }
 
 impl PlayerWindow {
-    fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+    fn new(source: Option<Source>, cx: &mut Context<Self>) -> Self {
         let settings_path = Settings::default_path();
         let settings = settings_path
             .as_deref()
@@ -151,8 +151,8 @@ impl PlayerWindow {
             video.set_stats_visible(settings.stats_visible, cx);
             video.set_volume(settings.volume, cx);
         });
-        if let Some(path) = path {
-            player.update(cx, |video, cx| video.open(path, cx));
+        if let Some(source) = source {
+            player.update(cx, |video, cx| video.open(source, cx));
         }
 
         let focus_handle = cx.focus_handle();
@@ -646,11 +646,14 @@ impl PlayerWindow {
     /// частоту звука из аудиодекодера, длительность из звука или видео.
     fn file_info_lines(&self, cx: &App) -> Vec<String> {
         let video = self.player.read(cx);
-        let (Some(path), Some(media)) = (video.path(), video.media_info()) else {
+        let (Some(source), Some(media)) = (video.source(), video.media_info()) else {
             return vec!["файл не открыт".to_owned()];
         };
 
-        file_info_lines(path, media, video.duration())
+        match source {
+            Source::File(path) => file_info_lines(path, media, video.duration()),
+            Source::Url(url) => url_info_lines(url, media, video.duration()),
+        }
     }
 
     /// Панель с несколькими строками текста поверх кадра.
@@ -905,6 +908,45 @@ fn file_info_lines(path: &Path, media: &MediaInfo, duration: Option<Duration>) -
         lines.push(facts.join(" · "));
     }
 
+    lines.extend(track_lines(media));
+    lines
+}
+
+/// Строки панели «Информация о файле» для URL.
+///
+/// Размера у ссылки нет, поэтому первая строка — последний сегмент пути, а
+/// вторая — полная ссылка, как путь у локального файла.
+fn url_info_lines(url: &str, media: &MediaInfo, duration: Option<Duration>) -> Vec<String> {
+    let name = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .and_then(|(_, path)| path.split(['?', '#']).next())
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(url)
+        .to_owned();
+
+    let mut lines = vec![name, url.to_owned()];
+
+    let mut facts = Vec::new();
+    if let Some(container) = &media.container {
+        facts.push(container.clone());
+    }
+    if let Some(duration) = duration {
+        facts.push(format!("длительность {}", format_clock(duration)));
+    }
+    if !facts.is_empty() {
+        lines.push(facts.join(" · "));
+    }
+
+    lines.extend(track_lines(media));
+    lines
+}
+
+/// Строки дорожек: кодек, размеры/кадры и параметры звука.
+fn track_lines(media: &MediaInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+
     if let Some(video) = &media.video {
         let mut parts = Vec::new();
         if let Some(codec) = &video.codec {
@@ -989,7 +1031,7 @@ fn spawn_auto_hide(cx: &mut Context<PlayerWindow>) -> Task<()> {
 }
 
 /// Открывает главное окно в уже запущенном приложении.
-fn open_main_window(cx: &mut App, path: Option<PathBuf>) -> gpui::Result<()> {
+fn open_main_window(cx: &mut App, source: Option<Source>) -> gpui::Result<()> {
     let bounds = Bounds::centered(None, size(px(960.0), px(540.0)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1002,7 +1044,7 @@ fn open_main_window(cx: &mut App, path: Option<PathBuf>) -> gpui::Result<()> {
 
     info!("открытие главного окна");
     cx.open_window(options, |_window, cx| {
-        cx.new(|cx| PlayerWindow::new(path, cx))
+        cx.new(|cx| PlayerWindow::new(source, cx))
     })?;
     Ok(())
 }
@@ -1012,12 +1054,12 @@ fn open_main_window(cx: &mut App, path: Option<PathBuf>) -> gpui::Result<()> {
 /// `Application::run` не умеет возвращать значение из колбэка, поэтому ошибку
 /// создания окна складываем в слот, останавливаем приложение и отдаём её уже
 /// после выхода из цикла событий.
-pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
+pub fn run_app_source(source: Option<Source>) -> Result<(), LaunchError> {
     let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let failure_slot = Rc::clone(&failure);
 
     gpui_platform::application().run(move |cx: &mut App| {
-        if let Err(err) = open_main_window(cx, path) {
+        if let Err(err) = open_main_window(cx, source) {
             error!(%err, "не удалось открыть окно");
             *failure_slot.borrow_mut() = Some(err.to_string());
             cx.quit();
@@ -1030,6 +1072,11 @@ pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
         Some(message) => Err(LaunchError { message }),
         None => Ok(()),
     }
+}
+
+/// Запуск по локальному пути: обёртка над [`run_app_source`].
+pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
+    run_app_source(path.map(Source::File))
 }
 
 #[cfg(test)]
@@ -1144,6 +1191,33 @@ mod tests {
         assert_eq!(
             lines,
             vec!["missing.mp4".to_owned(), "missing.mp4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn url_info_has_no_size_and_shows_the_link() {
+        let media = MediaInfo {
+            container: Some("Matroska / WebM".to_owned()),
+            ..MediaInfo::default()
+        };
+        let lines = url_info_lines(
+            "https://example.com/dir/movie.mkv?token=1",
+            &media,
+            Some(Duration::from_secs(5)),
+        );
+
+        assert_eq!(lines[0], "movie.mkv");
+        assert_eq!(lines[1], "https://example.com/dir/movie.mkv?token=1");
+        assert!(
+            lines.iter().any(|line| line.contains("Matroska")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("00:05")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("КБ") && !line.contains("МБ")),
+            "у URL нет размера: {lines:?}"
         );
     }
 

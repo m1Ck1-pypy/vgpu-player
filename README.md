@@ -75,7 +75,13 @@ cp .tools/vcpkg/installed/x64-windows/bin/*.dll target/debug/deps/
 ```bash
 cargo build -p player-app
 cargo run -p player-app -- path/to/video.mp4
+cargo run -p player-app -- file:///C:/video/movie.mp4
 ```
+
+Аргумент разбирается как источник: путь, `file://` или `https://`. Сетевой
+читатель появится на этапе 3; пока URL доходит до окна и показывает ошибку
+«источник пока не поддерживается». Локальные файлы играют как раньше, а окно
+во время открытия показывает «Загрузка…» и не замирает.
 
 Если сборка идёт из Git Bash и `PATH` подхватывает `/usr/bin/link.exe`, добавьте
 `RUSTFLAGS="-Clinker=rust-lld"` (см. `docs/SPEC.md`, раздел 12.4).

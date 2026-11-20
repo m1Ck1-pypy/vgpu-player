@@ -132,13 +132,9 @@ fn decode_video(source: &Source, limit: usize, seek: Option<f64>) -> anyhow::Res
 }
 
 fn play(source: &Source) -> anyhow::Result<()> {
-    // Сначала открываем ядро: если источник битый или отсутствует, отдельный
-    // декодер только добавит шума в лог.
+    // Открытие теперь асинхронное: `open` только запускает поток, а метаданные
+    // и длительность приходят событием `Ready`.
     let player = to_anyhow(Player::open(source.clone()))?;
-
-    // Параметры видео берём из отдельного декодера: в контракте событий их
-    // пока нет (передача кадров и метаданных в UI — этап 4).
-    let video = video_info(source);
 
     to_anyhow(player.send(Command::Play))?;
     info!(source = %source, "воспроизведение начато");
@@ -152,10 +148,12 @@ fn play(source: &Source) -> anyhow::Result<()> {
     loop {
         while let Some(event) = player.try_recv_event() {
             match event {
-                Event::DurationKnown(known) => {
-                    duration = Some(known);
-                    println!("duration: {}", format_clock(known));
-                    if let Some(info) = video {
+                Event::Ready(ready) => {
+                    duration = ready.duration;
+                    if let Some(known) = ready.duration {
+                        println!("duration: {}", format_clock(known));
+                    }
+                    if let Some(info) = ready.video_info {
                         println!("video: {}", describe_video(info));
                     }
                 }
@@ -203,19 +201,6 @@ fn play(source: &Source) -> anyhow::Result<()> {
             player.recycle_frame(frame);
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Параметры видео, если в источнике есть видеодорожка.
-fn video_info(source: &Source) -> Option<VideoInfo> {
-    match VideoDecoder::open_source(source) {
-        Ok(decoder) => Some(*decoder.info()),
-        // Только звук — нормальный сценарий, не ошибка CLI.
-        Err(PlayerError::NoVideoTrack { .. }) => None,
-        Err(video_error) => {
-            error!(%video_error, "не удалось прочитать параметры видео");
-            None
-        }
     }
 }
 

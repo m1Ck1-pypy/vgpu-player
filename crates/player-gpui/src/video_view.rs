@@ -158,7 +158,11 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
 
 /// Рисуем ли спектр: только для файла без видео и не в текстовых состояниях.
 fn shows_spectrum(state: PlaybackState, has_video: bool) -> bool {
-    !has_video && !matches!(state, PlaybackState::Idle | PlaybackState::Failed)
+    !has_video
+        && !matches!(
+            state,
+            PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
+        )
 }
 
 /// Визуализатор звука: столбики растут от нижнего края окна вверх, как
@@ -299,6 +303,7 @@ fn fit_rect(bounds: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels> {
 fn describe(state: PlaybackState, error: Option<&str>) -> Option<(SharedString, SharedString)> {
     match state {
         PlaybackState::Idle => Some(("видео не открыто".into(), "player-gpui <file>".into())),
+        PlaybackState::Loading => Some(("Загрузка…".into(), "".into())),
         PlaybackState::Ready | PlaybackState::Paused => None,
         PlaybackState::Playing => Some(("воспроизведение".into(), "ожидание первого кадра".into())),
         PlaybackState::Ended => Some((
@@ -419,12 +424,21 @@ mod tests {
     }
 
     #[test]
+    fn loading_state_shows_progress_text() {
+        let (title, detail) =
+            describe(PlaybackState::Loading, None).expect("у загрузки есть текст");
+        assert_eq!(title, "Загрузка…");
+        assert!(detail.is_empty());
+    }
+
+    #[test]
     fn spectrum_is_only_for_audio_files() {
         assert!(shows_spectrum(PlaybackState::Ready, false));
         assert!(shows_spectrum(PlaybackState::Playing, false));
         assert!(shows_spectrum(PlaybackState::Paused, false));
         assert!(shows_spectrum(PlaybackState::Ended, false));
         assert!(!shows_spectrum(PlaybackState::Idle, false));
+        assert!(!shows_spectrum(PlaybackState::Loading, false));
         assert!(!shows_spectrum(PlaybackState::Failed, false));
         assert!(!shows_spectrum(PlaybackState::Playing, true));
     }

@@ -95,9 +95,49 @@ pub enum PlayerError {
         /// Источник.
         target: Source,
     },
+    /// По ссылке пришёл пустой ответ.
+    #[error("по ссылке нет данных: {target}")]
+    EmptySource {
+        /// Источник.
+        target: Source,
+    },
+    /// Сервер ответил не-2xx.
+    #[error("сервер вернул {status} для {target}")]
+    HttpStatus {
+        /// Источник.
+        target: Source,
+        /// Код ответа.
+        status: u16,
+    },
+    /// Сеть: таймаут, DNS, TLS или обрыв.
+    #[error("сеть: {message}")]
+    Network {
+        /// Источник.
+        target: Source,
+        /// Причина в готовом для показа виде.
+        message: String,
+    },
+    /// Ответ не является медиафайлом (например, `text/html`).
+    #[error("по ссылке не медиафайл: {target}")]
+    NotMedia {
+        /// Источник.
+        target: Source,
+    },
+    /// Источник не поддерживает перемотку.
+    #[error("источник не поддерживает перемотку: {target}")]
+    NotSeekable {
+        /// Источник.
+        target: Source,
+    },
     /// Строку не удалось разобрать как URL или путь.
     #[error(transparent)]
     Source(#[from] SourceError),
+    /// Открытие отменено: пришёл `Stop`, новый `Open` или `Player` уничтожен.
+    ///
+    /// Внутренний путь: до UI эта ошибка не доходит, ядро молча ждёт
+    /// следующую команду.
+    #[error("открытие отменено")]
+    Cancelled,
     /// Звуковое устройство недоступно.
     #[error("звуковое устройство недоступно: {0}")]
     AudioDevice(#[source] rodio::DeviceSinkError),
@@ -172,6 +212,49 @@ mod tests {
             error.to_string(),
             "HLS пока не поддерживается: https://example.com/v.mp4?…"
         );
+    }
+
+    #[test]
+    fn network_errors_name_the_link() {
+        let target = Source::Url("https://example.com/v.mkv?token=secret".to_owned());
+        let hidden = "https://example.com/v.mkv?…";
+
+        assert_eq!(
+            PlayerError::EmptySource {
+                target: target.clone()
+            }
+            .to_string(),
+            format!("по ссылке нет данных: {hidden}")
+        );
+        assert_eq!(
+            PlayerError::HttpStatus {
+                target: target.clone(),
+                status: 404
+            }
+            .to_string(),
+            format!("сервер вернул 404 для {hidden}")
+        );
+        assert_eq!(
+            PlayerError::NotMedia {
+                target: target.clone()
+            }
+            .to_string(),
+            format!("по ссылке не медиафайл: {hidden}")
+        );
+        assert_eq!(
+            PlayerError::NotSeekable { target }.to_string(),
+            format!("источник не поддерживает перемотку: {hidden}")
+        );
+    }
+
+    #[test]
+    fn network_failure_is_a_plain_reason() {
+        let error = PlayerError::Network {
+            target: Source::Url("https://example.com/v.mp4".to_owned()),
+            message: "connection refused".to_owned(),
+        };
+
+        assert_eq!(error.to_string(), "сеть: connection refused");
     }
 
     #[test]

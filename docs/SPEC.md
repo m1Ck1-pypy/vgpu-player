@@ -261,18 +261,21 @@ pub struct MediaReady {
 
 ### Этап 2 — асинхронное открытие
 
-- [ ] `Player::open` только запускает поток и ставит `Open`.
-- [ ] `Media` открывается в цикле ядра; ошибки — `Event::Error`, поток жив.
-- [ ] `Event::Ready(Box<MediaReady>)`; `DurationKnown` удаляется.
-- [ ] `Loading` в `VideoPlayer`, `video_view`, `controls_view`.
-- [ ] Одно ядро на плеер; `retry`, `EngineGone`, отмена `Stop`/`Open`/`Drop`.
-- [ ] `preview_frame` только для файлов.
-- [ ] `run_app_source`; README и примеры (doc-тесты) обновлены.
-- [ ] Тесты: медленный читатель, `open` < 50 мс; ошибки открытия — событием.
+- [x] `Player::open` только запускает поток и ставит `Open`.
+- [x] `Media` открывается в цикле ядра; ошибки — `Event::Error`, поток жив.
+- [x] `Event::Ready(Box<MediaReady>)`; `DurationKnown` удаляется.
+- [x] `Loading` в `VideoPlayer`, `video_view`, `controls_view`.
+- [x] Одно ядро на плеер; `retry`, `EngineGone`, отмена `Stop`/`Open`/`Drop`.
+- [x] `preview_frame` только для файлов.
+- [x] `run_app_source`; README и примеры (doc-тесты) обновлены.
+- [x] Тесты: медленный читатель, `open` < 50 мс; ошибки открытия — событием.
+- [x] `player.rs` разделён на `player.rs`/`media.rs`/`engine.rs` (2.0).
 
 Приёмка: окно не замирает; локальные файлы без регрессий; ошибки понятны.
 
 ### Этап 3 — HTTP(S) VOD
+
+Подэтапы 3.0–3.6 и открытые вопросы — в `docs/CURRENT_TASK.md`.
 
 - [ ] `ureq` 3.5.x + `native-tls`; на агенте явно `TlsProvider::NativeTls`
       и `RootCerts::PlatformVerifier`.
