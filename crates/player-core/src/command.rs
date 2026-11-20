@@ -1,7 +1,8 @@
 //! Команды управления из UI в ядро.
 
-use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::Source;
 
 /// Что UI может попросить у ядра.
 ///
@@ -12,8 +13,8 @@ use std::time::Duration;
 /// полного порядка.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Открыть файл и подготовить дорожки.
-    Open(PathBuf),
+    /// Открыть файл или URL и подготовить дорожки.
+    Open(Source),
     /// Продолжить воспроизведение.
     Play,
     /// Приостановить воспроизведение.

@@ -9,7 +9,7 @@
 //! неограниченный.
 
 use std::num::{NonZeroU16, NonZeroU32};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -23,6 +23,7 @@ use tracing::{debug, error, info};
 
 use crate::audio::{AudioChunk, AudioDecoder};
 use crate::clock::AudioClock;
+use crate::source::Source as MediaSource;
 use crate::spectrum::{
     SAMPLE_RING_CAPACITY, SpectrumAnalyzer, SpectrumBars, SpectrumRing, SpectrumTap,
 };
@@ -94,16 +95,16 @@ pub struct Player {
 }
 
 impl Player {
-    /// Открывает файл и запускает поток ядра.
+    /// Открывает источник и запускает поток ядра.
     ///
     /// Хотя бы одна дорожка — звук или видео — должна открыться. Ошибки
     /// открытия возвращаются сразу, а не приходят событием: вызывающему нужно
     /// знать о них до того, как он начнёт строить UI.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, PlayerError> {
-        let path = path.into();
-        let media = Media::open(&path)?;
+    pub fn open(source: impl Into<MediaSource>) -> Result<Self, PlayerError> {
+        let source = source.into();
+        let media = Media::open(&source)?;
         let video_info = media.video_info();
-        let media_info = media.info(&path);
+        let media_info = media.info(&source);
 
         let (command_sender, command_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
@@ -301,39 +302,47 @@ impl Media {
     /// Ошибку одной дорожки при живой другой не считаем фатальной: ролик без
     /// звука или со сломанным видео должен всё равно играть. Когда не открылось
     /// ничего, возвращаем ошибку звука — она возникает первой и обычно точнее
-    /// описывает проблему с файлом. Подробные состояния ошибок — этап 7.
-    fn open(path: &Path) -> Result<Self, PlayerError> {
+    /// описывает проблему с источником. Подробные состояния ошибок — этап 7.
+    fn open(source: &MediaSource) -> Result<Self, PlayerError> {
+        // Плейлист — не медиапоток: до него ещё нет HLS-клиента.
+        if source.is_hls() {
+            return Err(PlayerError::UnsupportedHls {
+                target: source.clone(),
+            });
+        }
+
         // Пустой файл даёт от Symphonia и FFmpeg разные непонятные тексты,
         // поэтому проверяем его сами и говорим прямо.
-        if let Ok(metadata) = std::fs::metadata(path)
+        if let Some(path) = source.as_file()
+            && let Ok(metadata) = std::fs::metadata(path)
             && metadata.is_file()
             && metadata.len() == 0
         {
             return Err(PlayerError::EmptyFile {
-                path: path.to_path_buf(),
+                target: source.clone(),
             });
         }
 
-        let audio = AudioDecoder::open(path);
-        let video = VideoDecoder::open(path);
+        let audio = AudioDecoder::open(source);
+        let video = VideoDecoder::open_source(source);
 
         match (audio, video) {
             (Ok(audio), Ok(video)) => {
-                info!(path = %path.display(), "открыты звук и видео");
+                info!(source = %source, "открыты звук и видео");
                 Ok(Self {
                     audio: Some(audio),
                     video: Some(video),
                 })
             }
             (Ok(audio), Err(video_error)) => {
-                debug!(path = %path.display(), %video_error, "видеодорожка недоступна");
+                debug!(source = %source, %video_error, "видеодорожка недоступна");
                 Ok(Self {
                     audio: Some(audio),
                     video: None,
                 })
             }
             (Err(audio_error), Ok(video)) => {
-                debug!(path = %path.display(), %audio_error, "аудиодорожка недоступна");
+                debug!(source = %source, %audio_error, "аудиодорожка недоступна");
                 Ok(Self {
                     audio: None,
                     video: Some(video),
@@ -341,10 +350,10 @@ impl Media {
             }
             (Err(audio_error), Err(video_error)) => {
                 error!(
-                    path = %path.display(),
+                    source = %source,
                     %audio_error,
                     %video_error,
-                    "файл не открылся ни как звук, ни как видео"
+                    "источник не открылся ни как звук, ни как видео"
                 );
                 Err(audio_error)
             }
@@ -364,13 +373,36 @@ impl Media {
         self.video.as_ref().map(|video| *video.info())
     }
 
-    /// Что известно о файле целиком — для панели «Информация о файле».
-    fn info(&self, path: &Path) -> MediaInfo {
+    /// Что известно о содержимом источника — для панели «Информация о файле».
+    ///
+    /// Для локального файла заголовок читается отдельным проходом; для URL
+    /// его нет, поэтому контейнер и кодеки берём из уже открытых декодеров.
+    fn info(&self, source: &MediaSource) -> MediaInfo {
         let ProbedTracks {
             container,
             video_codec,
             audio_codec,
-        } = probe_tracks(path);
+        } = match source {
+            MediaSource::File(path) => probe_tracks(path),
+            MediaSource::Url(_) => ProbedTracks {
+                container: self
+                    .video
+                    .as_ref()
+                    .and_then(|video| video.container_name())
+                    .or_else(|| self.audio.as_ref().and_then(|audio| audio.container_name()))
+                    .map(str::to_owned),
+                video_codec: self
+                    .video
+                    .as_ref()
+                    .and_then(|video| video.codec_name())
+                    .map(str::to_owned),
+                audio_codec: self
+                    .audio
+                    .as_ref()
+                    .and_then(|audio| audio.codec_name())
+                    .map(str::to_owned),
+            },
+        };
 
         MediaInfo {
             container,
@@ -603,16 +635,16 @@ fn run_engine(
                 );
             }
             Ok(EngineMessage {
-                command: Command::Open(path),
+                command: Command::Open(source),
                 epoch,
             }) => {
                 if let Some(epoch) = epoch {
                     frame_epoch = epoch;
                 }
-                info!(path = %path.display(), "открытие нового файла");
+                info!(source = %source, "открытие нового источника");
                 tail_started = false;
                 last_shown_pts = None;
-                let opened = Media::open(&path)?;
+                let opened = Media::open(&source)?;
                 if opened.audio.is_some() && output.is_none() {
                     output = Some(AudioSink::open(volume)?);
                 }
@@ -1401,6 +1433,18 @@ mod tests {
             panic!("мусорный файл должен давать ошибку");
         };
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn url_source_reports_a_clear_error_for_now() {
+        let source = MediaSource::Url("https://example.com/video.mp4?token=secret".to_owned());
+        let Err(error) = Player::open(source) else {
+            panic!("URL пока не должен открываться");
+        };
+
+        assert!(matches!(error, PlayerError::UnsupportedSource { .. }));
+        assert!(error.to_string().contains("?…"), "{error}");
+        assert!(!error.to_string().contains("secret"), "{error}");
     }
 
     #[test]

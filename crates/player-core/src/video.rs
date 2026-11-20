@@ -5,8 +5,10 @@
 //! Этап 3 — только декодирование; очередь кадров и синхронизация с аудио
 //! появятся на этапах 4–5.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ffmpeg::format::Pixel;
@@ -16,7 +18,7 @@ use ffmpeg::util::frame::video::Video as FfmpegFrame;
 use ffmpeg::{Error as FfmpegError, Rational};
 use tracing::debug;
 
-use crate::PlayerError;
+use crate::{PlayerError, Source};
 
 /// Допуск при точной перемотке: PTS кадра может быть чуть раньше цели.
 const SEEK_EPSILON: Duration = Duration::from_millis(1);
@@ -72,15 +74,21 @@ pub fn preview_frame(path: &Path) -> Option<VideoFrame> {
     }
 }
 
-/// Открытый файл: демультиплексор, декодер видеодорожки и конвертер в BGRA.
+/// Открытый источник: демультиплексор, декодер видеодорожки и конвертер в BGRA.
 pub struct VideoDecoder {
-    path: PathBuf,
+    source: Source,
     input: ffmpeg::format::context::Input,
     decoder: ffmpeg::decoder::Video,
     stream_index: usize,
     time_base: Rational,
     converter: FrameConverter,
     info: VideoInfo,
+    /// Название контейнера от FFmpeg — для панели информации о URL.
+    container: Option<String>,
+    /// Короткое имя кодека от FFmpeg — для панели информации о URL.
+    codec: Option<String>,
+    /// Флаг отмены: FFmpeg опрашивает его во время блокирующего чтения.
+    cancel: Arc<AtomicBool>,
     /// `send_eof` уже отработал: дальше только дочитываем кадры из декодера.
     eof_sent: bool,
     /// Кадр, уже декодированный перемоткой и ждущий конвертации.
@@ -93,38 +101,75 @@ pub struct VideoDecoder {
 // передачу владения, а не общий доступ.
 unsafe impl Send for VideoDecoder {}
 
+impl Drop for VideoDecoder {
+    fn drop(&mut self) {
+        // Снимаем возможное блокирующее чтение до закрытия контекста FFmpeg.
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl VideoDecoder {
     /// Открывает файл и готовит декодер первой видеодорожки.
     pub fn open(path: &Path) -> Result<Self, PlayerError> {
-        init_ffmpeg(path)?;
+        Self::open_source(&Source::File(path.to_path_buf()))
+    }
 
-        // Проверяем файл средствами ОС: иначе отсутствие файла придёт из
-        // FFmpeg как безликая errno-ошибка без понятного пути.
-        std::fs::File::open(path).map_err(|source| PlayerError::OpenFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    /// Открывает источник и готовит декодер первой видеодорожки.
+    pub fn open_source(source: &Source) -> Result<Self, PlayerError> {
+        // Плейлист — не медиапоток: сообщаем это до любых попыток открытия.
+        if source.is_hls() {
+            return Err(PlayerError::UnsupportedHls {
+                target: source.clone(),
+            });
+        }
 
-        let input = ffmpeg::format::input(&path).map_err(|error| video_error(path, error))?;
+        init_ffmpeg(source)?;
 
-        let (stream_index, time_base, frame_rate, decoder) = {
+        let reader = crate::reader::open_reader(source)?;
+        let hint = reader.hint_name().map(str::to_owned);
+        debug!(
+            len = reader.len(),
+            seekable = reader.is_seekable(),
+            hint = ?hint,
+            "видеоисточник открыт"
+        );
+        let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(reader)
+            .map_err(|error| video_error(source, error))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupt = Arc::clone(&cancel);
+        let input = ffmpeg::format::input_from_stream_with_interrupt(
+            stream_io,
+            hint.as_deref(),
+            None,
+            move || interrupt.load(Ordering::Relaxed),
+        )
+        .map_err(|error| video_error(source, error))?;
+
+        let (stream_index, time_base, frame_rate, decoder, codec) = {
             let stream =
                 input
                     .streams()
                     .best(Type::Video)
                     .ok_or_else(|| PlayerError::NoVideoTrack {
-                        path: path.to_path_buf(),
+                        target: source.clone(),
                     })?;
+            let codec = codec_name_of(&stream.parameters());
 
             let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-                .map_err(|error| video_error(path, error))?;
+                .map_err(|error| video_error(source, error))?;
             let decoder = context
                 .decoder()
                 .video()
-                .map_err(|error| video_error(path, error))?;
+                .map_err(|error| video_error(source, error))?;
             let frame_rate = frame_rate_of(&decoder, stream.avg_frame_rate());
 
-            (stream.index(), stream.time_base(), frame_rate, decoder)
+            (
+                stream.index(),
+                stream.time_base(),
+                frame_rate,
+                decoder,
+                codec,
+            )
         };
 
         let info = VideoInfo {
@@ -133,15 +178,19 @@ impl VideoDecoder {
             frame_rate,
             duration: container_duration(&input),
         };
+        let container = container_name(&input);
 
         Ok(Self {
-            path: path.to_path_buf(),
+            source: source.clone(),
             input,
             decoder,
             stream_index,
             time_base,
             converter: FrameConverter::new(),
             info,
+            container,
+            codec,
+            cancel,
             eof_sent: false,
             pending: None,
         })
@@ -150,6 +199,16 @@ impl VideoDecoder {
     /// Параметры открытого видеопотока.
     pub fn info(&self) -> &VideoInfo {
         &self.info
+    }
+
+    /// Название контейнера, как его даёт FFmpeg.
+    pub fn container_name(&self) -> Option<&str> {
+        self.container.as_deref()
+    }
+
+    /// Короткое имя кодека: `h264`, `hevc`, `av1`.
+    pub fn codec_name(&self) -> Option<&str> {
+        self.codec.as_deref()
     }
 
     /// Декодирует следующий кадр. `None` — файл закончился.
@@ -189,7 +248,7 @@ impl VideoDecoder {
                 Ok(()) => return Ok(Some(decoded)),
                 Err(FfmpegError::Eof) => return Ok(None),
                 Err(error) if is_eagain(&error) => {}
-                Err(error) => return Err(video_error(&self.path, error)),
+                Err(error) => return Err(video_error(&self.source, error)),
             }
 
             // После `send_eof` декодер обязан отдать кадры и затем EOF.
@@ -203,13 +262,13 @@ impl VideoDecoder {
                 Some(packet) => match self.decoder.send_packet(&packet) {
                     Ok(()) => {}
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(video_error(&self.path, error)),
+                    Err(error) => return Err(video_error(&self.source, error)),
                 },
                 None => match self.decoder.send_eof() {
                     Ok(()) => self.eof_sent = true,
                     // Не все пакеты ещё забраны — сначала дочитаем их.
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(video_error(&self.path, error)),
+                    Err(error) => return Err(video_error(&self.source, error)),
                 },
             }
         }
@@ -227,7 +286,7 @@ impl VideoDecoder {
         let timestamp = i64::try_from(position.as_micros()).unwrap_or(i64::MAX);
         self.input
             .seek(timestamp, ..)
-            .map_err(|error| video_error(&self.path, error))?;
+            .map_err(|error| video_error(&self.source, error))?;
         self.decoder.flush();
         self.eof_sent = false;
 
@@ -264,7 +323,7 @@ impl VideoDecoder {
                 Err(FfmpegError::Eof) => return Ok(None),
                 // Битый пакет не повод останавливать воспроизведение.
                 Err(FfmpegError::InvalidData) => continue,
-                Err(error) => return Err(video_error(&self.path, error)),
+                Err(error) => return Err(video_error(&self.source, error)),
             }
         }
     }
@@ -278,7 +337,7 @@ impl VideoDecoder {
         let bgra = self
             .converter
             .convert_into(decoded, buffer)
-            .map_err(|error| video_error(&self.path, error))?;
+            .map_err(|error| video_error(&self.source, error))?;
 
         Ok(VideoFrame {
             width: decoded.width(),
@@ -376,14 +435,14 @@ impl FrameConverter {
 /// Общая точка для видео и аудио: тесты открывают декодеры параллельно, а
 /// `ffmpeg::init()` не обещает потокобезопасности — `OnceLock` снимает этот
 /// вопрос.
-pub(crate) fn init_ffmpeg(path: &Path) -> Result<(), PlayerError> {
+pub(crate) fn init_ffmpeg(target: &Source) -> Result<(), PlayerError> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = INIT.get_or_init(|| ffmpeg::init().map_err(|error| error.to_string()));
 
     match result {
         Ok(()) => Ok(()),
         Err(message) => Err(PlayerError::VideoDecode {
-            path: path.to_path_buf(),
+            target: target.clone(),
             message: format!("FFmpeg не инициализирован: {message}"),
         }),
     }
@@ -396,6 +455,18 @@ fn container_duration(input: &ffmpeg::format::context::Input) -> Option<Duration
         return None;
     }
     u64::try_from(duration).ok().map(Duration::from_micros)
+}
+
+/// Название контейнера по-человечески (`QuickTime / MOV`).
+pub(crate) fn container_name(input: &ffmpeg::format::context::Input) -> Option<String> {
+    let description = input.format().description().to_owned();
+    (!description.is_empty()).then_some(description)
+}
+
+/// Короткое имя кодека (`h264`, `hevc`, `av1`).
+pub(crate) fn codec_name_of(parameters: &ffmpeg::codec::Parameters) -> Option<String> {
+    let name = parameters.id().name();
+    (!name.is_empty() && name != "none").then(|| name.to_owned())
 }
 
 /// Частота кадров: сначала из декодера, затем из среднего по потоку.
@@ -426,10 +497,10 @@ fn is_eagain(error: &FfmpegError) -> bool {
     matches!(error, FfmpegError::Other { errno } if *errno == ffmpeg::error::EAGAIN)
 }
 
-/// Ошибка FFmpeg с путём к файлу.
-fn video_error(path: &Path, error: FfmpegError) -> PlayerError {
+/// Ошибка FFmpeg с источником.
+fn video_error(target: &Source, error: FfmpegError) -> PlayerError {
     PlayerError::VideoDecode {
-        path: path.to_path_buf(),
+        target: target.clone(),
         message: describe_error(&error),
     }
 }
@@ -647,6 +718,43 @@ mod tests {
         }
 
         assert!(frames > 0, "ни одного кадра не декодировано");
+    }
+
+    #[test]
+    fn source_file_decodes_like_a_path() {
+        let Some(path) = sample_video() else {
+            eprintln!("тестовое видео недоступно (нет ассета и системного ffmpeg) — пропускаем");
+            return;
+        };
+
+        let source = Source::File(path.clone());
+        let mut from_path = VideoDecoder::open(&path).expect("открыть по пути");
+        let mut from_source = VideoDecoder::open_source(&source).expect("открыть по Source");
+
+        assert_eq!(from_path.info(), from_source.info());
+        assert!(from_source.container_name().is_some());
+        assert!(from_source.codec_name().is_some());
+
+        let path_frame = from_path.next_frame().expect("кадр по пути");
+        let source_frame = from_source.next_frame().expect("кадр по Source");
+        assert_eq!(path_frame, source_frame);
+        assert!(path_frame.is_some(), "кадр по Source должен декодироваться");
+    }
+
+    #[test]
+    fn hls_is_rejected_before_opening() {
+        for source in [
+            Source::File(temp_path("m3u8")),
+            Source::Url("https://example.com/live/index.m3u8?token=1".to_owned()),
+        ] {
+            let Err(error) = VideoDecoder::open_source(&source) else {
+                panic!("HLS должен быть отклонён");
+            };
+            assert!(
+                matches!(error, PlayerError::UnsupportedHls { .. }),
+                "ожидалась ошибка HLS, получено: {error}"
+            );
+        }
     }
 
     #[test]

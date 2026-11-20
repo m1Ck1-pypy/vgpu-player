@@ -11,7 +11,9 @@
 //! знают, какой бэкенд работает.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ffmpeg::format::Sample as FfmpegSample;
@@ -30,8 +32,8 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use tracing::{debug, info};
 
-use crate::PlayerError;
-use crate::video::init_ffmpeg;
+use crate::video::{codec_name_of, container_name, init_ffmpeg};
+use crate::{PlayerError, Source};
 
 /// Готовый блок сэмплов: `f32`, каналы вперемешку.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,27 +48,32 @@ pub(crate) enum AudioDecoder {
     /// Основной путь: Symphonia.
     Symphonia(SymphoniaDecoder),
     /// Запасной путь: FFmpeg для кодеков, которых нет в Symphonia.
-    Ffmpeg(FfmpegDecoder),
+    Ffmpeg(Box<FfmpegDecoder>),
 }
 
 impl AudioDecoder {
     /// Открывает звуковую дорожку: сначала Symphonia, затем FFmpeg.
     ///
     /// Ошибку Symphonia возвращаем, только если FFmpeg тоже не справился:
-    /// для битого файла её текст обычно понятнее.
-    pub(crate) fn open(path: &Path) -> Result<Self, PlayerError> {
+    /// для битого файла её текст обычно понятнее. Для URL Symphonia не годится
+    /// (`MediaSource` требует `Sync`), поэтому там сразу FFmpeg.
+    pub(crate) fn open(source: &Source) -> Result<Self, PlayerError> {
+        let Source::File(path) = source else {
+            return FfmpegDecoder::open(source).map(|decoder| Self::Ffmpeg(Box::new(decoder)));
+        };
+
         match SymphoniaDecoder::open(path) {
             Ok(decoder) => Ok(Self::Symphonia(decoder)),
             // Нет файла или нет прав: второй бэкенд даст ту же ошибку.
             Err(error @ PlayerError::OpenFile { .. }) => Err(error),
-            Err(primary_error) => match FfmpegDecoder::open(path) {
+            Err(primary_error) => match FfmpegDecoder::open(source) {
                 Ok(decoder) => {
                     info!(
                         path = %path.display(),
                         %primary_error,
                         "звук открыт через FFmpeg"
                     );
-                    Ok(Self::Ffmpeg(decoder))
+                    Ok(Self::Ffmpeg(Box::new(decoder)))
                 }
                 Err(fallback_error) => {
                     debug!(
@@ -119,6 +126,22 @@ impl AudioDecoder {
             Self::Ffmpeg(decoder) => decoder.seek(position),
         }
     }
+
+    /// Название контейнера; Symphonia его не отдаёт в нужном виде.
+    pub(crate) fn container_name(&self) -> Option<&str> {
+        match self {
+            Self::Symphonia(_) => None,
+            Self::Ffmpeg(decoder) => decoder.container_name(),
+        }
+    }
+
+    /// Короткое имя кодека.
+    pub(crate) fn codec_name(&self) -> Option<&str> {
+        match self {
+            Self::Symphonia(_) => None,
+            Self::Ffmpeg(decoder) => decoder.codec_name(),
+        }
+    }
 }
 
 /// Открытый файл через Symphonia: демультиплексор плюс декодер.
@@ -137,8 +160,9 @@ pub(crate) struct SymphoniaDecoder {
 impl SymphoniaDecoder {
     /// Открывает файл и готовит декодер первой пригодной аудиодорожки.
     fn open(path: &Path) -> Result<Self, PlayerError> {
+        let target = Source::File(path.to_path_buf());
         let file = File::open(path).map_err(|source| PlayerError::OpenFile {
-            path: path.to_path_buf(),
+            target: target.clone(),
             source,
         })?;
         let stream = MediaSourceStream::new(Box::new(file), Default::default());
@@ -156,7 +180,7 @@ impl SymphoniaDecoder {
                 &MetadataOptions::default(),
             )
             .map_err(|source| PlayerError::Unsupported {
-                path: path.to_path_buf(),
+                target: target.clone(),
                 source,
             })?;
 
@@ -174,14 +198,14 @@ impl SymphoniaDecoder {
                         && track.codec_params.sample_rate.is_some()
                 })
                 .ok_or_else(|| PlayerError::NoPlayableTrack {
-                    path: path.to_path_buf(),
+                    target: target.clone(),
                 })?;
 
             let params = &track.codec_params;
             let sample_rate = params
                 .sample_rate
                 .ok_or_else(|| PlayerError::NoPlayableTrack {
-                    path: path.to_path_buf(),
+                    target: target.clone(),
                 })?;
             let channels = params.channels.map_or(1, |channels| channels.count());
             let channels = u16::try_from(channels)
@@ -197,7 +221,7 @@ impl SymphoniaDecoder {
             let decoder = symphonia::default::get_codecs()
                 .make(params, &DecoderOptions::default())
                 .map_err(|source| PlayerError::Unsupported {
-                    path: path.to_path_buf(),
+                    target: target.clone(),
                     source,
                 })?;
 
@@ -322,7 +346,7 @@ impl SymphoniaDecoder {
 
 /// Аудиодекодер FFmpeg для кодеков, которых нет в Symphonia (например, Opus).
 pub(crate) struct FfmpegDecoder {
-    path: PathBuf,
+    target: Source,
     input: ffmpeg::format::context::Input,
     decoder: ffmpeg::decoder::Audio,
     stream_index: usize,
@@ -330,6 +354,12 @@ pub(crate) struct FfmpegDecoder {
     channels: u16,
     sample_rate: u32,
     duration: Option<Duration>,
+    /// Название контейнера от FFmpeg.
+    container: Option<String>,
+    /// Короткое имя кодека от FFmpeg.
+    codec: Option<String>,
+    /// Флаг отмены: FFmpeg опрашивает его во время блокирующего чтения.
+    cancel: Arc<AtomicBool>,
     /// Конвертер в `f32` вперемешку; пересобирается при смене формата.
     resampler: Option<ResamplingContext>,
     /// Параметры, под которые настроен `resampler`.
@@ -347,35 +377,54 @@ pub(crate) struct FfmpegDecoder {
 // используется только там. `Send` разрешает именно передачу владения.
 unsafe impl Send for FfmpegDecoder {}
 
+impl Drop for FfmpegDecoder {
+    fn drop(&mut self) {
+        // Снимаем возможное блокирующее чтение до закрытия контекста FFmpeg.
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 impl FfmpegDecoder {
     /// Открывает первую аудиодорожку через FFmpeg.
-    fn open(path: &Path) -> Result<Self, PlayerError> {
-        init_ffmpeg(path)?;
+    fn open(target: &Source) -> Result<Self, PlayerError> {
+        init_ffmpeg(target)?;
 
-        // Проверяем файл средствами ОС: иначе отсутствие файла придёт из
-        // FFmpeg как безликая errno-ошибка без понятного пути.
-        std::fs::File::open(path).map_err(|source| PlayerError::OpenFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let reader = crate::reader::open_reader(target)?;
+        let hint = reader.hint_name().map(str::to_owned);
+        debug!(
+            len = reader.len(),
+            seekable = reader.is_seekable(),
+            hint = ?hint,
+            "аудиоисточник открыт"
+        );
+        let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(reader)
+            .map_err(|error| audio_error(target, error))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupt = Arc::clone(&cancel);
+        let input = ffmpeg::format::input_from_stream_with_interrupt(
+            stream_io,
+            hint.as_deref(),
+            None,
+            move || interrupt.load(Ordering::Relaxed),
+        )
+        .map_err(|error| audio_error(target, error))?;
 
-        let input = ffmpeg::format::input(&path).map_err(|error| audio_error(path, error))?;
-
-        let (stream_index, time_base, decoder) = {
+        let (stream_index, time_base, decoder, codec) = {
             let stream = input.streams().best(MediaType::Audio).ok_or_else(|| {
                 PlayerError::NoPlayableTrack {
-                    path: path.to_path_buf(),
+                    target: target.clone(),
                 }
             })?;
+            let codec = codec_name_of(&stream.parameters());
 
             let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-                .map_err(|error| audio_error(path, error))?;
+                .map_err(|error| audio_error(target, error))?;
             let decoder = context
                 .decoder()
                 .audio()
-                .map_err(|error| audio_error(path, error))?;
+                .map_err(|error| audio_error(target, error))?;
 
-            (stream.index(), stream.time_base(), decoder)
+            (stream.index(), stream.time_base(), decoder, codec)
         };
 
         let channels = decoder.channels();
@@ -388,9 +437,10 @@ impl FfmpegDecoder {
         }
 
         let duration = container_duration(&input);
+        let container = container_name(&input);
 
         Ok(Self {
-            path: path.to_path_buf(),
+            target: target.clone(),
             input,
             decoder,
             stream_index,
@@ -398,12 +448,23 @@ impl FfmpegDecoder {
             channels,
             sample_rate,
             duration,
+            container,
+            codec,
+            cancel,
             resampler: None,
             source: None,
             discard_until: None,
             eof_sent: false,
             converted_chunks: 0,
         })
+    }
+
+    fn container_name(&self) -> Option<&str> {
+        self.container.as_deref()
+    }
+
+    fn codec_name(&self) -> Option<&str> {
+        self.codec.as_deref()
     }
 
     fn duration(&self) -> Option<Duration> {
@@ -436,7 +497,7 @@ impl FfmpegDecoder {
                     return Ok(None);
                 }
                 Err(error) if is_eagain(&error) => {}
-                Err(error) => return Err(audio_error(&self.path, error)),
+                Err(error) => return Err(audio_error(&self.target, error)),
             }
 
             if self.eof_sent {
@@ -448,13 +509,13 @@ impl FfmpegDecoder {
                 Some(packet) => match self.decoder.send_packet(&packet) {
                     Ok(()) => {}
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(audio_error(&self.path, error)),
+                    Err(error) => return Err(audio_error(&self.target, error)),
                 },
                 None => match self.decoder.send_eof() {
                     Ok(()) => self.eof_sent = true,
                     // Не все пакеты ещё забраны — сначала дочитаем их.
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(audio_error(&self.path, error)),
+                    Err(error) => return Err(audio_error(&self.target, error)),
                 },
             }
         }
@@ -479,7 +540,7 @@ impl FfmpegDecoder {
                     debug!("аудио: битый пакет пропущен");
                     continue;
                 }
-                Err(error) => return Err(audio_error(&self.path, error)),
+                Err(error) => return Err(audio_error(&self.target, error)),
             }
         }
     }
@@ -490,7 +551,7 @@ impl FfmpegDecoder {
         let timestamp = i64::try_from(position.as_micros()).unwrap_or(i64::MAX);
         self.input
             .seek(timestamp, ..)
-            .map_err(|error| audio_error(&self.path, error))?;
+            .map_err(|error| audio_error(&self.target, error))?;
         self.decoder.flush();
         self.discard_until = Some(position);
         self.eof_sent = false;
@@ -539,7 +600,7 @@ impl FfmpegDecoder {
                     source.1,
                     source.2,
                 )
-                .map_err(|error| audio_error(&self.path, error))?,
+                .map_err(|error| audio_error(&self.target, error))?,
             );
             self.source = Some(source);
         }
@@ -563,7 +624,7 @@ impl FfmpegDecoder {
         );
         resampler
             .run(frame, &mut converted)
-            .map_err(|error| audio_error(&self.path, error))?;
+            .map_err(|error| audio_error(&self.target, error))?;
 
         self.converted_chunks = self.converted_chunks.saturating_add(1);
         if self.converted_chunks == 1 || self.converted_chunks.is_multiple_of(200) {
@@ -615,9 +676,9 @@ fn chunk_from(decoded: symphonia::core::audio::AudioBufferRef<'_>) -> AudioChunk
 }
 
 /// Ошибка FFmpeg с путём к файлу.
-fn audio_error(path: &Path, error: FfmpegError) -> PlayerError {
+fn audio_error(target: &Source, error: FfmpegError) -> PlayerError {
     PlayerError::AudioDecode {
-        path: path.to_path_buf(),
+        target: target.clone(),
         message: error.to_string(),
     }
 }
@@ -729,7 +790,7 @@ mod tests {
         let path = temp_path();
         write_wav(&path);
 
-        let mut decoder = AudioDecoder::open(&path).expect("открыть wav");
+        let mut decoder = AudioDecoder::open(&Source::from(&path)).expect("открыть wav");
         assert_eq!(decoder.duration(), Some(Duration::from_secs(4)));
 
         let mut total = 0;
@@ -748,7 +809,7 @@ mod tests {
         let path = temp_path();
         write_wav(&path);
 
-        let mut decoder = AudioDecoder::open(&path).expect("открыть wav");
+        let mut decoder = AudioDecoder::open(&Source::from(&path)).expect("открыть wav");
         decoder
             .seek(Duration::from_secs(2))
             .expect("перемотать на середину");
@@ -775,7 +836,7 @@ mod tests {
     fn missing_file_is_a_error() {
         let path = std::env::temp_dir().join("vgpu-player-definitely-missing.wav");
         assert!(matches!(
-            AudioDecoder::open(&path),
+            AudioDecoder::open(&Source::from(&path)),
             Err(PlayerError::OpenFile { .. })
         ));
     }
@@ -818,7 +879,8 @@ mod tests {
             return;
         };
 
-        let decoder = AudioDecoder::open(&path).expect("найти аудиодорожку в mp4 с видео");
+        let decoder =
+            AudioDecoder::open(&Source::from(&path)).expect("найти аудиодорожку в mp4 с видео");
         assert!(decoder.sample_rate() > 0);
 
         fs::remove_file(&path).expect("удалить тестовый mp4");
@@ -855,7 +917,7 @@ mod tests {
             return;
         };
 
-        let mut decoder = AudioDecoder::open(&path).expect("открыть AAC");
+        let mut decoder = AudioDecoder::open(&Source::from(&path)).expect("открыть AAC");
         assert_eq!(decoder.channels(), 2, "AAC-файл stereo, а не mono");
         assert_eq!(decoder.sample_rate(), 44_100);
 
@@ -902,7 +964,7 @@ mod tests {
             return;
         };
 
-        let mut decoder = AudioDecoder::open(&path).expect("открыть Opus");
+        let mut decoder = AudioDecoder::open(&Source::from(&path)).expect("открыть Opus");
         assert_eq!(decoder.sample_rate(), 48_000);
 
         let mut total = 0;
@@ -928,7 +990,7 @@ mod tests {
             return;
         };
 
-        let mut decoder = AudioDecoder::open(&path).expect("открыть Opus");
+        let mut decoder = AudioDecoder::open(&Source::from(&path)).expect("открыть Opus");
         decoder
             .seek(Duration::from_millis(300))
             .expect("перемотать Opus");
