@@ -6,9 +6,8 @@
 //! появятся на этапах 4–5.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ffmpeg::format::Pixel;
@@ -18,6 +17,8 @@ use ffmpeg::util::frame::video::Video as FfmpegFrame;
 use ffmpeg::{Error as FfmpegError, Rational};
 use tracing::debug;
 
+use crate::http::{HttpCounters, HttpFailure};
+use crate::sync::NetworkStats;
 use crate::{PlayerError, Source};
 
 /// Допуск при точной перемотке: PTS кадра может быть чуть раньше цели.
@@ -89,6 +90,14 @@ pub struct VideoDecoder {
     codec: Option<String>,
     /// Флаг отмены: FFmpeg опрашивает его во время блокирующего чтения.
     cancel: Arc<AtomicBool>,
+    /// Можно ли перематывать источник.
+    seekable: bool,
+    /// Слот HTTP-ошибки: им заменяем безликий `invalid data` FFmpeg.
+    http_failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
+    /// Флаг «ждём сеть» для события `Buffering`.
+    buffering: Option<Arc<AtomicBool>>,
+    /// Счётчики сети для статистики (только у URL).
+    counters: Option<Arc<HttpCounters>>,
     /// `send_eof` уже отработал: дальше только дочитываем кадры из декодера.
     eof_sent: bool,
     /// Кадр, уже декодированный перемоткой и ждущий конвертации.
@@ -116,6 +125,14 @@ impl VideoDecoder {
 
     /// Открывает источник и готовит декодер первой видеодорожки.
     pub fn open_source(source: &Source) -> Result<Self, PlayerError> {
+        Self::open_source_with_cancel(source, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Открывает источник с отменой сетевого читателя.
+    pub(crate) fn open_source_with_cancel(
+        source: &Source,
+        reader_cancel: Arc<AtomicBool>,
+    ) -> Result<Self, PlayerError> {
         // Плейлист — не медиапоток: сообщаем это до любых попыток открытия.
         if source.is_hls() {
             return Err(PlayerError::UnsupportedHls {
@@ -125,16 +142,21 @@ impl VideoDecoder {
 
         init_ffmpeg(source)?;
 
-        let reader = crate::reader::open_reader(source)?;
+        let opened = crate::reader::open_reader(source, reader_cancel)?;
+        let seekable = opened.reader.is_seekable();
+        let failure = opened.failure;
+        let buffering = opened.buffering;
+        let counters = opened.counters;
+        let reader = opened.reader;
         let hint = reader.hint_name().map(str::to_owned);
         debug!(
             len = reader.len(),
-            seekable = reader.is_seekable(),
+            seekable,
             hint = ?hint,
             "видеоисточник открыт"
         );
         let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(reader)
-            .map_err(|error| video_error(source, error))?;
+            .map_err(|error| open_error(source, &failure, error))?;
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::clone(&cancel);
         let input = ffmpeg::format::input_from_stream_with_interrupt(
@@ -143,7 +165,7 @@ impl VideoDecoder {
             None,
             move || interrupt.load(Ordering::Relaxed),
         )
-        .map_err(|error| video_error(source, error))?;
+        .map_err(|error| open_error(source, &failure, error))?;
 
         let (stream_index, time_base, frame_rate, decoder, codec) = {
             let stream =
@@ -156,11 +178,11 @@ impl VideoDecoder {
             let codec = codec_name_of(&stream.parameters());
 
             let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-                .map_err(|error| video_error(source, error))?;
+                .map_err(|error| open_error(source, &failure, error))?;
             let decoder = context
                 .decoder()
                 .video()
-                .map_err(|error| video_error(source, error))?;
+                .map_err(|error| open_error(source, &failure, error))?;
             let frame_rate = frame_rate_of(&decoder, stream.avg_frame_rate());
 
             (
@@ -191,9 +213,45 @@ impl VideoDecoder {
             container,
             codec,
             cancel,
+            seekable,
+            http_failure: failure,
+            buffering,
+            counters,
             eof_sent: false,
             pending: None,
         })
+    }
+
+    /// Можно ли перематывать источник.
+    pub(crate) fn is_seekable(&self) -> bool {
+        self.seekable
+    }
+
+    /// Ждёт ли читатель сеть прямо сейчас.
+    pub(crate) fn is_buffering(&self) -> bool {
+        self.buffering
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Счётчики сети; `None` — источник не сетевой.
+    pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
+        self.counters.as_ref().map(|counters| counters.snapshot())
+    }
+
+    /// Забирает сетевую ошибку, если читатель её записал.
+    fn take_http_failure(&self) -> Option<HttpFailure> {
+        self.http_failure
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().and_then(|mut guard| guard.take()))
+    }
+
+    /// Ошибка FFmpeg с подменой на понятную сетевую, если она есть.
+    fn error(&self, error: FfmpegError) -> PlayerError {
+        if let Some(failure) = self.take_http_failure() {
+            return failure.into_player_error(&self.source);
+        }
+        video_error(&self.source, error)
     }
 
     /// Параметры открытого видеопотока.
@@ -248,7 +306,7 @@ impl VideoDecoder {
                 Ok(()) => return Ok(Some(decoded)),
                 Err(FfmpegError::Eof) => return Ok(None),
                 Err(error) if is_eagain(&error) => {}
-                Err(error) => return Err(video_error(&self.source, error)),
+                Err(error) => return Err(self.error(error)),
             }
 
             // После `send_eof` декодер обязан отдать кадры и затем EOF.
@@ -262,13 +320,13 @@ impl VideoDecoder {
                 Some(packet) => match self.decoder.send_packet(&packet) {
                     Ok(()) => {}
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(video_error(&self.source, error)),
+                    Err(error) => return Err(self.error(error)),
                 },
                 None => match self.decoder.send_eof() {
                     Ok(()) => self.eof_sent = true,
                     // Не все пакеты ещё забраны — сначала дочитаем их.
                     Err(error) if is_eagain(&error) => {}
-                    Err(error) => return Err(video_error(&self.source, error)),
+                    Err(error) => return Err(self.error(error)),
                 },
             }
         }
@@ -286,7 +344,7 @@ impl VideoDecoder {
         let timestamp = i64::try_from(position.as_micros()).unwrap_or(i64::MAX);
         self.input
             .seek(timestamp, ..)
-            .map_err(|error| video_error(&self.source, error))?;
+            .map_err(|error| self.error(error))?;
         self.decoder.flush();
         self.eof_sent = false;
 
@@ -322,8 +380,13 @@ impl VideoDecoder {
                 }
                 Err(FfmpegError::Eof) => return Ok(None),
                 // Битый пакет не повод останавливать воспроизведение.
-                Err(FfmpegError::InvalidData) => continue,
-                Err(error) => return Err(video_error(&self.source, error)),
+                Err(FfmpegError::InvalidData) => {
+                    if self.http_failure.is_none() {
+                        continue;
+                    }
+                    return Err(self.error(FfmpegError::InvalidData));
+                }
+                Err(error) => return Err(self.error(error)),
             }
         }
     }
@@ -337,7 +400,7 @@ impl VideoDecoder {
         let bgra = self
             .converter
             .convert_into(decoded, buffer)
-            .map_err(|error| video_error(&self.source, error))?;
+            .map_err(|error| self.error(error))?;
 
         Ok(VideoFrame {
             width: decoded.width(),
@@ -498,6 +561,20 @@ fn is_eagain(error: &FfmpegError) -> bool {
 }
 
 /// Ошибка FFmpeg с источником.
+fn open_error(
+    target: &Source,
+    failure: &Option<Arc<Mutex<Option<HttpFailure>>>>,
+    error: FfmpegError,
+) -> PlayerError {
+    if let Some(failure) = failure
+        .as_ref()
+        .and_then(|slot| slot.lock().ok().and_then(|mut guard| guard.take()))
+    {
+        return failure.into_player_error(target);
+    }
+    video_error(target, error)
+}
+
 fn video_error(target: &Source, error: FfmpegError) -> PlayerError {
     PlayerError::VideoDecode {
         target: target.clone(),
@@ -586,6 +663,38 @@ pub(crate) mod test_support {
     pub(crate) fn sample_av1_video() -> Option<PathBuf> {
         let asset = asset_path("av1_test.webm");
         asset.is_file().then_some(asset)
+    }
+
+    /// Звук без видео: `audio_only.m4a` из `assets/test`.
+    pub(crate) fn sample_audio() -> Option<PathBuf> {
+        let asset = asset_path("audio_only.m4a");
+        asset.is_file().then_some(asset)
+    }
+
+    /// Короткий файл со звуком и видео: `sync_test.webm`.
+    pub(crate) fn sample_av() -> Option<PathBuf> {
+        let asset = asset_path("sync_test.webm");
+        asset.is_file().then_some(asset)
+    }
+
+    /// Короткий клип для матрицы форматов: ассет из `assets/test`, иначе
+    /// генерация системным `ffmpeg`.
+    ///
+    /// `None` — ни ассета, ни подходящего `ffmpeg`: тест пропускается.
+    pub(crate) fn sample_clip(asset: &str, extension: &str, args: &[&str]) -> Option<PathBuf> {
+        let asset = asset_path(asset);
+        if asset.is_file() {
+            return Some(asset);
+        }
+
+        let path = temp_path(extension);
+        let status = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y"])
+            .args(args)
+            .arg(&path)
+            .status();
+
+        matches!(status, Ok(status) if status.success()).then_some(path)
     }
 
     /// Путь к файлу в `assets/test/`.

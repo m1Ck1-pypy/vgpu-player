@@ -63,7 +63,7 @@ impl Player {
     pub fn open(source: impl Into<MediaSource>) -> Result<Self, PlayerError> {
         Self::spawn(
             source.into(),
-            Box::new(|source, cancelled| Media::open_with(source, cancelled)),
+            Box::new(|source, cancel, cancelled| Media::open_with(source, cancel, cancelled)),
         )
     }
 
@@ -73,7 +73,10 @@ impl Player {
         source: impl Into<MediaSource>,
         opener: impl Fn(&MediaSource, &dyn Fn() -> bool) -> Result<Media, PlayerError> + Send + 'static,
     ) -> Result<Self, PlayerError> {
-        Self::spawn(source.into(), Box::new(opener))
+        Self::spawn(
+            source.into(),
+            Box::new(move |source, _cancel, cancelled| opener(source, cancelled)),
+        )
     }
 
     fn spawn(source: MediaSource, opener: Opener) -> Result<Self, PlayerError> {
@@ -238,7 +241,51 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::MediaReady;
-    use crate::video::test_support::{sample_av1_video, sample_video, temp_path};
+    use crate::video::test_support::{
+        sample_audio, sample_av, sample_av1_video, sample_clip, sample_video, temp_path,
+    };
+
+    /// Видеоклип 0.5 с для матрицы контейнеров (MP4, MKV).
+    const VIDEO_CLIP: &[&str] = &[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x48:rate=30",
+        "-t",
+        "0.5",
+        "-c:v",
+        "mpeg4",
+        "-pix_fmt",
+        "yuv420p",
+    ];
+
+    /// Тот же клип в WebM (нужен кодек VP8/VP9).
+    const WEBM_CLIP: &[&str] = &[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x48:rate=30",
+        "-t",
+        "0.5",
+        "-c:v",
+        "libvpx",
+        "-b:v",
+        "200k",
+    ];
+
+    /// Звук 0.5 с в MP3.
+    const MP3_CLIP: &[&str] = &[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=44100",
+        "-t",
+        "0.5",
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "9",
+    ];
 
     /// Ждёт событие, удовлетворяющее условию, и забирает его из канала.
     fn wait_event(
@@ -532,25 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn url_source_reports_a_clear_error_for_now() {
-        let source = MediaSource::Url("https://example.com/video.mp4?token=secret".to_owned());
-        let player = Player::open(source).expect("поток должен запуститься");
-
-        let Some(Event::Error(message)) = wait_event(&player, Duration::from_secs(5), |event| {
-            matches!(event, Event::Error(_))
-        }) else {
-            panic!("URL пока не должен открываться");
-        };
-
-        assert!(
-            message.contains("источник пока не поддерживается"),
-            "{message}"
-        );
-        assert!(message.contains("?…"), "{message}");
-        assert!(!message.contains("secret"), "{message}");
-    }
-
-    #[test]
     fn engine_survives_an_open_error() {
         let missing = temp_path("mp4");
         let player = Player::open(&missing).expect("поток должен запуститься");
@@ -606,6 +634,119 @@ mod tests {
             started.elapsed() >= Duration::from_millis(250),
             "Ready не должен приходить раньше открытия"
         );
+    }
+
+    fn served(
+        path: &std::path::Path,
+        content_type: &'static str,
+        name: &'static str,
+        honor_range: bool,
+    ) -> crate::http::test_support::ServedFile {
+        let bytes = std::fs::read(path).expect("прочитать тестовый файл");
+        crate::http::test_support::serve(bytes, content_type, name, honor_range)
+    }
+
+    #[test]
+    fn url_video_opens_and_plays() {
+        let Some(path) = sample_video() else {
+            eprintln!("тестовое видео недоступно (нет ассета и системного ffmpeg) — пропускаем");
+            return;
+        };
+        let server = served(&path, "video/mp4", "video.mp4", true);
+        let player = Player::open(MediaSource::Url(server.url.clone())).expect("поток");
+
+        let ready = wait_ready(&player);
+        assert!(ready.seekable, "Range поддерживается");
+        assert!(ready.video_info.is_some(), "видеодорожка");
+        assert!(ready.media_info.container.is_some(), "контейнер");
+
+        player.send(Command::Play).expect("Play");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut frame = None;
+        while Instant::now() < deadline && frame.is_none() {
+            frame = player.try_recv_frame();
+            if frame.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(frame.is_some(), "кадр должен прийти по HTTP");
+    }
+
+    #[test]
+    fn url_without_range_is_not_seekable() {
+        let Some(path) = sample_av() else {
+            eprintln!("нет assets/test/sync_test.webm — пропускаем проверку без Range");
+            return;
+        };
+        let server = served(&path, "video/webm", "video.webm", false);
+        let player = Player::open(MediaSource::Url(server.url.clone())).expect("поток");
+
+        let ready = wait_ready(&player);
+        assert!(!ready.seekable, "сервер без Range не перематывается");
+        assert!(ready.video_info.is_some());
+        assert!(ready.media_info.audio.is_some());
+    }
+
+    #[test]
+    fn url_audio_opens_through_ffmpeg() {
+        let Some(path) = sample_audio() else {
+            eprintln!("нет assets/test/audio_only.m4a — пропускаем проверку звука по URL");
+            return;
+        };
+        let server = served(&path, "audio/mp4", "audio.m4a", true);
+        let player = Player::open(MediaSource::Url(server.url.clone())).expect("поток");
+
+        let ready = wait_ready(&player);
+        assert!(ready.video_info.is_none(), "в m4a нет видео");
+        assert!(ready.media_info.audio.is_some(), "звук открылся");
+        assert!(ready.seekable, "Range поддерживается");
+    }
+
+    /// Открывает клип по HTTP и ждёт `Ready`; `None` — клип не удалось
+    /// подготовить (нет ни ассета, ни `ffmpeg` для нужного кодека).
+    fn url_clip_ready(
+        asset: &str,
+        extension: &str,
+        args: &[&str],
+        content_type: &'static str,
+    ) -> Option<MediaReady> {
+        let path = sample_clip(asset, extension, args)?;
+        let server = served(&path, content_type, "clip", true);
+        let player = Player::open(MediaSource::Url(server.url.clone())).expect("поток");
+        Some(wait_ready(&player))
+    }
+
+    #[test]
+    fn url_mkv_opens_and_plays() {
+        let Some(ready) = url_clip_ready("video_only.mkv", "mkv", VIDEO_CLIP, "video/x-matroska")
+        else {
+            eprintln!("нет mkv и не удалось сгенерировать — пропускаем");
+            return;
+        };
+        assert!(ready.video_info.is_some(), "видеодорожка mkv");
+        assert!(ready.seekable, "Range поддерживается");
+        assert!(ready.media_info.container.is_some(), "контейнер известен");
+    }
+
+    #[test]
+    fn url_webm_opens_and_plays() {
+        let Some(ready) = url_clip_ready("video_only.webm", "webm", WEBM_CLIP, "video/webm") else {
+            eprintln!("нет webm и не удалось сгенерировать — пропускаем");
+            return;
+        };
+        assert!(ready.video_info.is_some(), "видеодорожка webm");
+        assert!(ready.seekable, "Range поддерживается");
+    }
+
+    #[test]
+    fn url_mp3_opens_through_ffmpeg() {
+        let Some(ready) = url_clip_ready("audio_only.mp3", "mp3", MP3_CLIP, "audio/mpeg") else {
+            eprintln!("нет mp3 и не удалось сгенерировать — пропускаем");
+            return;
+        };
+        assert!(ready.video_info.is_none(), "в mp3 нет видео");
+        assert!(ready.media_info.audio.is_some(), "звук открылся");
+        assert!(ready.seekable, "Range поддерживается");
     }
 
     #[test]

@@ -7,7 +7,10 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
+use crate::http::{HttpConfig, HttpCounters, HttpFailure, HttpReader};
 use crate::{PlayerError, Source};
 
 /// Источник байтов для FFmpeg.
@@ -74,22 +77,51 @@ impl MediaReader for FileReader {
     }
 }
 
+/// Открытый читатель и слот сетевой ошибки, если она есть.
+pub(crate) struct OpenedReader {
+    pub(crate) reader: Box<dyn MediaReader>,
+    /// Слот HTTP-ошибки: декодер заменит им `invalid data` от FFmpeg.
+    pub(crate) failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
+    /// Флаг «ждём сеть» для события `Buffering`.
+    pub(crate) buffering: Option<Arc<AtomicBool>>,
+    /// Счётчики сети для оверлея статистики.
+    pub(crate) counters: Option<Arc<HttpCounters>>,
+}
+
 /// Открывает читатель для источника.
 ///
-/// Сетевой читатель появится на следующем этапе; до него URL даёт понятную
-/// ошибку вместо попытки открыть файл с именем `https://…`.
-pub(crate) fn open_reader(source: &Source) -> Result<Box<dyn MediaReader>, PlayerError> {
+/// Файл даёт [`FileReader`], URL — [`HttpReader`]; декодеры дальше не знают,
+/// откуда пришли байты. `cancel` — флаг ядра: сетевой читатель должен прервать
+/// блокирующее чтение при `Stop`/`Drop`.
+pub(crate) fn open_reader(
+    source: &Source,
+    cancel: Arc<AtomicBool>,
+) -> Result<OpenedReader, PlayerError> {
     match source {
         Source::File(path) => {
             let reader = FileReader::open(path).map_err(|error| PlayerError::OpenFile {
                 target: source.clone(),
                 source: error,
             })?;
-            Ok(Box::new(reader))
+            Ok(OpenedReader {
+                reader: Box::new(reader),
+                failure: None,
+                buffering: None,
+                counters: None,
+            })
         }
-        Source::Url(_) => Err(PlayerError::UnsupportedSource {
-            target: source.clone(),
-        }),
+        Source::Url(_) => {
+            let reader = HttpReader::open(source, HttpConfig::default(), cancel)?;
+            let failure = reader.failure_slot();
+            let buffering = reader.buffering_flag();
+            let counters = reader.counters();
+            Ok(OpenedReader {
+                reader: Box::new(reader),
+                failure: Some(failure),
+                buffering: Some(buffering),
+                counters: Some(counters),
+            })
+        }
     }
 }
 
@@ -171,12 +203,16 @@ mod tests {
     }
 
     #[test]
-    fn url_reader_is_not_available_yet() {
-        let source = Source::Url("https://example.com/video.mp4".to_owned());
-        let Err(error) = open_reader(&source) else {
-            panic!("URL пока не читается");
-        };
+    fn file_reader_has_no_http_failure() {
+        let path = write_sample(b"data");
+        let opened = open_reader(
+            &Source::File(path.clone()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("открыть файл");
 
-        assert!(matches!(error, PlayerError::UnsupportedSource { .. }));
+        assert!(opened.failure.is_none());
+        assert!(opened.buffering.is_none());
+        let _ = std::fs::remove_file(path);
     }
 }

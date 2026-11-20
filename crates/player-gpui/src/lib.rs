@@ -62,6 +62,7 @@ pub use player_core::{
 mod app;
 mod controls;
 mod icons;
+mod open_panel;
 mod settings;
 mod video_player;
 mod video_view;

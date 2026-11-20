@@ -5,6 +5,8 @@
 //! только одну из дорожек, и тогда открывается то, что удалось.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ffmpeg::media::Type;
@@ -13,12 +15,15 @@ use tracing::{debug, error, info};
 use crate::PlayerError;
 use crate::audio::AudioDecoder;
 use crate::source::Source as MediaSource;
+use crate::sync::NetworkStats;
 use crate::video::{VideoDecoder, VideoInfo};
 
 /// Открытые источники файла. Любой из них может отсутствовать.
 pub(crate) struct Media {
     pub(crate) audio: Option<AudioDecoder>,
     pub(crate) video: Option<VideoDecoder>,
+    /// Можно ли перематывать источник (учитываются открытые дорожки).
+    seekable: bool,
 }
 
 impl Media {
@@ -31,15 +36,17 @@ impl Media {
     /// Открывает источник для тестов: без контроля отмены.
     #[cfg(test)]
     pub(crate) fn open(source: &MediaSource) -> Result<Self, PlayerError> {
-        Self::open_with(source, &|| false)
+        Self::open_with(source, Arc::new(AtomicBool::new(false)), &|| false)
     }
 
     /// Открывает источник и между шагами проверяет, не отменили ли открытие.
     ///
-    /// Шаги — звук, видео и заголовок. Внутри самого декодера отмена станет
-    /// возможна на этапе 3, когда появится сетевой читатель.
+    /// `cancel` уходит в сетевой читатель: он должен прервать блокирующее
+    /// чтение при `Stop`/`Drop`. `cancelled` — более широкий признак, включая
+    /// смену источника (`open_seq`).
     pub(crate) fn open_with(
         source: &MediaSource,
+        cancel: Arc<AtomicBool>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, PlayerError> {
         if cancelled() {
@@ -65,14 +72,24 @@ impl Media {
             });
         }
 
-        let audio = AudioDecoder::open(source);
+        let audio = AudioDecoder::open_with_cancel(source, Arc::clone(&cancel));
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
-        let video = VideoDecoder::open_source(source);
+        let video = VideoDecoder::open_source_with_cancel(source, Arc::clone(&cancel));
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
+
+        // Перемотка возможна, только если её поддерживают все открытые дорожки.
+        let seekable = audio
+            .as_ref()
+            .map(AudioDecoder::is_seekable)
+            .unwrap_or(true)
+            && video
+                .as_ref()
+                .map(VideoDecoder::is_seekable)
+                .unwrap_or(true);
 
         match (audio, video) {
             (Ok(audio), Ok(video)) => {
@@ -80,6 +97,7 @@ impl Media {
                 Ok(Self {
                     audio: Some(audio),
                     video: Some(video),
+                    seekable,
                 })
             }
             (Ok(audio), Err(video_error)) => {
@@ -87,6 +105,7 @@ impl Media {
                 Ok(Self {
                     audio: Some(audio),
                     video: None,
+                    seekable,
                 })
             }
             (Err(audio_error), Ok(video)) => {
@@ -94,6 +113,7 @@ impl Media {
                 Ok(Self {
                     audio: None,
                     video: Some(video),
+                    seekable,
                 })
             }
             (Err(audio_error), Err(video_error)) => {
@@ -106,6 +126,41 @@ impl Media {
                 Err(audio_error)
             }
         }
+    }
+
+    /// Можно ли перематывать источник.
+    pub(crate) fn is_seekable(&self) -> bool {
+        self.seekable
+    }
+
+    /// Ждёт ли хотя бы одна дорожка сеть.
+    pub(crate) fn is_buffering(&self) -> bool {
+        self.audio.as_ref().is_some_and(AudioDecoder::is_buffering)
+            || self.video.as_ref().is_some_and(VideoDecoder::is_buffering)
+    }
+
+    /// Счётчики сети для статистики.
+    ///
+    /// Читателей два (звук и видео), поэтому запросы и байты складываем: важно
+    /// сколько сети потрачено в сумме, а не кем именно.
+    pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
+        let mut total: Option<NetworkStats> = None;
+        for stats in [
+            self.audio.as_ref().and_then(AudioDecoder::network_stats),
+            self.video.as_ref().and_then(VideoDecoder::network_stats),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let summary = total.get_or_insert_default();
+            summary.requests = summary.requests.saturating_add(stats.requests);
+            summary.bytes = summary.bytes.saturating_add(stats.bytes);
+            summary.slow_reads = summary.slow_reads.saturating_add(stats.slow_reads);
+            summary.slow_ms = summary.slow_ms.saturating_add(stats.slow_ms);
+            summary.retries = summary.retries.saturating_add(stats.retries);
+            summary.restarts = summary.restarts.saturating_add(stats.restarts);
+        }
+        total
     }
 
     /// Длительность: из звука, иначе из видео.
@@ -127,7 +182,7 @@ impl Media {
             media_info: self.info(source),
             video_info: self.video_info(),
             duration: self.duration(),
-            seekable: is_seekable(source),
+            seekable: self.seekable,
             live: false,
         }
     }
@@ -200,12 +255,6 @@ pub struct MediaReady {
     pub seekable: bool,
     /// Идёт ли поток в реальном времени (пока всегда `false`).
     pub live: bool,
-}
-
-/// Перематывать можно только локальный источник: у URL это решит `HttpReader`
-/// по ответу на `Range` (этап 3).
-fn is_seekable(source: &MediaSource) -> bool {
-    source.as_file().is_some()
 }
 
 /// Что известно о содержимом открытого файла.
@@ -285,7 +334,7 @@ fn probe_tracks(path: &Path) -> ProbedTracks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::test_support::sample_video;
+    use crate::video::test_support::{sample_clip, sample_video};
 
     #[test]
     fn ready_describes_an_open_video() {
@@ -306,10 +355,73 @@ mod tests {
         assert!(!ready.live, "файл не является live-потоком");
     }
 
+    /// Замер трафика для этапа 4.
+    ///
+    /// Звук и видео — независимые читатели, поэтому файл качается дважды;
+    /// тест печатает фактическое соотношение и сторожит от лавины запросов.
     #[test]
-    fn url_sources_are_not_seekable_yet() {
-        let source = MediaSource::Url("https://example.com/video.mp4".to_owned());
+    fn url_traffic_is_measured() {
+        const AV_CLIP: &[&str] = &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "10",
+            "-c:v",
+            "mpeg4",
+            "-b:v",
+            "4M",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "9",
+        ];
 
-        assert!(!is_seekable(&source));
+        for extension in ["mp4", "mkv"] {
+            let asset = format!("av_clip.{extension}");
+            let Some(path) = sample_clip(&asset, extension, AV_CLIP) else {
+                eprintln!("{extension}: нет клипа и нет ffmpeg — пропускаем");
+                continue;
+            };
+            let bytes = std::fs::read(&path).expect("прочитать клип");
+            let len = bytes.len() as u64;
+            if len == 0 {
+                eprintln!("{extension}: пустой клип — пропускаем");
+                continue;
+            }
+
+            let server = crate::http::test_support::serve(bytes, "video/mp4", "clip", true);
+            let source = MediaSource::Url(server.url.clone());
+            let mut media = Media::open(&source).expect("открыть клип по HTTP");
+
+            if let Some(video) = media.video.as_mut() {
+                while video
+                    .next_frame_with_buffer(None)
+                    .expect("декодировать кадр")
+                    .is_some()
+                {}
+            }
+            if let Some(audio) = media.audio.as_mut() {
+                while audio.next_chunk().expect("декодировать звук").is_some() {}
+            }
+
+            let stats = media.network_stats().expect("счётчики сети");
+            let ratio = stats.bytes as f64 / len as f64;
+            println!(
+                "{extension}: файл {len} Б, сеть {} Б ({ratio:.2}×), запросов {}",
+                stats.bytes, stats.requests
+            );
+            assert!(stats.bytes >= len, "данные должны быть прочитаны");
+            // Два читателя плюс окна, отброшенные после перемоток демуксера:
+            // сейчас это ориентир для этапа 4, а не требование.
+            assert!(ratio < 8.0, "трафик не должен разрастаться: {ratio:.2}×");
+        }
     }
 }

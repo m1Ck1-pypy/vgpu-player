@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::controls::{format_clock, volume_percent};
 use crate::icons::{ICON_SIZE, Icon, icon};
+use crate::open_panel::{OpenPanel, PanelAction, PanelChoice};
 use crate::settings::Settings;
 use crate::{VideoPlayer, controls_view, video_view};
 
@@ -69,10 +70,11 @@ enum Shortcut {
     CloseOverlays,
 }
 
-/// Сопоставляет клавишу действию.
+/// Сопоставляет клавишу действию плеера.
 ///
-/// Модификаторы не учитываем: в окне нет текстового ввода, а Ctrl/Alt-сочетания
-/// лучше не перехватывать.
+/// Модификаторы здесь не учитываем: они важны только панели «Открыть…», где
+/// `Ctrl+V` вставляет ссылку. Пока поле ввода открыто, этот обработчик вообще
+/// не вызывается.
 fn shortcut(key: &str) -> Option<Shortcut> {
     match key {
         "space" => Some(Shortcut::TogglePlayback),
@@ -112,6 +114,10 @@ struct PlayerWindow {
     about_open: bool,
     /// Показана панель «Информация о файле» поверх кадра.
     file_info_open: bool,
+    /// Панель «Открыть…»: выбор «Файл»/«URL» и поле ввода ссылки.
+    open_panel: OpenPanel,
+    /// Текст ошибки разбора ссылки: панель остаётся открытой для правки.
+    open_panel_error: Option<String>,
     /// Скрывать панель управления после бездействия (пункт меню).
     auto_hide_enabled: bool,
     /// Файл настроек; `None` — каталог пользователя не определить, и тогда
@@ -166,6 +172,8 @@ impl PlayerWindow {
             menu_open: false,
             about_open: false,
             file_info_open: false,
+            open_panel: OpenPanel::default(),
+            open_panel_error: None,
             auto_hide_enabled: settings.auto_hide,
             settings_path,
             saved_settings: settings,
@@ -258,7 +266,25 @@ impl PlayerWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(shortcut) = shortcut(&event.keystroke.key) else {
+        let key = event.keystroke.key.as_str();
+        // На macOS вставка — Command+V; на Windows и Linux — Control+V.
+        let ctrl = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+
+        // Пока панель «Открыть…» открыта, клавиши принадлежат ей: пробел,
+        // стрелки и Esc не должны управлять воспроизведением.
+        if self.open_panel.is_open() {
+            self.note_activity(cx);
+            let action = self
+                .open_panel
+                .handle_key(key, ctrl, event.keystroke.key_char.as_deref());
+            self.apply_panel_action(action, cx);
+            // Перерисовка нужна на каждый ввод и каждое переключение пункта:
+            // поле рисуем сами, само по себе оно не обновится без `notify`.
+            cx.notify();
+            return;
+        }
+
+        let Some(shortcut) = shortcut(key) else {
             return;
         };
 
@@ -271,9 +297,7 @@ impl PlayerWindow {
             Shortcut::SeekBackward => self.seek_relative(SEEK_STEP, false, cx),
             Shortcut::SeekForward => self.seek_relative(SEEK_STEP, true, cx),
             Shortcut::ToggleFullscreen => window.toggle_fullscreen(),
-            Shortcut::OpenFile => {
-                self.player.update(cx, |video, cx| video.open_dialog(cx));
-            }
+            Shortcut::OpenFile => self.show_open_panel(cx),
             Shortcut::CloseOverlays => {
                 let closed = self.close_overlays(cx);
                 if !closed && window.is_fullscreen() {
@@ -356,10 +380,12 @@ impl PlayerWindow {
     /// Возвращает `true`, если что-то действительно было открыто: по этому
     /// признаку `Escape` переключается на выход из fullscreen.
     fn close_overlays(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.menu_open || self.about_open || self.file_info_open {
+        if self.menu_open || self.about_open || self.file_info_open || self.open_panel.is_open() {
             self.menu_open = false;
             self.about_open = false;
             self.file_info_open = false;
+            self.open_panel.close();
+            self.open_panel_error = None;
             cx.notify();
             true
         } else {
@@ -376,10 +402,81 @@ impl PlayerWindow {
         self.note_activity(cx);
     }
 
+    /// Открывает панель «Открыть…»: клавиша `O`, кнопка-папка, меню.
+    fn show_open_panel(&mut self, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.about_open = false;
+        self.file_info_open = false;
+        self.open_panel_error = None;
+        self.open_panel.reset();
+        self.note_activity(cx);
+        cx.notify();
+    }
+
+    /// Выполняет то, что решила панель по нажатой клавише.
+    fn apply_panel_action(&mut self, action: PanelAction, cx: &mut Context<Self>) {
+        match action {
+            PanelAction::Handled | PanelAction::Ignored => {}
+            PanelAction::Close => {
+                self.open_panel.close();
+                self.open_panel_error = None;
+                cx.notify();
+            }
+            PanelAction::OpenFile => self.pick_file(cx),
+            PanelAction::OpenUrl(text) => self.open_url(&text, cx),
+            PanelAction::Paste => {
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                if let Some(text) = text {
+                    self.open_panel.insert(&text);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Открывает системный диалог из панели или из пункта «Файл».
+    fn pick_file(&mut self, cx: &mut Context<Self>) {
+        self.open_panel.close();
+        self.open_panel_error = None;
+        self.player.update(cx, |video, cx| video.open_dialog(cx));
+        cx.notify();
+    }
+
+    /// Открывает ссылку из поля ввода.
+    ///
+    /// При ошибке разбора панель остаётся открытой: текст можно исправить
+    /// без повторного ввода, а ошибка видна под полем.
+    fn open_url(&mut self, text: &str, cx: &mut Context<Self>) {
+        match Source::parse(text) {
+            Ok(source) => {
+                self.open_panel.close();
+                self.open_panel_error = None;
+                self.note_activity(cx);
+                self.player.update(cx, |video, cx| video.open(source, cx));
+            }
+            Err(parse_error) => {
+                self.open_panel_error = Some(parse_error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Клик по «Файл…» в панели.
+    fn choose_file(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.pick_file(cx);
+    }
+
+    /// Клик по «URL…» в панели.
+    fn choose_url(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_panel.select_url();
+        self.open_panel_error = None;
+        self.note_activity(cx);
+        cx.notify();
+    }
+
     /// Меню → «Открыть…»: то же, что клавиша `O` и кнопка-папка.
     fn open_from_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_menu(cx);
-        self.player.update(cx, |video, cx| video.open_dialog(cx));
+        self.show_open_panel(cx);
     }
 
     /// Меню → «Показать/Скрыть оверлей статистики».
@@ -493,7 +590,7 @@ impl PlayerWindow {
             cx.notify();
         }
 
-        if self.menu_open || self.about_open || self.file_info_open {
+        if self.menu_open || self.about_open || self.file_info_open || self.open_panel.is_open() {
             return;
         }
 
@@ -637,6 +734,102 @@ impl PlayerWindow {
             .pr(px(16.0))
             .pb(px(CONTROLS_HEIGHT))
             .child(items)
+    }
+
+    /// Панель «Открыть…»: выбор источника или поле ввода ссылки.
+    ///
+    /// Как и меню, панель — наложение поверх кадра; нажатия внутри карточки
+    /// гасят всплытие, иначе клик по панели закрывал бы её же.
+    fn open_panel_view(&self, cx: &mut Context<Self>) -> Div {
+        let mut card = div()
+            .w(px(520.0))
+            .p_4()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::rgb(0x44_44_44))
+            .bg(gpui::rgb(0x22_22_22))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        if let Some(selected) = self.open_panel.choice() {
+            card = card
+                .child(div().text_sm().child("Открыть"))
+                .child(panel_item(
+                    "vgpu-open-panel-file",
+                    "Файл…",
+                    selected == PanelChoice::File,
+                    cx.listener(Self::choose_file),
+                ))
+                .child(panel_item(
+                    "vgpu-open-panel-url",
+                    "URL…",
+                    selected == PanelChoice::Url,
+                    cx.listener(Self::choose_url),
+                ))
+                .child(panel_hint(
+                    "Enter — выбрать · ←/→ — переключить · Esc — закрыть",
+                ));
+        }
+
+        if let Some(input) = self.open_panel.input() {
+            let mut field = div()
+                .flex()
+                .items_center()
+                .min_h(px(34.0))
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(gpui::rgb(0x55_55_55))
+                .bg(gpui::rgb(0x11_11_11))
+                .text_sm()
+                .overflow_hidden()
+                .whitespace_nowrap();
+
+            // Пока ничего не введено, показываем пример — но курсор уже
+            // стоит в поле, чтобы было видно, куда печатать.
+            field = if input.text().is_empty() {
+                field.child(panel_caret()).child(
+                    div()
+                        .text_color(gpui::rgb(0x77_77_77))
+                        .child("https://example.com/movie.mp4"),
+                )
+            } else {
+                field
+                    .child(div().child(input.visible_before().to_owned()))
+                    .child(panel_caret())
+                    .child(div().child(input.visible_after().to_owned()))
+            };
+
+            card = card
+                .child(div().text_sm().child("Ссылка на видео"))
+                .child(field)
+                .child(panel_hint(
+                    "Enter — открыть · Ctrl+V — вставить · Esc — закрыть",
+                ));
+
+            if let Some(error) = self.open_panel_error.as_ref() {
+                card = card.child(
+                    div()
+                        .text_sm()
+                        .text_color(gpui::rgb(0xff_88_88))
+                        .child(error.clone()),
+                );
+            }
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00_00_00_66))
+            .child(card)
     }
 
     /// Строки панели «Информация о файле».
@@ -786,6 +979,12 @@ impl Render for PlayerWindow {
             video_area = video_area.child(self.controls_panel(cx));
         }
 
+        // «Открыть…» перекрывает и управление, и меню: пока она открыта,
+        // клавиши принадлежат полю ввода.
+        if self.open_panel.is_open() {
+            video_area = video_area.child(self.open_panel_view(cx));
+        }
+
         root = root.child(video_area);
 
         // Подсказка поверх всего, пока файлы ведут над окном. Она же — самый
@@ -855,6 +1054,56 @@ fn menu_item(
         .child(div().text_sm().child(label))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
+}
+
+/// Пункт панели «Открыть…»: подпись и подсветка выбранного.
+///
+/// `on_mouse_down` с `stop_propagation` нужен по той же причине, что и в меню:
+/// под панелью лежит «клик по кадру закрывает наложения».
+fn panel_item(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let label = label.into();
+    let mut item = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .aria_label(label.clone())
+        .hover(|style| style.bg(gpui::rgb(0x33_33_33)))
+        .child(div().text_sm().child(label))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(on_click);
+
+    if selected {
+        item = item.bg(gpui::rgb(0x33_33_33));
+    }
+    item
+}
+
+/// Подсказка под содержимым панели: серый мелкий текст.
+fn panel_hint(text: &'static str) -> Div {
+    div()
+        .text_sm()
+        .text_color(gpui::rgb(0x88_88_88))
+        .child(text)
+}
+
+/// Курсор поля ввода: тонкая вертикальная черта.
+fn panel_caret() -> Div {
+    div()
+        .flex_shrink_0()
+        .w(px(2.0))
+        .h(px(16.0))
+        .bg(gpui::rgb(0xee_ee_ee))
 }
 
 /// Подпись переключателя оверлея: действие, которое сделает клик.

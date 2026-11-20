@@ -24,7 +24,7 @@ use crate::source::Source as MediaSource;
 use crate::spectrum::{
     SAMPLE_RING_CAPACITY, SpectrumAnalyzer, SpectrumBars, SpectrumRing, SpectrumTap,
 };
-use crate::sync::{FrameAction, FrameScheduler, SyncStats, VideoTimer};
+use crate::sync::{FrameAction, FrameScheduler, NetworkStats, SyncStats, VideoTimer};
 use crate::video::VideoFrame;
 use crate::{Command, Event, PlayerError};
 
@@ -36,6 +36,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Ограничение нужно и для звука: без него декодер вычитает файл целиком
 /// вперёд, и память растёт вместе с длительностью ролика.
 const QUEUED_CHUNKS: usize = 4;
+
+/// Для сети очередь больше: блокирующее чтение видео не должно опустошать звук.
+const QUEUED_CHUNKS_NETWORK: usize = 32;
+
+/// Сколько должна длиться пауза чтения, чтобы показать плашку буферизации.
+const BUFFERING_DELAY: Duration = Duration::from_millis(200);
 
 /// Максимальная громкость, которую ядро принимает от UI.
 const MAX_VOLUME: f32 = 2.0;
@@ -65,8 +71,9 @@ const SPECTRUM_INTERVAL: Duration = Duration::from_millis(33);
 ///
 /// В обычной жизни это [`Media::open_with`]; тесты подменяют открытие, чтобы
 /// получить «медленный» источник без сети и без новых файлов.
-pub(crate) type Opener =
-    Box<dyn Fn(&MediaSource, &dyn Fn() -> bool) -> Result<Media, PlayerError> + Send>;
+pub(crate) type Opener = Box<
+    dyn Fn(&MediaSource, Arc<AtomicBool>, &dyn Fn() -> bool) -> Result<Media, PlayerError> + Send,
+>;
 
 /// Состояние и цикл одного потока ядра.
 struct Engine<'a> {
@@ -100,6 +107,7 @@ struct Engine<'a> {
     waiting_output_logged: bool,
     audio_chunks: u64,
     buffer_pool: Vec<Vec<u8>>,
+    buffering: BufferingWatch,
     events: &'a Sender<Event>,
     frames: &'a Sender<TaggedFrame>,
     recycled: &'a Receiver<Vec<u8>>,
@@ -205,6 +213,7 @@ impl<'a> Engine<'a> {
             waiting_output_logged: false,
             audio_chunks: 0,
             buffer_pool: Vec::new(),
+            buffering: BufferingWatch::default(),
             events,
             frames,
             recycled,
@@ -222,7 +231,7 @@ impl<'a> Engine<'a> {
         let cancelled =
             || self.cancel.load(Ordering::SeqCst) || self.open_seq.load(Ordering::SeqCst) != seq;
 
-        match (self.opener)(&self.source, &cancelled) {
+        match (self.opener)(&self.source, Arc::clone(&self.cancel), &cancelled) {
             Ok(opened) => self.apply(opened),
             Err(PlayerError::Cancelled) => debug!("открытие отменено"),
             Err(error) => {
@@ -248,6 +257,7 @@ impl<'a> Engine<'a> {
         self.scheduler = FrameScheduler::new(None);
         self.video_timer = VideoTimer::new();
         self.stats = SyncCounters::new(None);
+        self.buffering.reset();
         if let Some(sink) = self.output.as_ref() {
             sink.player.stop();
             sink.player.pause();
@@ -362,6 +372,10 @@ impl<'a> Engine<'a> {
                     debug!("Seek без открытого источника");
                     return Ok(false);
                 }
+                if !self.media.as_ref().is_some_and(Media::is_seekable) {
+                    debug!("Seek без поддержки перемотки");
+                    return Ok(false);
+                }
                 self.seek(position)?;
             }
             Command::Open(source) => {
@@ -449,13 +463,18 @@ impl<'a> Engine<'a> {
             return Ok(());
         };
 
+        if let Some(buffering) = self.buffering.update(media.is_buffering(), Instant::now()) {
+            let _ = self.events.send(Event::Buffering(buffering));
+        }
+
         if let (Some(audio), Some(sink), Some(clock)) = (
             media.audio.as_mut(),
             self.output.as_ref(),
             self.clock.as_ref(),
         ) {
             let spectrum_tap = self.spectrum.as_ref().map(|_| Arc::clone(&sink.spectrum));
-            while !self.audio_finished && sink.player.len() < QUEUED_CHUNKS {
+            let queued_chunks = queued_chunks(self.source.is_network());
+            while !self.audio_finished && sink.player.len() < queued_chunks {
                 match audio.next_chunk()? {
                     Some(chunk) => {
                         self.audio_chunks = self.audio_chunks.saturating_add(1);
@@ -596,12 +615,19 @@ impl<'a> Engine<'a> {
             && !self.paused
             && self.stats.report_at.elapsed() >= SYNC_STATS_INTERVAL
         {
-            let snapshot = self.stats.snapshot();
+            let snapshot = self.stats.snapshot(media.network_stats());
+            // Счётчики сети — только у URL: по ним видно, откуда `drop`.
+            let network = snapshot.network;
             debug!(
                 shown = snapshot.shown,
                 dropped = snapshot.dropped,
                 fps = snapshot.fps,
                 lag_ms = snapshot.lag.as_millis(),
+                requests = network.map(|stats| stats.requests),
+                bytes = network.map(|stats| stats.bytes),
+                slow_reads = network.map(|stats| stats.slow_reads),
+                slow_ms = network.map(|stats| stats.slow_ms),
+                retries = network.map(|stats| stats.retries),
                 "состояние синхронизации"
             );
             let _ = self.events.send(Event::Stats(snapshot));
@@ -625,7 +651,8 @@ impl<'a> Engine<'a> {
             self.end_reported = true;
             info!("файл доигран до конца");
             if media.video.is_some() {
-                let _ = self.events.send(Event::Stats(self.stats.snapshot()));
+                let snapshot = self.stats.snapshot(media.network_stats());
+                let _ = self.events.send(Event::Stats(snapshot));
             }
             // Столбики не должны замереть на последнем уровне.
             if self.spectrum.is_some() {
@@ -651,6 +678,53 @@ impl<'a> Engine<'a> {
             &mut self.last_position_at,
             force,
         );
+    }
+}
+
+/// Сглаживает флаг буферизации: короткие паузы плашку не показывают.
+#[derive(Debug, Default)]
+struct BufferingWatch {
+    since: Option<Instant>,
+    shown: bool,
+}
+
+impl BufferingWatch {
+    fn reset(&mut self) {
+        self.since = None;
+        self.shown = false;
+    }
+
+    /// Возвращает новое состояние плашки, если его нужно отправить в UI.
+    fn update(&mut self, buffering: bool, now: Instant) -> Option<bool> {
+        if buffering {
+            if self.shown {
+                return None;
+            }
+            let since = *self.since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= BUFFERING_DELAY {
+                self.shown = true;
+                Some(true)
+            } else {
+                None
+            }
+        } else {
+            self.since = None;
+            if self.shown {
+                self.shown = false;
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Размер очереди звука: для сети больше, чтобы видео не опустошало её.
+fn queued_chunks(network: bool) -> usize {
+    if network {
+        QUEUED_CHUNKS_NETWORK
+    } else {
+        QUEUED_CHUNKS
     }
 }
 
@@ -759,7 +833,9 @@ impl SyncCounters {
     }
 
     /// Снимает срез для UI и начинает новый интервал измерения fps.
-    fn snapshot(&mut self) -> SyncStats {
+    ///
+    /// `network` — счётчики читателей: у файла их нет, у URL есть.
+    fn snapshot(&mut self, network: Option<NetworkStats>) -> SyncStats {
         let seconds = self.report_at.elapsed().as_secs_f64();
         let fps = if self.shown_since_report > 0 && seconds > 0.0 {
             self.shown_since_report as f64 / seconds
@@ -782,6 +858,7 @@ impl SyncCounters {
             dropped: self.dropped,
             lag: self.lag,
             fps: fps as f32,
+            network,
         };
 
         self.shown_since_report = 0;
@@ -949,5 +1026,45 @@ mod tests {
 
         assert_eq!(source.next(), None);
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn buffering_waits_for_the_delay_before_showing() {
+        let start = Instant::now();
+        let mut watch = BufferingWatch::default();
+
+        assert_eq!(watch.update(true, start), None);
+        assert_eq!(watch.update(true, start + Duration::from_millis(199)), None);
+        assert_eq!(watch.update(true, start + BUFFERING_DELAY), Some(true));
+        assert_eq!(
+            watch.update(true, start + Duration::from_secs(1)),
+            None,
+            "пока буферизация идёт, повторно не шлём"
+        );
+        assert_eq!(
+            watch.update(false, start + Duration::from_secs(1)),
+            Some(false)
+        );
+        assert_eq!(watch.update(false, start + Duration::from_secs(2)), None);
+    }
+
+    #[test]
+    fn short_buffering_does_not_flash() {
+        let start = Instant::now();
+        let mut watch = BufferingWatch::default();
+
+        assert_eq!(watch.update(true, start), None);
+        assert_eq!(
+            watch.update(false, start + Duration::from_millis(100)),
+            None,
+            "короткая пауза не должна показывать плашку"
+        );
+    }
+
+    #[test]
+    fn network_audio_queue_is_larger() {
+        assert_eq!(queued_chunks(false), QUEUED_CHUNKS);
+        assert_eq!(queued_chunks(true), QUEUED_CHUNKS_NETWORK);
+        const { assert!(QUEUED_CHUNKS_NETWORK > QUEUED_CHUNKS) };
     }
 }

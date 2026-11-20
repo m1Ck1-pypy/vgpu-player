@@ -97,6 +97,14 @@ fn progress_ratio(position: Duration, duration: Option<Duration>) -> f32 {
     (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0) as f32
 }
 
+/// Можно ли тащить полосу прогресса.
+///
+/// Без известной длительности и без перемотки слайдер бесполезен: ядро всё
+/// равно проигнорирует `Seek`, а серый слайдер честно говорит почему.
+fn progress_enabled(state: PlaybackState, seekable: bool, duration: Option<Duration>) -> bool {
+    state != PlaybackState::Loading && seekable && duration.is_some()
+}
+
 /// Собирает панель: кнопки Play/Pause, mute и fullscreen, слайдеры перемотки
 /// и громкости.
 ///
@@ -110,7 +118,7 @@ fn progress_ratio(position: Duration, duration: Option<Duration>) -> f32 {
 /// Если панелей нужно несколько, им понадобятся разные `ElementId`; сейчас
 /// предполагается одна панель на плеер.
 pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
-    let (state, volume, muted, position, duration, fullscreen, volume_hover) = {
+    let (state, volume, muted, position, duration, fullscreen, volume_hover, seekable) = {
         let video = player.read(cx);
         (
             video.state(),
@@ -120,6 +128,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             video.duration(),
             video.fullscreen(),
             video.volume_hover(),
+            video.seekable(),
         )
     };
     // Пока источник открывается, управление не действует: `Play`, `Seek` и
@@ -198,7 +207,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
                 progress_ratio(position, duration),
                 player,
                 SliderKind::Progress,
-                !loading,
+                progress_enabled(state, seekable, duration),
             )
             .flex_1(),
         )
@@ -473,5 +482,18 @@ mod tests {
             progress_ratio(Duration::from_secs(5), Some(Duration::ZERO)),
             0.0
         );
+    }
+
+    #[test]
+    fn progress_needs_a_seekable_source_with_duration() {
+        let duration = Some(Duration::from_secs(10));
+        assert!(progress_enabled(PlaybackState::Playing, true, duration));
+        assert!(progress_enabled(PlaybackState::Ended, true, duration));
+        // Без `Range` источник играет, но не перематывается.
+        assert!(!progress_enabled(PlaybackState::Playing, false, duration));
+        // Пока длительность неизвестна, тащить некуда.
+        assert!(!progress_enabled(PlaybackState::Playing, true, None));
+        // Пока идёт открытие, управление не действует.
+        assert!(!progress_enabled(PlaybackState::Loading, true, duration));
     }
 }

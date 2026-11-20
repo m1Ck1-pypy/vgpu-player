@@ -328,7 +328,7 @@ impl VideoPlayer {
 
     /// Перейти к позиции.
     pub fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
-        if self.state == PlaybackState::Loading {
+        if self.state == PlaybackState::Loading || !self.seekable {
             return;
         }
         if self.send(Command::Seek(position), cx) {
@@ -728,6 +728,7 @@ impl VideoPlayer {
                     self.media_info = Some(ready.media_info);
                     self.duration = ready.duration;
                     self.seekable = ready.seekable;
+                    self.buffering = false;
                     self.state = PlaybackState::Ready;
                     self.error = None;
                     // Файл открывают, чтобы его посмотреть: при включённой
@@ -738,14 +739,17 @@ impl VideoPlayer {
                     }
                 }
                 Event::PositionChanged(position) => self.position = position,
+                Event::Buffering(buffering) => self.buffering = buffering,
                 Event::Stats(stats) => self.stats = Some(stats),
                 Event::Spectrum(bars) => self.spectrum = Some(bars),
                 Event::Ended => {
                     info!("воспроизведение завершено");
+                    self.buffering = false;
                     self.state = PlaybackState::Ended;
                 }
                 Event::Error(message) => {
                     error!(%message, "ошибка воспроизведения");
+                    self.buffering = false;
                     self.error = Some(message);
                     self.state = PlaybackState::Failed;
                 }
