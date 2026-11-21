@@ -1,22 +1,22 @@
-//! HTTP-читатель для сетевых источников.
+//! HTTP-слой для сетевых источников.
 //!
-//! Читатель отдаёт байты через [`MediaReader`], поэтому декодеры не знают, что
-//! источник сетевой. Для файла, поддерживающего `Range`, читается окно
-//! вперёд и перемотка выполняется новым запросом. Сервер без `Range` отдаёт
-//! поток только с начала: он играет, но не перематывается.
+//! Байты тянет загрузчик общего кэша (`cache.rs`), а звук и видео читают из
+//! него своими курсорами: файл качается один раз на источник. Здесь остаются
+//! только запросы, `Range`, повторы, отмена и TLS.
+//!
+//! Источник с `Range` берёт каждый блок отдельным запросом. Сервер без `Range`
+//! отдаёт поток с начала: загрузчик держит соединение, продолжает его, а после
+//! перемотки перезапускает и пропускает уже прочитанное (до `resume_limit`).
 
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::cache::{Cache, CacheConfig, CacheCounters, CacheCursor, FetchError};
 use crate::reader::MediaReader;
 use crate::sync::NetworkStats;
 use crate::{PlayerError, Source};
-
-/// Сколько байт читается одним запросом.
-const WINDOW_SIZE: usize = 2 * 1024 * 1024;
 
 /// Таймаут на DNS-резолв и установку соединения.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,12 +44,7 @@ const RETRY_DELAYS: [Duration; 4] = [
 /// До какой позиции можно перезапускать поток без `Range` (решение B).
 const RESUME_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// С какого времени сетевое чтение считается медленным для статистики.
-///
-/// 100 мс — примерно три кадра при 30 fps: такие паузы уже видны глазом.
-const SLOW_READ: Duration = Duration::from_millis(100);
-
-/// Настройки HTTP-читателя.
+/// Настройки HTTP-источника.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HttpConfig {
     /// Таймаут на DNS и соединение.
@@ -64,8 +59,8 @@ pub(crate) struct HttpConfig {
     pub(crate) retry_delays: [Duration; 4],
     /// Сколько редиректов разрешено.
     pub(crate) max_redirects: u32,
-    /// Размер окна чтения.
-    pub(crate) window: usize,
+    /// Размеры общего кэша.
+    pub(crate) cache: CacheConfig,
     /// До какой позиции можно перезапускать поток без `Range`.
     pub(crate) resume_limit: u64,
 }
@@ -79,7 +74,7 @@ impl Default for HttpConfig {
             retries: RETRIES,
             retry_delays: RETRY_DELAYS,
             max_redirects: MAX_REDIRECTS,
-            window: WINDOW_SIZE,
+            cache: CacheConfig::default(),
             resume_limit: RESUME_LIMIT,
         }
     }
@@ -196,123 +191,20 @@ impl HttpError {
     }
 }
 
-/// Счётчики сетевого чтения для оверлея статистики.
+/// Открытый сетевой источник: один кэш и общие счётчики на две дорожки.
 ///
-/// Живут в `Arc`: читатель уезжает внутрь FFmpeg, а ядро опрашивает счётчики
-/// из своего цикла.
-#[derive(Debug, Default)]
-pub(crate) struct HttpCounters {
-    requests: AtomicU64,
-    bytes: AtomicU64,
-    slow_reads: AtomicU64,
-    slow_ms: AtomicU64,
-    retries: AtomicU64,
-    restarts: AtomicU64,
-}
-
-impl HttpCounters {
-    fn add_request(&self) {
-        self.requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn add_bytes(&self, len: usize) {
-        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
-    }
-
-    fn add_slow_read(&self, elapsed: Duration) {
-        self.slow_reads.fetch_add(1, Ordering::Relaxed);
-        self.slow_ms
-            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
-    }
-
-    fn add_retry(&self) {
-        self.retries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn add_restart(&self) {
-        self.restarts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Срез для `SyncStats`.
-    pub(crate) fn snapshot(&self) -> NetworkStats {
-        NetworkStats {
-            requests: self.requests.load(Ordering::Relaxed),
-            bytes: self.bytes.load(Ordering::Relaxed),
-            slow_reads: self.slow_reads.load(Ordering::Relaxed),
-            slow_ms: self.slow_ms.load(Ordering::Relaxed),
-            retries: self.retries.load(Ordering::Relaxed),
-            restarts: self.restarts.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Запрос окна фоновому загрузчику.
-enum FetchRequest {
-    Window {
-        start: u64,
-        end: u64,
-        /// Поколение запроса: после перемотки ответ устаревает.
-        generation: u64,
-    },
-}
-
-/// Ответ фонового загрузчика.
-struct FetchResponse {
-    start: u64,
-    generation: u64,
-    result: Result<Vec<u8>, HttpError>,
-}
-
-/// Фоновый загрузчик окон.
-///
-/// Зачем: заливка окна занимает доли секунды, и если делать её в потоке
-/// декодера, всё это время FFmpeg стоит, а кадры концу очереди опоздают.
-/// Поэтому следующее окно качается параллельно с работой декодера.
-struct Prefetch {
-    requests: Sender<FetchRequest>,
-    responses: Receiver<FetchResponse>,
-    /// Начало уже запрошенного окна.
-    pending: Option<u64>,
-    /// Пришедшее, но ещё не прочитанное окно.
-    ready: Option<(u64, Vec<u8>)>,
-}
-
-/// Сетевой источник байтов.
-pub(crate) struct HttpReader {
-    agent: ureq::Agent,
-    config: HttpConfig,
-    url: String,
+/// Живёт в `Media`; читатели получают курсоры через [`HttpSource::reader`].
+pub(crate) struct HttpSource {
     hint: Option<String>,
     len: Option<u64>,
     seekable: bool,
-    /// Текущая позиция чтения.
-    position: u64,
-    /// Окно прочитанных байт.
-    window: Vec<u8>,
-    /// Абсолютное смещение первого байта окна.
-    window_start: u64,
-    /// Сколько байт окна действительно заполнено.
-    window_len: usize,
-    /// Поток без `Range`: сервер отдаёт байты только по порядку.
-    stream: Option<ureq::BodyReader<'static>>,
-    /// Абсолютная позиция следующего байта из потока.
-    stream_pos: u64,
-    window_size: usize,
-    /// Флаг отмены из ядра.
-    cancel: Arc<AtomicBool>,
-    /// Читатель ждёт сеть; ядро превращает это в `Buffering`.
     buffering: Arc<AtomicBool>,
-    /// Причина последней ошибки — для слоя декодера.
     failure: Arc<Mutex<Option<HttpFailure>>>,
-    /// Счётчики для статистики.
-    counters: Arc<HttpCounters>,
-    /// Фоновый загрузчик окон: есть только у источников с `Range`.
-    prefetch: Option<Prefetch>,
-    /// Номер поколения: перемотка делает старые запросы негодными.
-    generation: Arc<AtomicU64>,
+    counters: Arc<CacheCounters>,
+    cache: Arc<Cache>,
 }
 
-impl HttpReader {
+impl HttpSource {
     /// Открывает URL и выясняет размер и поддержку `Range`.
     ///
     /// Проверочный запрос просит один байт: по ответу `206` видно поддержку
@@ -322,7 +214,7 @@ impl HttpReader {
         source: &Source,
         config: HttpConfig,
         cancel: Arc<AtomicBool>,
-    ) -> Result<Self, PlayerError> {
+    ) -> Result<Arc<Self>, PlayerError> {
         let Source::Url(url) = source else {
             return Err(PlayerError::UnsupportedSource {
                 target: source.clone(),
@@ -330,13 +222,15 @@ impl HttpReader {
         };
 
         let agent = agent(&config);
-        let counters = Arc::new(HttpCounters::default());
-        let probe_counters = Arc::clone(&counters);
+        let counters = Arc::new(CacheCounters::default());
+        let buffering = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+
         let mut probe = || {
             if cancel.load(Ordering::SeqCst) {
                 return Err(HttpError::cancelled());
             }
-            probe_counters.add_request();
+            counters.add_request();
             let response = agent
                 .get(url)
                 .header("Range", "bytes=0-0")
@@ -366,472 +260,305 @@ impl HttpReader {
 
         let content_length =
             header(&response, "content-length").and_then(|value| value.parse::<u64>().ok());
-
-        let (len, seekable, stream) = if status == 206 {
+        let (len, seekable) = if status == 206 {
             let total = header(&response, "content-range")
                 .as_deref()
                 .and_then(parse_content_range)
                 .flatten();
-            (total, true, None)
+            (total, true)
         } else {
-            // Ответ на проверочный запрос уже содержит тело с начала файла:
-            // не выбрасываем его, а читаем дальше без повторного соединения.
-            let body = response
-                .into_body()
-                .into_with_config()
-                .limit(u64::MAX)
-                .reader();
-            (content_length, false, Some(body))
+            (content_length, false)
         };
+        // Тело пробного ответа не нужно: загрузчик запросит данные сам.
+        drop(response);
 
         if len == Some(0) {
             return Err(HttpFailure::Empty.into_player_error(source));
         }
 
-        let generation = Arc::new(AtomicU64::new(0));
-        // Фоновый загрузчик имеет смысл только у источника с `Range`: без него
-        // окно неоткуда взять, кроме одного последовательного потока.
-        let prefetch = seekable.then(|| {
-            let (request_tx, request_rx) = mpsc::channel();
-            let (response_tx, response_rx) = mpsc::channel();
-            spawn_prefetch(PrefetchContext {
-                agent: agent.clone(),
-                config,
-                url: url.clone(),
-                cancel: Arc::clone(&cancel),
-                generation: Arc::clone(&generation),
-                counters: Arc::clone(&counters),
-                requests: request_rx,
-                responses: response_tx,
-            });
-            Prefetch {
-                requests: request_tx,
-                responses: response_rx,
-                pending: None,
-                ready: None,
-            }
-        });
-
-        Ok(Self {
+        let loader = HttpLoader {
             agent,
             config,
             url: url.clone(),
+            cancel: Arc::clone(&cancel),
+            counters: Arc::clone(&counters),
+            failure: Arc::clone(&failure),
+            buffering: Arc::clone(&buffering),
+            mode: if seekable {
+                Mode::Range
+            } else {
+                Mode::Stream(Mutex::new(None))
+            },
+        };
+        let cache = Cache::start(
+            config.cache,
+            len,
+            Arc::clone(&counters),
+            move |offset, want, abort| loader.fetch(offset, want, abort),
+        )
+        .map_err(|error| PlayerError::Network {
+            target: source.clone(),
+            message: format!("не удалось запустить загрузчик кэша: {error}"),
+        })?;
+
+        Ok(Arc::new(Self {
             hint: source.file_name().map(str::to_owned),
             len,
             seekable,
-            position: 0,
-            window: Vec::new(),
-            window_start: 0,
-            window_len: 0,
-            stream,
-            stream_pos: 0,
-            window_size: config.window.max(1),
-            cancel,
-            buffering: Arc::new(AtomicBool::new(false)),
-            failure: Arc::new(Mutex::new(None)),
+            buffering,
+            failure,
             counters,
-            prefetch,
-            generation,
-        })
+            cache,
+        }))
     }
 
-    /// Догружает окно с текущей позиции.
-    fn fill_window(&mut self) -> io::Result<()> {
-        if self.seekable {
-            self.fill_ranged()
-        } else {
-            self.fill_stream()
+    /// Новый курсор чтения поверх общего кэша.
+    pub(crate) fn reader(self: &Arc<Self>, cancel: Arc<AtomicBool>) -> HttpReader {
+        HttpReader {
+            cursor: self.cache.cursor(Arc::clone(&cancel)),
+            hint: self.hint.clone(),
+            len: self.len,
+            seekable: self.seekable,
+            cancel,
+            shared_failure: Arc::clone(&self.failure),
+            slot: Arc::new(Mutex::new(None)),
+            buffering: Arc::clone(&self.buffering),
+            counters: Arc::clone(&self.counters),
         }
     }
 
-    /// Окно запросом `Range`: сервер обязан ответить `206`.
-    ///
-    /// С фоновым загрузчиком окно берётся из него, а следующее сразу же
-    /// заказывается — декодер не ждёт сеть Почти никогда.
-    fn fill_ranged(&mut self) -> io::Result<()> {
-        let start = self.position;
-        if let Some(len) = self.len
-            && start >= len
-        {
-            self.window_len = 0;
-            return Ok(());
-        }
-
-        let buffer = if self.prefetch.is_some() {
-            self.window_ahead(start)?
-        } else {
-            self.fetch_sync(start)?
-        };
-
-        self.set_window(start, buffer);
-        // Пока декодер читает это окно, готовим следующее.
-        self.request_window(start + self.window_len as u64);
-        Ok(())
+    /// Счётчики сети источника: без двойного учёта двух дорожек.
+    pub(crate) fn network_stats(&self) -> NetworkStats {
+        self.cache.network_stats()
     }
+}
 
-    /// Конец диапазона окна с учётом размера источника.
-    fn range_end(&self, start: u64) -> u64 {
-        let mut end = start.saturating_add(self.window_size as u64 - 1);
-        if let Some(len) = self.len {
-            end = end.min(len - 1);
-        }
-        end
-    }
+/// Как загрузчик берёт байты: диапазонами или одним потоком с начала.
+enum Mode {
+    /// Сервер понимает `Range`: каждый блок — отдельный запрос.
+    Range,
+    /// Сервер отдаёт только поток с начала.
+    Stream(Mutex<Option<StreamState>>),
+}
 
-    /// Окно из фонового загрузчика.
-    ///
-    /// Если готового окна нет, ждём его — только это ожидание и есть реальная
-    /// просадка, поэтому именно оно попадает в счётчик медленных чтений.
-    fn window_ahead(&mut self, start: u64) -> io::Result<Vec<u8>> {
-        let ready_start = self
-            .prefetch
-            .as_ref()
-            .and_then(|prefetch| prefetch.ready.as_ref())
-            .map(|(ready_start, _)| *ready_start);
-        if ready_start == Some(start)
-            && let Some((_, buffer)) = self.prefetch.as_mut().and_then(|p| p.ready.take())
-        {
-            return Ok(buffer);
-        }
+/// Открытый последовательный поток без `Range`.
+struct StreamState {
+    body: ureq::BodyReader<'static>,
+    /// Абсолютная позиция следующего байта из потока.
+    pos: u64,
+}
 
-        self.request_window(start);
+/// Загрузчик кэша: один на источник, работает в фоновом потоке кэша.
+struct HttpLoader {
+    agent: ureq::Agent,
+    config: HttpConfig,
+    url: String,
+    cancel: Arc<AtomicBool>,
+    counters: Arc<CacheCounters>,
+    failure: Arc<Mutex<Option<HttpFailure>>>,
+    buffering: Arc<AtomicBool>,
+    mode: Mode,
+}
 
+impl HttpLoader {
+    fn fetch(&self, offset: u64, want: usize, abort: &AtomicBool) -> Result<Vec<u8>, FetchError> {
+        let stop = || self.cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed);
         self.buffering.store(true, Ordering::SeqCst);
-        let started = Instant::now();
-        let result = loop {
-            let response = self
-                .prefetch
-                .as_ref()
-                .and_then(|prefetch| prefetch.responses.recv().ok());
-            let Some(response) = response else {
-                break Err(io::Error::other("фоновое чтение остановлено"));
-            };
-
-            if let Some(prefetch) = self.prefetch.as_mut()
-                && prefetch.pending == Some(response.start)
-            {
-                prefetch.pending = None;
-            }
-            // Ответ на запрос до перемотки больше не нужен.
-            if response.generation != self.generation.load(Ordering::SeqCst) {
-                continue;
-            }
-
-            match response.result {
-                Err(error) => break Err(self.fail(error)),
-                Ok(buffer) if response.start == start => break Ok(buffer),
-                Ok(buffer) => {
-                    // Пришло другое окно: оставляем на следующий раз.
-                    if let Some(prefetch) = self.prefetch.as_mut() {
-                        prefetch.ready = Some((response.start, buffer));
-                    }
-                }
-            }
+        let result = match &self.mode {
+            Mode::Range => fetch_range(
+                &self.agent,
+                &self.config,
+                &self.url,
+                offset,
+                want as u64,
+                &self.counters,
+                &stop,
+            ),
+            Mode::Stream(state) => self.fetch_stream(offset, want, &stop, state),
         };
-        let waited = started.elapsed();
-        if waited >= SLOW_READ {
-            self.counters.add_slow_read(waited);
-        }
         self.buffering.store(false, Ordering::SeqCst);
-        result
+        result.map_err(|error| self.record(error))
     }
 
-    /// Просит фоновый загрузчик скачать окно с этой позиции.
-    fn request_window(&mut self, start: u64) {
-        if let Some(len) = self.len
-            && start >= len
+    /// Сохраняет причину для слоя декодера и переводит её в ошибку кэша.
+    fn record(&self, error: HttpError) -> FetchError {
+        if error.failure == HttpFailure::Cancelled {
+            return FetchError::cancelled();
+        }
+        if let Ok(mut slot) = self.failure.lock()
+            && slot.is_none()
         {
-            return;
+            *slot = Some(error.failure.clone());
         }
-        let end = self.range_end(start);
-        let generation = self.generation.load(Ordering::SeqCst);
-        let Some(prefetch) = self.prefetch.as_mut() else {
-            return;
-        };
-        if prefetch.pending == Some(start) {
-            return;
-        }
-        let request = FetchRequest::Window {
-            start,
-            end,
-            generation,
-        };
-        if prefetch.requests.send(request).is_ok() {
-            prefetch.pending = Some(start);
-        }
+        FetchError::other(error.failure.clone().into_io().to_string())
     }
 
-    /// Синхронная догрузка окна: источник без фонового загрузчика.
-    fn fetch_sync(&mut self, start: u64) -> io::Result<Vec<u8>> {
-        let end = self.range_end(start);
-        let range = format!("bytes={start}-{end}");
-        let expected = (end - start + 1) as usize;
+    /// Читает блок из последовательного потока без `Range`.
+    ///
+    /// Пока поток стоит на нужной позиции, соединение продолжается; иначе —
+    /// перезапуск с начала и пропуск до `offset` (не дальше `resume_limit`).
+    fn fetch_stream(
+        &self,
+        offset: u64,
+        want: usize,
+        stop: &dyn Fn() -> bool,
+        state: &Mutex<Option<StreamState>>,
+    ) -> Result<Vec<u8>, HttpError> {
+        let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stream = guard.take();
 
-        let mut attempt = || {
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err(HttpError::cancelled());
-            }
-            self.buffering.store(true, Ordering::SeqCst);
-            let started = Instant::now();
-            let result = (|| {
-                self.counters.add_request();
-                let response = self
-                    .agent
-                    .get(&self.url)
-                    .header("Range", &range)
-                    .call()
-                    .map_err(request_error)?;
-
-                let status = response.status().as_u16();
-                if status == 200 {
-                    return Err(HttpError::fatal(HttpFailure::NotSeekable));
-                }
-                if status != 206 {
-                    return Err(status_error(status));
-                }
-
-                let mut body = response
-                    .into_body()
-                    .into_with_config()
-                    .limit(expected as u64 + 1)
-                    .reader();
-                let mut buffer = Vec::with_capacity(expected);
-                body.read_to_end(&mut buffer).map_err(body_error)?;
-                buffer.truncate(expected);
-                Ok(buffer)
-            })();
-            let elapsed = started.elapsed();
-            if elapsed >= SLOW_READ {
-                self.counters.add_slow_read(elapsed);
-            }
-            self.buffering.store(false, Ordering::SeqCst);
-            result
-        };
-
-        let stop = || self.cancel.load(Ordering::SeqCst);
-        match with_retries(&self.config, &stop, &self.counters, &mut attempt) {
-            Ok(buffer) => {
-                self.counters.add_bytes(buffer.len());
-                Ok(buffer)
-            }
-            Err(error) => Err(self.fail(error)),
-        }
-    }
-
-    /// Окно из последовательного потока без `Range`.
-    fn fill_stream(&mut self) -> io::Result<()> {
-        let start = self.position;
-        if let Some(len) = self.len
-            && start >= len
+        if let Some(active) = stream.as_mut()
+            && active.pos == offset
         {
-            self.window_len = 0;
-            return Ok(());
-        }
-
-        let remaining = self.len.map_or(u64::MAX, |len| len.saturating_sub(start));
-        let cap = (self.window_size as u64).min(remaining) as usize;
-
-        // Сначала просто продолжаем уже открытый поток.
-        if self.stream.is_some() && self.stream_pos == start {
-            self.buffering.store(true, Ordering::SeqCst);
-            let started = Instant::now();
-            let result = {
-                let body = self.stream.as_mut().expect("поток открыт");
-                read_window(body, cap, &|| self.cancel.load(Ordering::SeqCst))
-            };
-            let elapsed = started.elapsed();
-            if elapsed >= SLOW_READ {
-                self.counters.add_slow_read(elapsed);
-            }
-            self.buffering.store(false, Ordering::SeqCst);
-            match result {
+            match read_window(&mut active.body, want, stop) {
                 Ok(buffer) => {
-                    self.counters.add_bytes(buffer.len());
-                    self.stream_pos += buffer.len() as u64;
-                    self.set_window(start, buffer);
-                    return Ok(());
+                    active.pos += buffer.len() as u64;
+                    *guard = stream;
+                    return Ok(buffer);
                 }
-                Err(error) => {
-                    // Поток сломался: дальше только перезапуск с начала.
-                    self.stream = None;
-                    if !error.retryable {
-                        return Err(self.fail(error));
-                    }
+                // Отмена (перемотка или закрытие) не должна рвать открытое
+                // соединение: тело не прочитало ни байта, поток можно
+                // продолжить с той же позиции.
+                Err(error) if error.failure == HttpFailure::Cancelled => {
+                    *guard = stream;
+                    return Err(error);
                 }
+                // Поток сломался: дальше только перезапуск с начала.
+                Err(_) => {}
             }
         }
 
-        // Без `Range` продолжить с места нельзя: перезапуск с начала и пропуск
-        // уже прочитанного. Решение B: только до `resume_limit`.
-        if start > self.config.resume_limit {
-            return Err(self.fail(HttpError::fatal(HttpFailure::NotSeekable)));
+        if offset > self.config.resume_limit {
+            return Err(HttpError::fatal(HttpFailure::NotSeekable));
         }
-
-        let mut attempt = || {
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err(HttpError::cancelled());
-            }
-            self.buffering.store(true, Ordering::SeqCst);
-            self.counters.add_request();
-            let started = Instant::now();
-            let result = (|| {
-                let response = self.agent.get(&self.url).call().map_err(request_error)?;
-                let status = response.status().as_u16();
-                if status != 200 {
-                    return Err(status_error(status));
-                }
-                let mut body = response
-                    .into_body()
-                    .into_with_config()
-                    .limit(u64::MAX)
-                    .reader();
-                skip_stream(&mut body, start, &|| self.cancel.load(Ordering::SeqCst))?;
-                let buffer = read_window(&mut body, cap, &|| self.cancel.load(Ordering::SeqCst))?;
-                Ok((body, buffer))
-            })();
-            let elapsed = started.elapsed();
-            if elapsed >= SLOW_READ {
-                self.counters.add_slow_read(elapsed);
-            }
-            self.buffering.store(false, Ordering::SeqCst);
-            result
-        };
-
-        // Без `Range` каждая такая попытка заново читает файл с начала.
-        if start > 0 {
+        if offset > 0 {
             self.counters.add_restart();
         }
 
-        let stop = || self.cancel.load(Ordering::SeqCst);
-        match with_retries(&self.config, &stop, &self.counters, &mut attempt) {
-            Ok((body, buffer)) => {
-                self.counters.add_bytes(buffer.len());
-                self.stream = Some(body);
-                self.stream_pos = start + buffer.len() as u64;
-                self.set_window(start, buffer);
-                Ok(())
+        let mut attempt = || {
+            if stop() {
+                return Err(HttpError::cancelled());
             }
-            Err(error) => Err(self.fail(error)),
+            let response = self.agent.get(&self.url).call().map_err(request_error)?;
+            let status = response.status().as_u16();
+            if status != 200 {
+                return Err(status_error(status));
+            }
+            let mut body = response
+                .into_body()
+                .into_with_config()
+                .limit(u64::MAX)
+                .reader();
+            skip_stream(&mut body, offset, stop)?;
+            let buffer = read_window(&mut body, want, stop)?;
+            Ok((body, buffer))
+        };
+
+        let (body, buffer) = with_retries(&self.config, stop, &self.counters, &mut attempt)?;
+        let pos = offset + buffer.len() as u64;
+        *guard = Some(StreamState { body, pos });
+        Ok(buffer)
+    }
+}
+
+/// Сетевой читатель одной дорожки: курсор в общем кэше.
+pub(crate) struct HttpReader {
+    cursor: CacheCursor,
+    hint: Option<String>,
+    len: Option<u64>,
+    seekable: bool,
+    cancel: Arc<AtomicBool>,
+    /// Терминальная ошибка источника (общая, не сбрасывается).
+    shared_failure: Arc<Mutex<Option<HttpFailure>>>,
+    /// Слот своей дорожки: декодер забирает его после `invalid data`.
+    slot: Arc<Mutex<Option<HttpFailure>>>,
+    /// «Ждём сеть»: ядро превращает это в `Buffering`.
+    buffering: Arc<AtomicBool>,
+    counters: Arc<CacheCounters>,
+}
+
+impl HttpReader {
+    /// Открывает URL с собственным кэшем (тесты и одиночный читатель).
+    pub(crate) fn open(
+        source: &Source,
+        config: HttpConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, PlayerError> {
+        let shared = HttpSource::open(source, config, Arc::clone(&cancel))?;
+        Ok(shared.reader(cancel))
+    }
+
+    /// Копирует причину сбоя источника в слот этой дорожки.
+    fn record_failure(&self) {
+        if self.cancel.load(Ordering::SeqCst) {
+            self.set_failure(HttpFailure::Cancelled);
+            return;
+        }
+        let failure = self
+            .shared_failure
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(failure) = failure {
+            self.set_failure(failure);
         }
     }
 
-    fn set_window(&mut self, start: u64, buffer: Vec<u8>) {
-        self.window = buffer;
-        self.window_start = start;
-        self.window_len = self.window.len();
-    }
-
-    /// Сохраняет причину ошибки для слоя декодера.
-    fn fail(&self, error: HttpError) -> io::Error {
-        if let Ok(mut slot) = self.failure.lock() {
-            *slot = Some(error.failure.clone());
+    fn set_failure(&self, failure: HttpFailure) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(failure);
         }
-        error.failure.into_io()
     }
 
     /// Последняя сетевая ошибка — для подмены текста FFmpeg.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn failure(&self) -> Option<HttpFailure> {
-        self.failure.lock().ok().and_then(|slot| slot.clone())
+        self.slot.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Слот ошибки: декодер читает его, когда FFmpeg вернул `invalid data`.
     pub(crate) fn failure_slot(&self) -> Arc<Mutex<Option<HttpFailure>>> {
-        Arc::clone(&self.failure)
+        Arc::clone(&self.slot)
     }
 
-    /// Флаг «ждём сеть»: ядро превращает его в `Buffering`.
+    /// Флаг «ждём сеть» для события `Buffering`.
     pub(crate) fn buffering_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.buffering)
     }
 
-    /// Счётчики сети: ядро опрашивает их для статистики.
-    pub(crate) fn counters(&self) -> Arc<HttpCounters> {
+    /// Счётчики сети: общие с другой дорожкой.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn counters(&self) -> Arc<CacheCounters> {
         Arc::clone(&self.counters)
     }
 }
 
 impl Read for HttpReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.cancel.load(Ordering::SeqCst) {
-            return Err(HttpFailure::Cancelled.into_io());
-        }
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if let Some(len) = self.len
-            && self.position >= len
-        {
-            return Ok(0);
-        }
-
-        let in_window = self.position >= self.window_start
-            && self.position < self.window_start.saturating_add(self.window_len as u64);
-        if !in_window {
-            self.fill_window()?;
-            if self.window_len == 0 {
-                return Ok(0);
+        match self.cursor.read(buffer) {
+            Ok(read) => Ok(read),
+            Err(error) => {
+                self.record_failure();
+                match self.failure() {
+                    Some(failure) => Err(failure.into_io()),
+                    None => Err(error),
+                }
             }
         }
-
-        let offset = (self.position - self.window_start) as usize;
-        let available = self.window_len.saturating_sub(offset);
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let read = available.min(buffer.len());
-        buffer[..read].copy_from_slice(&self.window[offset..offset + read]);
-        self.position += read as u64;
-        Ok(read)
     }
 }
 
 impl Seek for HttpReader {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        if self.cancel.load(Ordering::SeqCst) {
-            return Err(HttpFailure::Cancelled.into_io());
-        }
-        let target = match position {
-            SeekFrom::Start(offset) => i128::from(offset),
-            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
-            SeekFrom::End(delta) => {
-                let Some(len) = self.len else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "размер источника неизвестен",
-                    ));
-                };
-                i128::from(len) + i128::from(delta)
+        match self.cursor.seek(position) {
+            Ok(target) => Ok(target),
+            Err(error) => {
+                if error.kind() != io::ErrorKind::Unsupported {
+                    self.record_failure();
+                }
+                Err(error)
             }
-        };
-
-        if target < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "позиция до начала источника",
-            ));
         }
-        let target = target as u64;
-        if let Some(len) = self.len
-            && target > len
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "позиция за концом источника",
-            ));
-        }
-
-        self.position = target;
-        // Старые ответы фонового загрузчика относятся к другой позиции.
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(prefetch) = self.prefetch.as_mut() {
-            prefetch.pending = None;
-            prefetch.ready = None;
-        }
-        // Старое окно относится к другой позиции.
-        self.window_len = 0;
-        Ok(target)
     }
 }
 
@@ -849,86 +576,25 @@ impl MediaReader for HttpReader {
     }
 }
 
-/// Всё, что нужно фоновому загрузчику.
-struct PrefetchContext {
-    agent: ureq::Agent,
-    config: HttpConfig,
-    url: String,
-    cancel: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
-    counters: Arc<HttpCounters>,
-    requests: Receiver<FetchRequest>,
-    responses: Sender<FetchResponse>,
-}
-
-/// Запускает фоновый загрузчик окон.
-///
-/// Поток живёт, пока у него есть отправитель запросов: `HttpReader` уронил его при
-/// `Drop`, и мы выходим по `recv`. Заодно это и способ остановки при замене
-/// источника.
-fn spawn_prefetch(context: PrefetchContext) {
-    let PrefetchContext {
-        agent,
-        config,
-        url,
-        cancel,
-        generation,
-        counters,
-        requests,
-        responses,
-    } = context;
-
-    std::thread::spawn(move || {
-        while let Ok(FetchRequest::Window {
-            start,
-            end,
-            generation: wanted,
-        }) = requests.recv()
-        {
-            // Запрос устарел, если его отменили или сменилось поколение.
-            let stop = {
-                let cancel = Arc::clone(&cancel);
-                let generation = Arc::clone(&generation);
-                move || {
-                    cancel.load(Ordering::Relaxed) || generation.load(Ordering::Relaxed) != wanted
-                }
-            };
-            let result = fetch_range(&agent, &config, &url, start, end, &counters, &stop);
-            if responses
-                .send(FetchResponse {
-                    start,
-                    generation: wanted,
-                    result,
-                })
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
-}
-
-/// Скачивает окно `[start, end]` с повторами.
-///
-/// Счётчики медленных чтений здесь не ведутся: медленная загрузка в фоне
-/// ничего не блокирует. Ждать её начинает читатель, и он же это считает.
+/// Скачивает блок `[start, start + len)` запросом `Range` с повторами.
 fn fetch_range(
     agent: &ureq::Agent,
     config: &HttpConfig,
     url: &str,
     start: u64,
-    end: u64,
-    counters: &HttpCounters,
+    len: u64,
+    counters: &CacheCounters,
     stop: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>, HttpError> {
+    let len = len.max(1);
+    let end = start.saturating_add(len - 1);
     let range = format!("bytes={start}-{end}");
-    let expected = (end - start + 1) as usize;
+    let expected = len as usize;
 
     let mut attempt = || {
         if stop() {
             return Err(HttpError::cancelled());
         }
-        counters.add_request();
         let response = agent
             .get(url)
             .header("Range", &range)
@@ -946,11 +612,9 @@ fn fetch_range(
         let mut body = response
             .into_body()
             .into_with_config()
-            .limit(expected as u64 + 1)
+            .limit(len + 1)
             .reader();
-        let buffer = read_window(&mut body, expected, stop)?;
-        counters.add_bytes(buffer.len());
-        Ok(buffer)
+        read_window(&mut body, expected, stop)
     };
 
     with_retries(config, stop, counters, &mut attempt)
@@ -976,12 +640,12 @@ fn parse_content_range(value: &str) -> Option<Option<u64>> {
 
 /// Повторяет запрос по решению B и уважает отмену.
 ///
-/// `stop` шире, чем флаг отмены: фоновому загрузчику нужно ещё и прекратить
-/// работу, когда окно устарело после перемотки.
+/// `stop` шире, чем флаг отмены: кэш взводит `abort`, когда блок устарел
+/// после перемотки.
 fn with_retries<T>(
     config: &HttpConfig,
     stop: &dyn Fn() -> bool,
-    counters: &HttpCounters,
+    counters: &CacheCounters,
     attempt: &mut impl FnMut() -> Result<T, HttpError>,
 ) -> Result<T, HttpError> {
     let attempts = config.retries.max(1);
@@ -1059,7 +723,7 @@ fn skip_stream(
     Ok(())
 }
 
-/// Читает окно из последовательного потока.
+/// Читает блок из последовательного потока.
 fn read_window(
     body: &mut ureq::BodyReader<'static>,
     cap: usize,
@@ -1070,6 +734,12 @@ fn read_window(
 
     while buffer.len() < cap {
         if stop() {
+            // Отмена после частичного чтения: отдаём уже полученное.
+            // Кэш сохранит этот неполный блок, и перемотка не потеряет
+            // скачанный трафик.
+            if !buffer.is_empty() {
+                break;
+            }
             return Err(HttpError::cancelled());
         }
         let want = (cap - buffer.len()).min(scratch.len());
@@ -1109,8 +779,8 @@ pub(crate) mod test_support {
         let thread = std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 let body = bytes.clone();
-                // Соединение без `Range` держит тело открытым; второй читатель
-                // (звук и видео) должен обслуживаться параллельно.
+                // Соединение без `Range` держит тело открытым; обработчик
+                // должен принимать следующий запрос параллельно.
                 std::thread::spawn(move || respond(request, body, content_type, honor_range));
             }
         });
@@ -1193,6 +863,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
+    use std::time::Instant;
 
     use tiny_http::{Header, Response, Server, StatusCode};
 
@@ -1207,7 +878,11 @@ mod tests {
 
     fn test_config() -> HttpConfig {
         HttpConfig {
-            window: TEST_WINDOW,
+            cache: CacheConfig {
+                block: TEST_WINDOW,
+                capacity: 8 * TEST_WINDOW,
+                read_ahead: 8 * TEST_WINDOW as u64,
+            },
             connect_timeout: Duration::from_millis(500),
             read_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_millis(500),
@@ -1351,13 +1026,13 @@ mod tests {
             .expect("прочитать после seek");
         assert_eq!(buffer, data[150_000..150_016]);
 
-        // Чтение через границу окна: второй запрос Range.
+        // Чтение через границу блока: второй запрос Range.
         reader.seek(SeekFrom::Start(0)).expect("в начало");
         let mut first = vec![0_u8; TEST_WINDOW];
-        reader.read_exact(&mut first).expect("прочитать окно");
+        reader.read_exact(&mut first).expect("прочитать блок");
         assert_eq!(first, data[..TEST_WINDOW]);
         let mut next = [0_u8; 16];
-        reader.read_exact(&mut next).expect("прочитать после окна");
+        reader.read_exact(&mut next).expect("прочитать после блока");
         assert_eq!(next, data[TEST_WINDOW..TEST_WINDOW + 16]);
 
         let history = ranges.lock().expect("история");
@@ -1365,8 +1040,9 @@ mod tests {
             history
                 .iter()
                 .flatten()
-                .any(|range| range.starts_with("bytes=150000-")),
-            "должен быть запрос Range с новой позиции: {history:?}"
+                .filter_map(|range| parse_range(range))
+                .any(|(start, end)| start <= 150_000 && 150_000 <= end),
+            "позиция 150000 должна попасть в запрошенный диапазон: {history:?}"
         );
     }
 
@@ -1395,16 +1071,16 @@ mod tests {
             .expect("прочитать после seek");
         assert_eq!(buffer, data[1_000..1_010]);
 
-        // Дальше окна: поток продолжается без повторного соединения.
+        // Дальше блока: поток продолжается без повторного соединения.
         reader.seek(SeekFrom::Start(0)).expect("в начало");
         let mut first = vec![0_u8; TEST_WINDOW];
-        reader.read_exact(&mut first).expect("прочитать окно");
+        reader.read_exact(&mut first).expect("прочитать блок");
         assert_eq!(first, data[..TEST_WINDOW]);
 
         let mut second = [0_u8; 1024];
         reader
             .read_exact(&mut second)
-            .expect("продолжить после окна");
+            .expect("продолжить после блока");
         assert_eq!(second, data[TEST_WINDOW..TEST_WINDOW + 1024]);
 
         let history = ranges.lock().expect("история");
@@ -1464,13 +1140,13 @@ mod tests {
         assert_eq!(received.len(), data.len());
 
         let after = reader.counters().snapshot();
-        // Проверочный запрос и два окна: данных чуть больше одного окна.
+        // Проверочный запрос и два блока: данных чуть больше одного блока.
         assert_eq!(after.requests, 3);
         assert_eq!(after.bytes, data.len() as u64);
     }
 
     #[test]
-    fn prefetch_requests_the_next_window_ahead() {
+    fn loader_reads_ahead_of_the_cursor() {
         let data = pattern(4 * TEST_WINDOW);
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let body = data.clone();
@@ -1482,23 +1158,23 @@ mod tests {
         let mut reader = open_test(&source).expect("открыть URL");
 
         let mut first = vec![0_u8; TEST_WINDOW];
-        reader.read_exact(&mut first).expect("первое окно");
+        reader.read_exact(&mut first).expect("первый блок");
         assert_eq!(first, data[..TEST_WINDOW]);
 
-        // Второе окно заказано заранее: проверка + окно 0 + окно 1.
+        // Кэш читает вперёд: проверка + блок 0 + блок 1.
         let deadline = Instant::now() + Duration::from_secs(2);
         while ranges.lock().expect("история").len() < 3 {
-            assert!(Instant::now() < deadline, "фоновая загрузка не началась");
+            assert!(Instant::now() < deadline, "чтение вперёд не началось");
             std::thread::sleep(Duration::from_millis(5));
         }
 
         let mut second = vec![0_u8; TEST_WINDOW];
-        reader.read_exact(&mut second).expect("второе окно");
+        reader.read_exact(&mut second).expect("второй блок");
         assert_eq!(second, data[TEST_WINDOW..2 * TEST_WINDOW]);
     }
 
     #[test]
-    fn seek_ignores_a_stale_prefetch() {
+    fn seek_while_a_block_is_in_flight_uses_the_target() {
         let data = pattern(4 * TEST_WINDOW);
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let body = data.clone();
@@ -1510,9 +1186,9 @@ mod tests {
         let mut reader = open_test(&source).expect("открыть URL");
 
         let mut first = vec![0_u8; TEST_WINDOW];
-        reader.read_exact(&mut first).expect("первое окно");
+        reader.read_exact(&mut first).expect("первый блок");
 
-        // Второе окно уже в пути; перемотка делает его негодным.
+        // Прочитанный вперёд блок относится к прежней позиции и не мешает.
         reader
             .seek(SeekFrom::Start(3 * TEST_WINDOW as u64))
             .expect("перемотка");
@@ -1740,13 +1416,13 @@ mod tests {
 
         let mut reader = open_test(&Source::Url(server.base.clone())).expect("открыть URL");
         let mut byte = [0_u8; 1];
-        assert!(reader.read(&mut byte).is_err(), "окно должно упасть");
+        assert!(reader.read(&mut byte).is_err(), "блок должен упасть");
         assert_eq!(reader.failure(), Some(HttpFailure::Status(404)));
     }
 
     #[test]
     fn stream_restart_after_resume_limit_is_rejected() {
-        let data = pattern(10 * 1024);
+        let data = pattern(100 * 1024);
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let body = data.clone();
         let server = spawn(Arc::clone(&ranges), move |request, history| {
@@ -1754,8 +1430,10 @@ mod tests {
         });
 
         let mut reader = open_test(&Source::Url(server.base.clone())).expect("открыть URL");
+        // Целевой блок начинается дальше resume_limit (4096) — перезапуск
+        // с начала уже недопустим.
         reader
-            .seek(SeekFrom::Start(5_000))
+            .seek(SeekFrom::Start(70_000))
             .expect("позиция известна");
         let mut byte = [0_u8; 1];
         let error = reader.read(&mut byte).expect_err("перезапуск запрещён");

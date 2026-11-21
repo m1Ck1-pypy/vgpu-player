@@ -147,6 +147,7 @@ pub(crate) fn run_engine(
                     };
                     messages.push(next);
                 }
+                let messages = coalesce_seeks(messages);
                 let last_open = messages
                     .iter()
                     .rposition(|message| matches!(message.command, Command::Open(_)));
@@ -167,6 +168,63 @@ pub(crate) fn run_engine(
 
         engine.tick()?;
     }
+}
+
+/// Склеивает подряд идущие относительные перемотки одного направления.
+///
+/// Удержание `←`/`→` присылает десятки команд. Если выполнять их по одной,
+/// картинка отстаёт от UI и «догоняет» шагами. Сумма шагов даёт ту же
+/// конечную позицию одним seek. Разные направления не смешиваем: на границах
+/// файла промежуточный клип меняет результат.
+fn coalesce_seeks(messages: Vec<EngineMessage>) -> Vec<EngineMessage> {
+    let mut merged = Vec::with_capacity(messages.len());
+    // Направление, суммарный шаг в миллисекундах и эпоха кадров.
+    let mut run: Option<(bool, u64, Option<u64>)> = None;
+
+    for message in messages {
+        match message.command {
+            Command::SeekRelative { forward, step } => {
+                let step = u64::try_from(step.as_millis()).unwrap_or(u64::MAX);
+                if step == 0 {
+                    continue;
+                }
+                match &mut run {
+                    Some((run_forward, total, epoch)) if *run_forward == forward => {
+                        *total = total.saturating_add(step);
+                        *epoch = message.epoch;
+                    }
+                    Some(_) => {
+                        flush_seek_run(&mut merged, &mut run);
+                        run = Some((forward, step, message.epoch));
+                    }
+                    None => run = Some((forward, step, message.epoch)),
+                }
+            }
+            command => {
+                flush_seek_run(&mut merged, &mut run);
+                merged.push(EngineMessage {
+                    command,
+                    epoch: message.epoch,
+                });
+            }
+        }
+    }
+    flush_seek_run(&mut merged, &mut run);
+    merged
+}
+
+/// Добавляет накопленный шаг в список.
+fn flush_seek_run(merged: &mut Vec<EngineMessage>, run: &mut Option<(bool, u64, Option<u64>)>) {
+    let Some((forward, step, epoch)) = run.take() else {
+        return;
+    };
+    merged.push(EngineMessage {
+        command: Command::SeekRelative {
+            forward,
+            step: Duration::from_millis(step),
+        },
+        epoch,
+    });
 }
 
 impl<'a> Engine<'a> {
@@ -378,6 +436,38 @@ impl<'a> Engine<'a> {
                 }
                 self.seek(position)?;
             }
+            Command::SeekRelative { forward, step } => {
+                if let Some(epoch) = epoch {
+                    self.frame_epoch = epoch;
+                }
+                if self.media.is_none() {
+                    debug!("SeekRelative без открытого источника");
+                    return Ok(false);
+                }
+                if !self.media.as_ref().is_some_and(Media::is_seekable) {
+                    debug!("SeekRelative без поддержки перемотки");
+                    return Ok(false);
+                }
+                let current = current_position(
+                    self.clock.as_ref(),
+                    video_timer_ref(self.media.as_ref(), &self.video_timer),
+                );
+                let Some(current) = current else {
+                    debug!("SeekRelative без текущей позиции");
+                    return Ok(false);
+                };
+                let target = if forward {
+                    current.saturating_add(step)
+                } else {
+                    current.saturating_sub(step)
+                };
+                let target = self
+                    .media
+                    .as_ref()
+                    .and_then(Media::duration)
+                    .map_or(target, |duration| target.min(duration));
+                self.seek(target)?;
+            }
             Command::Open(source) => {
                 if let Some(epoch) = epoch {
                     self.frame_epoch = epoch;
@@ -432,6 +522,7 @@ impl<'a> Engine<'a> {
         );
         self.last_spectrum_at = Instant::now();
         self.report(true);
+        let _ = self.events.send(Event::Seeked(position));
         Ok(())
     }
 
@@ -628,6 +719,7 @@ impl<'a> Engine<'a> {
                 slow_reads = network.map(|stats| stats.slow_reads),
                 slow_ms = network.map(|stats| stats.slow_ms),
                 retries = network.map(|stats| stats.retries),
+                cache_bytes = network.map(|stats| stats.cache_bytes),
                 "состояние синхронизации"
             );
             let _ = self.events.send(Event::Stats(snapshot));
@@ -1001,6 +1093,82 @@ mod tests {
             ),
             counter,
         }
+    }
+
+    #[test]
+    fn relative_seek_runs_are_coalesced() {
+        let seek = |forward, seconds, epoch| EngineMessage {
+            command: Command::SeekRelative {
+                forward,
+                step: Duration::from_secs(seconds),
+            },
+            epoch: Some(epoch),
+        };
+
+        let merged = coalesce_seeks(vec![
+            seek(true, 5, 1),
+            seek(true, 5, 2),
+            seek(false, 3, 3),
+            EngineMessage {
+                command: Command::Pause,
+                epoch: None,
+            },
+            seek(false, 2, 4),
+        ]);
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(
+            merged[0].command,
+            Command::SeekRelative {
+                forward: true,
+                step: Duration::from_secs(10),
+            }
+        );
+        assert_eq!(merged[0].epoch, Some(2));
+        assert_eq!(
+            merged[1].command,
+            Command::SeekRelative {
+                forward: false,
+                step: Duration::from_secs(3),
+            }
+        );
+        assert_eq!(merged[1].epoch, Some(3));
+        assert_eq!(merged[2].command, Command::Pause);
+        assert_eq!(
+            merged[3].command,
+            Command::SeekRelative {
+                forward: false,
+                step: Duration::from_secs(2),
+            }
+        );
+    }
+
+    #[test]
+    fn opposite_relative_seeks_are_not_merged() {
+        let seek = |forward| EngineMessage {
+            command: Command::SeekRelative {
+                forward,
+                step: Duration::from_secs(5),
+            },
+            epoch: Some(1),
+        };
+
+        let merged = coalesce_seeks(vec![seek(true), seek(false)]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].command,
+            Command::SeekRelative {
+                forward: true,
+                step: Duration::from_secs(5),
+            }
+        );
+        assert_eq!(
+            merged[1].command,
+            Command::SeekRelative {
+                forward: false,
+                step: Duration::from_secs(5),
+            }
+        );
     }
 
     #[test]

@@ -134,7 +134,9 @@ impl Player {
         }
 
         let epoch = match &command {
-            Command::Seek(_) => Some(self.frame_epoch.fetch_add(1, Ordering::Relaxed) + 1),
+            Command::Seek(_) | Command::SeekRelative { .. } => {
+                Some(self.frame_epoch.fetch_add(1, Ordering::Relaxed) + 1)
+            }
             Command::Open(_) => {
                 self.open_seq.fetch_add(1, Ordering::SeqCst);
                 Some(self.frame_epoch.fetch_add(1, Ordering::Relaxed) + 1)
@@ -258,6 +260,24 @@ mod tests {
         "-pix_fmt",
         "yuv420p",
     ];
+
+    /// Клип 20 с: два шага перемотки по 5 с должны уложиться в длительность.
+    const SEEK_CLIP: &[&str] = &[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x48:rate=30",
+        "-t",
+        "20",
+        "-c:v",
+        "mpeg4",
+        "-pix_fmt",
+        "yuv420p",
+    ];
+
+    fn seek_clip() -> Option<std::path::PathBuf> {
+        sample_clip("relative_seek.mp4", "mp4", SEEK_CLIP)
+    }
 
     /// Тот же клип в WebM (нужен кодек VP8/VP9).
     const WEBM_CLIP: &[&str] = &[
@@ -527,6 +547,84 @@ mod tests {
         assert!(
             !position.is_zero(),
             "позиция должна идти и без звуковой дорожки"
+        );
+    }
+
+    #[test]
+    fn relative_seeks_accumulate_in_the_engine() {
+        // Длинный клип: два шага по 5 с должны уложиться в длительность.
+        let Some(path) = seek_clip() else {
+            eprintln!("нет клипа для перемотки и нет ffmpeg — пропускаем");
+            return;
+        };
+
+        let player = Player::open(&path).expect("запустить ядро");
+        let ready = wait_ready(&player);
+        assert!(ready.video_info.is_some(), "нужна видеодорожка");
+        player
+            .send(Command::Play)
+            .expect("запустить воспроизведение");
+
+        // Сначала даём таймеру видео пойти: относительная перемотка берёт
+        // текущую позицию ядра.
+        let started = Instant::now();
+        let mut start = Duration::ZERO;
+        while started.elapsed() < Duration::from_secs(5) && start.is_zero() {
+            if let Some(Event::PositionChanged(value)) = player.try_recv_event() {
+                start = value;
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(!start.is_zero(), "воспроизведение должно начаться");
+
+        for _ in 0..2 {
+            player
+                .send(Command::SeekRelative {
+                    forward: true,
+                    step: Duration::from_secs(5),
+                })
+                .expect("относительная перемотка");
+        }
+
+        let target = start + Duration::from_secs(9);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut position = start;
+        while Instant::now() < deadline && position < target {
+            if let Some(Event::PositionChanged(value)) = player.try_recv_event() {
+                position = value;
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        assert!(
+            position >= target,
+            "две перемотки по 5 с должны накопиться, а не откатиться: {position:?}"
+        );
+    }
+
+    #[test]
+    fn seek_reports_completion() {
+        let Some(path) = seek_clip() else {
+            eprintln!("нет клипа для перемотки и нет ffmpeg — пропускаем");
+            return;
+        };
+
+        let player = Player::open(&path).expect("запустить ядро");
+        wait_ready(&player);
+        player
+            .send(Command::Seek(Duration::from_secs(5)))
+            .expect("перемотка");
+
+        let Some(Event::Seeked(position)) = wait_event(&player, Duration::from_secs(10), |event| {
+            matches!(event, Event::Seeked(_))
+        }) else {
+            panic!("подтверждение перемотки не пришло");
+        };
+        assert!(
+            position >= Duration::from_secs(5),
+            "ядро должно стоять на цели: {position:?}"
         );
     }
 

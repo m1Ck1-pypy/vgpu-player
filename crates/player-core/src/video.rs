@@ -17,8 +17,7 @@ use ffmpeg::util::frame::video::Video as FfmpegFrame;
 use ffmpeg::{Error as FfmpegError, Rational};
 use tracing::debug;
 
-use crate::http::{HttpCounters, HttpFailure};
-use crate::sync::NetworkStats;
+use crate::http::{HttpFailure, HttpSource};
 use crate::{PlayerError, Source};
 
 /// Допуск при точной перемотке: PTS кадра может быть чуть раньше цели.
@@ -96,8 +95,6 @@ pub struct VideoDecoder {
     http_failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
     /// Флаг «ждём сеть» для события `Buffering`.
     buffering: Option<Arc<AtomicBool>>,
-    /// Счётчики сети для статистики (только у URL).
-    counters: Option<Arc<HttpCounters>>,
     /// `send_eof` уже отработал: дальше только дочитываем кадры из декодера.
     eof_sent: bool,
     /// Кадр, уже декодированный перемоткой и ждущий конвертации.
@@ -125,13 +122,16 @@ impl VideoDecoder {
 
     /// Открывает источник и готовит декодер первой видеодорожки.
     pub fn open_source(source: &Source) -> Result<Self, PlayerError> {
-        Self::open_source_with_cancel(source, Arc::new(AtomicBool::new(false)))
+        Self::open_source_with_cancel(source, Arc::new(AtomicBool::new(false)), None)
     }
 
     /// Открывает источник с отменой сетевого читателя.
+    ///
+    /// `shared` — уже открытый сетевой источник: кэш у звука и видео общий.
     pub(crate) fn open_source_with_cancel(
         source: &Source,
         reader_cancel: Arc<AtomicBool>,
+        shared: Option<&Arc<HttpSource>>,
     ) -> Result<Self, PlayerError> {
         // Плейлист — не медиапоток: сообщаем это до любых попыток открытия.
         if source.is_hls() {
@@ -142,11 +142,10 @@ impl VideoDecoder {
 
         init_ffmpeg(source)?;
 
-        let opened = crate::reader::open_reader(source, reader_cancel)?;
+        let opened = crate::reader::open_reader(source, reader_cancel, shared)?;
         let seekable = opened.reader.is_seekable();
         let failure = opened.failure;
         let buffering = opened.buffering;
-        let counters = opened.counters;
         let reader = opened.reader;
         let hint = reader.hint_name().map(str::to_owned);
         debug!(
@@ -216,7 +215,6 @@ impl VideoDecoder {
             seekable,
             http_failure: failure,
             buffering,
-            counters,
             eof_sent: false,
             pending: None,
         })
@@ -232,11 +230,6 @@ impl VideoDecoder {
         self.buffering
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
-    }
-
-    /// Счётчики сети; `None` — источник не сетевой.
-    pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
-        self.counters.as_ref().map(|counters| counters.snapshot())
     }
 
     /// Забирает сетевую ошибку, если читатель её записал.

@@ -288,9 +288,9 @@ fn action_button(id: &'static str, action: Action, player: &Entity<VideoPlayer>)
 
 /// Строка оверлея: fps, пропуски и отставание последнего кадра.
 ///
-/// Для сетевого источника добавляется вторая строка со счётчиками читателя:
-/// по ним видно, откуда берутся `drop` — медленные чтения или нехватка
-/// соединений.
+/// Для сетевого источника добавляются ещё две строки: счётчики читателя
+/// (`net:`) и занятость общего кэша (`cache:`). По ним видно, откуда берутся
+/// `drop` и рост памяти: трафик и резидентный кэш — разные величины.
 fn format_stats(stats: SyncStats) -> String {
     let mut text = format!(
         "{:.1} fps · drop {} · lag {} ms",
@@ -313,6 +313,8 @@ fn format_stats(stats: SyncStats) -> String {
         if network.restarts > 0 {
             text.push_str(&format!(" · restarts {}", network.restarts));
         }
+        text.push('\n');
+        text.push_str(&format!("cache: {}", format_mb(network.cache_bytes)));
     }
 
     text
@@ -470,11 +472,12 @@ mod tests {
                 slow_ms: 2_500,
                 retries: 1,
                 restarts: 0,
+                cache_bytes: 26_000_000,
             }),
         };
         assert_eq!(
             format_stats(stats),
-            "60.0 fps · drop 40 · lag 0 ms\nnet: 14 req · 24.8 MB · slow 9 (2.5 s) · retries 1"
+            "60.0 fps · drop 40 · lag 0 ms\nnet: 14 req · 24.8 MB · slow 9 (2.5 s) · retries 1\ncache: 24.8 MB"
         );
     }
 
@@ -492,9 +495,10 @@ mod tests {
                 slow_ms: 0,
                 retries: 0,
                 restarts: 2,
+                cache_bytes: 0,
             }),
         };
-        assert!(format_stats(stats).ends_with("restarts 2"));
+        assert!(format_stats(stats).contains("restarts 2"));
     }
 
     #[test]

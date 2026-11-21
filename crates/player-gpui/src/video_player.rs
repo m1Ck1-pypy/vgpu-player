@@ -63,6 +63,30 @@ pub(crate) struct VideoTexture {
     serial: u64,
 }
 
+/// Цель перемотки, которую UI показывает до подтверждения ядром.
+///
+/// Пока ядро ищет данные, `PositionChanged` из прошлого игнорируются: ползунок
+/// стоит на цели и ждёт `Seeked`, а не откатывается назад.
+#[derive(Debug, Clone, Copy)]
+struct SeekHint {
+    target: Duration,
+    /// Позиция, от которой считался шаг: задаёт направление.
+    from: Duration,
+}
+
+impl SeekHint {
+    /// Допуск: ядро может встать чуть раньше цели (ключевой кадр).
+    const TOLERANCE: Duration = Duration::from_millis(250);
+
+    fn accepts(self, position: Duration) -> bool {
+        if self.target >= self.from {
+            position + Self::TOLERANCE >= self.target
+        } else {
+            position <= self.target + Self::TOLERANCE
+        }
+    }
+}
+
 /// Плеер как сущность GPUI.
 ///
 /// Хранит состояние, которое нужно UI, и держит ссылку на ядро. Задачу опроса
@@ -75,6 +99,8 @@ pub struct VideoPlayer {
     volume: f32,
     duration: Option<Duration>,
     position: Duration,
+    /// Цель перемотки, ещё не подтверждённая ядром.
+    seek_hint: Option<SeekHint>,
     /// Можно ли перематывать источник.
     seekable: bool,
     /// Идёт ли буферизация (для сети появится на этапе 3).
@@ -129,6 +155,7 @@ impl VideoPlayer {
             volume: 1.0,
             duration: None,
             position: Duration::ZERO,
+            seek_hint: None,
             seekable: false,
             buffering: false,
             error: None,
@@ -331,8 +358,42 @@ impl VideoPlayer {
         if self.state == PlaybackState::Loading || !self.seekable {
             return;
         }
+        let from = self.position();
         if self.send(Command::Seek(position), cx) {
             self.position = position;
+            self.seek_hint = Some(SeekHint {
+                target: position,
+                from,
+            });
+            cx.notify();
+        }
+    }
+
+    /// Перемотать на шаг вперёд или назад.
+    ///
+    /// Цель считает ядро от своей позиции: при удержании клавиши события
+    /// `PositionChanged` доходят с задержкой, и абсолютная цель, посчитанная
+    /// здесь, откатывалась бы назад. UI показывает накопленную цель и ждёт
+    /// `Seeked`.
+    pub fn seek_relative(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
+        if self.state == PlaybackState::Loading || !self.seekable {
+            return;
+        }
+        let current = self.position();
+        let mut target = if forward {
+            current.saturating_add(step)
+        } else {
+            current.saturating_sub(step)
+        };
+        if let Some(duration) = self.duration {
+            target = target.min(duration);
+        }
+        if self.send(Command::SeekRelative { forward, step }, cx) {
+            self.position = target;
+            self.seek_hint = Some(SeekHint {
+                target,
+                from: current,
+            });
             cx.notify();
         }
     }
@@ -413,7 +474,9 @@ impl VideoPlayer {
     /// Пока пользователь тянет полосу, отдаём позицию предпросмотра: ядро
     /// в это время ещё не перематывалось.
     pub fn position(&self) -> Duration {
-        self.scrub.unwrap_or(self.position)
+        self.scrub
+            .or(self.seek_hint.map(|hint| hint.target))
+            .unwrap_or(self.position)
     }
 
     /// Текст последней ошибки, если она была.
@@ -618,6 +681,7 @@ impl VideoPlayer {
         self.progress_bounds = None;
         self.volume_bounds = None;
         self.scrub = None;
+        self.seek_hint = None;
         self.volume_scrubbing = false;
         self.volume_hover = None;
     }
@@ -698,6 +762,7 @@ impl VideoPlayer {
             Err(send_error) => {
                 error!(%send_error, "команда ядру не доставлена");
                 self.error = Some(send_error.to_string());
+                self.seek_hint = None;
                 self.state = PlaybackState::Failed;
                 cx.notify();
                 false
@@ -728,6 +793,7 @@ impl VideoPlayer {
                     self.media_info = Some(ready.media_info);
                     self.duration = ready.duration;
                     self.seekable = ready.seekable;
+                    self.seek_hint = None;
                     self.buffering = false;
                     self.state = PlaybackState::Ready;
                     self.error = None;
@@ -738,18 +804,36 @@ impl VideoPlayer {
                         self.play(cx);
                     }
                 }
-                Event::PositionChanged(position) => self.position = position,
+                Event::PositionChanged(position) => {
+                    // Пока идёт перемотка, старые позиции не должны
+                    // откатывать ползунок с выбранной цели.
+                    if self.seek_hint.is_none() {
+                        self.position = position;
+                    }
+                }
+                Event::Seeked(position) => {
+                    if let Some(hint) = self.seek_hint {
+                        if hint.accepts(position) {
+                            self.position = hint.target;
+                            self.seek_hint = None;
+                        }
+                    } else {
+                        self.position = position;
+                    }
+                }
                 Event::Buffering(buffering) => self.buffering = buffering,
                 Event::Stats(stats) => self.stats = Some(stats),
                 Event::Spectrum(bars) => self.spectrum = Some(bars),
                 Event::Ended => {
                     info!("воспроизведение завершено");
                     self.buffering = false;
+                    self.seek_hint = None;
                     self.state = PlaybackState::Ended;
                 }
                 Event::Error(message) => {
                     error!(%message, "ошибка воспроизведения");
                     self.buffering = false;
+                    self.seek_hint = None;
                     self.error = Some(message);
                     self.state = PlaybackState::Failed;
                 }
@@ -844,6 +928,25 @@ fn spawn_event_pump(cx: &mut Context<VideoPlayer>) -> Task<()> {
 mod tests {
     use super::*;
     use gpui::px;
+
+    #[test]
+    fn seek_hint_waits_for_the_target() {
+        let forward = SeekHint {
+            from: Duration::from_secs(10),
+            target: Duration::from_secs(20),
+        };
+        assert!(!forward.accepts(Duration::from_secs(15)));
+        assert!(forward.accepts(Duration::from_millis(19_900)));
+        assert!(forward.accepts(Duration::from_secs(20)));
+
+        let backward = SeekHint {
+            from: Duration::from_secs(20),
+            target: Duration::from_secs(10),
+        };
+        assert!(!backward.accepts(Duration::from_secs(15)));
+        assert!(backward.accepts(Duration::from_millis(10_100)));
+        assert!(backward.accepts(Duration::from_secs(10)));
+    }
 
     fn slider_bounds() -> Bounds<Pixels> {
         Bounds {

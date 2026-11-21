@@ -32,8 +32,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use tracing::{debug, info};
 
-use crate::http::{HttpCounters, HttpFailure};
-use crate::sync::NetworkStats;
+use crate::http::{HttpFailure, HttpSource};
 use crate::video::{codec_name_of, container_name, init_ffmpeg};
 use crate::{PlayerError, Source};
 
@@ -62,16 +61,19 @@ impl AudioDecoder {
     /// Версия для тестов: без контроля отмены.
     #[cfg(test)]
     pub(crate) fn open(source: &Source) -> Result<Self, PlayerError> {
-        Self::open_with_cancel(source, Arc::new(AtomicBool::new(false)))
+        Self::open_with_cancel(source, Arc::new(AtomicBool::new(false)), None)
     }
 
     /// То же, но с флагом отмены для сетевого читателя.
+    ///
+    /// `shared` — уже открытый сетевой источник: кэш у звука и видео общий.
     pub(crate) fn open_with_cancel(
         source: &Source,
         cancel: Arc<AtomicBool>,
+        shared: Option<&Arc<HttpSource>>,
     ) -> Result<Self, PlayerError> {
         let Source::File(path) = source else {
-            return FfmpegDecoder::open_with_cancel(source, cancel)
+            return FfmpegDecoder::open_with_cancel(source, cancel, shared)
                 .map(|decoder| Self::Ffmpeg(Box::new(decoder)));
         };
 
@@ -79,7 +81,7 @@ impl AudioDecoder {
             Ok(decoder) => Ok(Self::Symphonia(decoder)),
             // Нет файла или нет прав: второй бэкенд даст ту же ошибку.
             Err(error @ PlayerError::OpenFile { .. }) => Err(error),
-            Err(primary_error) => match FfmpegDecoder::open_with_cancel(source, cancel) {
+            Err(primary_error) => match FfmpegDecoder::open_with_cancel(source, cancel, shared) {
                 Ok(decoder) => {
                     info!(
                         path = %path.display(),
@@ -116,17 +118,6 @@ impl AudioDecoder {
                 .buffering
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed)),
-        }
-    }
-
-    /// Счётчики сети; `None` — звук прочитан не из сети.
-    pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
-        match self {
-            Self::Symphonia(_) => None,
-            Self::Ffmpeg(decoder) => decoder
-                .counters
-                .as_ref()
-                .map(|counters| counters.snapshot()),
         }
     }
 
@@ -409,8 +400,6 @@ pub(crate) struct FfmpegDecoder {
     http_failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
     /// Флаг «ждём сеть» для события `Buffering`.
     buffering: Option<Arc<AtomicBool>>,
-    /// Счётчики сети для статистики (только у URL).
-    counters: Option<Arc<HttpCounters>>,
     /// Конвертер в `f32` вперемешку; пересобирается при смене формата.
     resampler: Option<ResamplingContext>,
     /// Параметры, под которые настроен `resampler`.
@@ -440,14 +429,14 @@ impl FfmpegDecoder {
     fn open_with_cancel(
         target: &Source,
         reader_cancel: Arc<AtomicBool>,
+        shared: Option<&Arc<HttpSource>>,
     ) -> Result<Self, PlayerError> {
         init_ffmpeg(target)?;
 
-        let opened = crate::reader::open_reader(target, reader_cancel)?;
+        let opened = crate::reader::open_reader(target, reader_cancel, shared)?;
         let seekable = opened.reader.is_seekable();
         let failure = opened.failure;
         let buffering = opened.buffering;
-        let counters = opened.counters;
         let reader = opened.reader;
         let hint = reader.hint_name().map(str::to_owned);
         debug!(
@@ -513,7 +502,6 @@ impl FfmpegDecoder {
             seekable,
             http_failure: failure,
             buffering,
-            counters,
             resampler: None,
             source: None,
             discard_until: None,

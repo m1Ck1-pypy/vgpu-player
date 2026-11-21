@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use crate::http::{HttpConfig, HttpCounters, HttpFailure, HttpReader};
+use crate::http::{HttpConfig, HttpFailure, HttpReader, HttpSource};
 use crate::{PlayerError, Source};
 
 /// Источник байтов для FFmpeg.
@@ -84,18 +84,18 @@ pub(crate) struct OpenedReader {
     pub(crate) failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
     /// Флаг «ждём сеть» для события `Buffering`.
     pub(crate) buffering: Option<Arc<AtomicBool>>,
-    /// Счётчики сети для оверлея статистики.
-    pub(crate) counters: Option<Arc<HttpCounters>>,
 }
 
 /// Открывает читатель для источника.
 ///
-/// Файл даёт [`FileReader`], URL — [`HttpReader`]; декодеры дальше не знают,
-/// откуда пришли байты. `cancel` — флаг ядра: сетевой читатель должен прервать
-/// блокирующее чтение при `Stop`/`Drop`.
+/// Файл даёт [`FileReader`], URL — [`HttpReader`] поверх общего кэша;
+/// декодеры дальше не знают, откуда пришли байты. `cancel` — флаг ядра:
+/// сетевой читатель должен прервать блокирующее чтение при `Stop`/`Drop`.
+/// `shared` — уже открытый сетевой источник: кэш у звука и видео один.
 pub(crate) fn open_reader(
     source: &Source,
     cancel: Arc<AtomicBool>,
+    shared: Option<&Arc<HttpSource>>,
 ) -> Result<OpenedReader, PlayerError> {
     match source {
         Source::File(path) => {
@@ -107,19 +107,20 @@ pub(crate) fn open_reader(
                 reader: Box::new(reader),
                 failure: None,
                 buffering: None,
-                counters: None,
             })
         }
         Source::Url(_) => {
-            let reader = HttpReader::open(source, HttpConfig::default(), cancel)?;
+            let reader = match shared {
+                Some(shared) => shared.reader(Arc::clone(&cancel)),
+                // Одиночный читатель (тесты, CLI): свой кэш на источник.
+                None => HttpReader::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
+            };
             let failure = reader.failure_slot();
             let buffering = reader.buffering_flag();
-            let counters = reader.counters();
             Ok(OpenedReader {
                 reader: Box::new(reader),
                 failure: Some(failure),
                 buffering: Some(buffering),
-                counters: Some(counters),
             })
         }
     }
@@ -208,6 +209,7 @@ mod tests {
         let opened = open_reader(
             &Source::File(path.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .expect("открыть файл");
 

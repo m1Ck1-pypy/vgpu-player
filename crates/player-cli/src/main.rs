@@ -191,6 +191,8 @@ fn play(source: &Source) -> anyhow::Result<()> {
                 Event::Stats(stats) => last_stats = Some(stats),
                 // CLI не рисует визуализатор: уровни нужны только окну.
                 Event::Spectrum(_) => {}
+                // Ползунка в CLI нет: подтверждение перемотки не печатаем.
+                Event::Seeked(_) => {}
                 Event::Buffering(_) => {}
             }
         }

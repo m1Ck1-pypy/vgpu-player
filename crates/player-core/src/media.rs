@@ -14,6 +14,7 @@ use tracing::{debug, error, info};
 
 use crate::PlayerError;
 use crate::audio::AudioDecoder;
+use crate::http::{HttpConfig, HttpSource};
 use crate::source::Source as MediaSource;
 use crate::sync::NetworkStats;
 use crate::video::{VideoDecoder, VideoInfo};
@@ -22,6 +23,8 @@ use crate::video::{VideoDecoder, VideoInfo};
 pub(crate) struct Media {
     pub(crate) audio: Option<AudioDecoder>,
     pub(crate) video: Option<VideoDecoder>,
+    /// Сетевой источник: один кэш и одни счётчики на обе дорожки.
+    shared: Option<Arc<HttpSource>>,
     /// Можно ли перематывать источник (учитываются открытые дорожки).
     seekable: bool,
 }
@@ -72,11 +75,26 @@ impl Media {
             });
         }
 
-        let audio = AudioDecoder::open_with_cancel(source, Arc::clone(&cancel));
+        // Сетевой источник открывается один раз: и звук, и видео читают из
+        // общего кэша, а не качают файл каждый сам себе.
+        let shared = match source {
+            MediaSource::Url(_) => Some(HttpSource::open(
+                source,
+                HttpConfig::default(),
+                Arc::clone(&cancel),
+            )?),
+            MediaSource::File(_) => None,
+        };
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
-        let video = VideoDecoder::open_source_with_cancel(source, Arc::clone(&cancel));
+
+        let audio = AudioDecoder::open_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
+        if cancelled() {
+            return Err(PlayerError::Cancelled);
+        }
+        let video =
+            VideoDecoder::open_source_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
@@ -97,6 +115,7 @@ impl Media {
                 Ok(Self {
                     audio: Some(audio),
                     video: Some(video),
+                    shared,
                     seekable,
                 })
             }
@@ -105,6 +124,7 @@ impl Media {
                 Ok(Self {
                     audio: Some(audio),
                     video: None,
+                    shared,
                     seekable,
                 })
             }
@@ -113,6 +133,7 @@ impl Media {
                 Ok(Self {
                     audio: None,
                     video: Some(video),
+                    shared,
                     seekable,
                 })
             }
@@ -141,26 +162,10 @@ impl Media {
 
     /// Счётчики сети для статистики.
     ///
-    /// Читателей два (звук и видео), поэтому запросы и байты складываем: важно
-    /// сколько сети потрачено в сумме, а не кем именно.
+    /// Кэш у источника один, поэтому запросы и байты считаются один раз и не
+    /// складываются по дорожкам.
     pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
-        let mut total: Option<NetworkStats> = None;
-        for stats in [
-            self.audio.as_ref().and_then(AudioDecoder::network_stats),
-            self.video.as_ref().and_then(VideoDecoder::network_stats),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let summary = total.get_or_insert_default();
-            summary.requests = summary.requests.saturating_add(stats.requests);
-            summary.bytes = summary.bytes.saturating_add(stats.bytes);
-            summary.slow_reads = summary.slow_reads.saturating_add(stats.slow_reads);
-            summary.slow_ms = summary.slow_ms.saturating_add(stats.slow_ms);
-            summary.retries = summary.retries.saturating_add(stats.retries);
-            summary.restarts = summary.restarts.saturating_add(stats.restarts);
-        }
-        total
+        self.shared.as_ref().map(|shared| shared.network_stats())
     }
 
     /// Длительность: из звука, иначе из видео.
@@ -357,8 +362,8 @@ mod tests {
 
     /// Замер трафика для этапа 4.
     ///
-    /// Звук и видео — независимые читатели, поэтому файл качается дважды;
-    /// тест печатает фактическое соотношение и сторожит от лавины запросов.
+    /// Общий кэш: звук и видео читают один и тот же файл, а не две копии.
+    /// Тест печатает фактическое соотношение и сторожит от лавины запросов.
     #[test]
     fn url_traffic_is_measured() {
         const AV_CLIP: &[&str] = &[
@@ -419,9 +424,12 @@ mod tests {
                 stats.bytes, stats.requests
             );
             assert!(stats.bytes >= len, "данные должны быть прочитаны");
-            // Два читателя плюс окна, отброшенные после перемоток демуксера:
-            // сейчас это ориентир для этапа 4, а не требование.
-            assert!(ratio < 8.0, "трафик не должен разрастаться: {ratio:.2}×");
+            // После этапа 4 читатель один, а кэш не сбрасывается при перемотках
+            // демуксера: трафик не должен заметно превышать размер файла.
+            assert!(
+                ratio <= 1.2,
+                "трафик должен укладываться в 1,2× файла: {ratio:.2}×"
+            );
         }
     }
 }

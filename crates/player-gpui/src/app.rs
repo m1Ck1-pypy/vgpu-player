@@ -521,20 +521,13 @@ impl PlayerWindow {
         self.save_settings(cx);
     }
 
-    /// Перематывает на шаг вперёд или назад, не выходя за границы файла.
+    /// Перематывает на шаг вперёд или назад.
+    ///
+    /// Цель считает ядро: при удержании клавиши `PositionChanged` доходят
+    /// с задержкой, и абсолютная цель, собранная в UI, откатывалась бы назад.
     fn seek_relative(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
-        self.player.update(cx, |video, cx| {
-            let current = video.position();
-            let mut target = if forward {
-                current.saturating_add(step)
-            } else {
-                current.saturating_sub(step)
-            };
-            if let Some(duration) = video.duration() {
-                target = target.min(duration);
-            }
-            video.seek(target, cx);
-        });
+        self.player
+            .update(cx, |video, cx| video.seek_relative(step, forward, cx));
     }
 
     /// Перетаскивание файла в окно: играем первый подходящий.

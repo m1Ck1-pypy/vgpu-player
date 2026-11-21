@@ -8,6 +8,7 @@
 //! [`Command`] и [`Event`] как контракт с UI, [`PlayerError`] для ошибок.
 
 mod audio;
+mod cache;
 mod clock;
 mod command;
 mod engine;
