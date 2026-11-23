@@ -14,6 +14,7 @@ mod command;
 mod engine;
 mod error;
 mod event;
+mod hls;
 mod http;
 mod media;
 mod player;

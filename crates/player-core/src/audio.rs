@@ -32,7 +32,8 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use tracing::{debug, info};
 
-use crate::http::{HttpFailure, HttpSource};
+use crate::http::HttpFailure;
+use crate::reader::SharedSource;
 use crate::video::{codec_name_of, container_name, init_ffmpeg};
 use crate::{PlayerError, Source};
 
@@ -70,7 +71,7 @@ impl AudioDecoder {
     pub(crate) fn open_with_cancel(
         source: &Source,
         cancel: Arc<AtomicBool>,
-        shared: Option<&Arc<HttpSource>>,
+        shared: Option<&SharedSource>,
     ) -> Result<Self, PlayerError> {
         let Source::File(path) = source else {
             return FfmpegDecoder::open_with_cancel(source, cancel, shared)
@@ -158,6 +159,18 @@ impl AudioDecoder {
         match self {
             Self::Symphonia(decoder) => decoder.seek(position),
             Self::Ffmpeg(decoder) => decoder.seek(position),
+        }
+    }
+
+    /// Переходит к позиции без байтовой перемотки: HLS-читатель уже стоит на
+    /// сегменте целевого времени, остаётся отбросить сэмплы до неё.
+    pub(crate) fn skip_to(&mut self, position: Duration) -> Result<(), PlayerError> {
+        match self {
+            Self::Symphonia(decoder) => decoder.seek(position),
+            Self::Ffmpeg(decoder) => {
+                decoder.skip_to(position);
+                Ok(())
+            }
         }
     }
 
@@ -410,6 +423,8 @@ pub(crate) struct FfmpegDecoder {
     eof_sent: bool,
     /// Сколько кадров уже сконвертировано (диагностика).
     converted_chunks: u64,
+    /// Пересечён `#EXT-X-DISCONTINUITY`: перед следующим пакетом сбросить декодер.
+    discontinuity: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: контексты FFmpeg не потокобезопасны для одновременного доступа, но
@@ -429,14 +444,16 @@ impl FfmpegDecoder {
     fn open_with_cancel(
         target: &Source,
         reader_cancel: Arc<AtomicBool>,
-        shared: Option<&Arc<HttpSource>>,
+        shared: Option<&SharedSource>,
     ) -> Result<Self, PlayerError> {
         init_ffmpeg(target)?;
 
-        let opened = crate::reader::open_reader(target, reader_cancel, shared)?;
+        let opened =
+            crate::reader::open_reader(target, crate::reader::Track::Audio, reader_cancel, shared)?;
         let seekable = opened.reader.is_seekable();
         let failure = opened.failure;
         let buffering = opened.buffering;
+        let discontinuity = opened.discontinuity;
         let reader = opened.reader;
         let hint = reader.hint_name().map(str::to_owned);
         debug!(
@@ -445,8 +462,14 @@ impl FfmpegDecoder {
             hint = ?hint,
             "аудиоисточник открыт"
         );
-        let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(reader)
-            .map_err(|error| open_error(target, &failure, error))?;
+        // То же, что у видео: без seek-колбэка демуксер не уходит искать
+        // конец несеквентного HLS-потока.
+        let stream_io = if seekable {
+            ffmpeg::format::context::StreamIo::from_read_seek(reader)
+        } else {
+            ffmpeg::format::context::StreamIo::from_read(reader)
+        }
+        .map_err(|error| open_error(target, &failure, error))?;
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::clone(&cancel);
         let input = ffmpeg::format::input_from_stream_with_interrupt(
@@ -507,6 +530,7 @@ impl FfmpegDecoder {
             discard_until: None,
             eof_sent: false,
             converted_chunks: 0,
+            discontinuity,
         })
     }
 
@@ -593,6 +617,15 @@ impl FfmpegDecoder {
             let mut packet = ffmpeg::Packet::empty();
             match packet.read(&mut self.input) {
                 Ok(()) => {
+                    // Разрыв HLS: пакет уже из нового сегмента, декодер
+                    // должен начать с чистого листа.
+                    if self
+                        .discontinuity
+                        .as_ref()
+                        .is_some_and(|flag| flag.swap(false, Ordering::Relaxed))
+                    {
+                        self.decoder.flush();
+                    }
                     if packet.stream() == self.stream_index {
                         return Ok(Some(packet));
                     }
@@ -626,6 +659,13 @@ impl FfmpegDecoder {
         self.discard_until = Some(position);
         self.eof_sent = false;
         Ok(())
+    }
+
+    /// То же без байтовой перемотки: HLS-читатель уже на нужном сегменте.
+    fn skip_to(&mut self, position: Duration) {
+        self.decoder.flush();
+        self.discard_until = Some(position);
+        self.eof_sent = false;
     }
 
     /// Нужно ли выбросить кадр: он целиком раньше цели перемотки.

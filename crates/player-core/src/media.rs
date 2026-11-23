@@ -14,7 +14,9 @@ use tracing::{debug, error, info};
 
 use crate::PlayerError;
 use crate::audio::AudioDecoder;
+use crate::hls::HlsSource;
 use crate::http::{HttpConfig, HttpSource};
+use crate::reader::SharedSource;
 use crate::source::Source as MediaSource;
 use crate::sync::NetworkStats;
 use crate::video::{VideoDecoder, VideoInfo};
@@ -23,10 +25,16 @@ use crate::video::{VideoDecoder, VideoInfo};
 pub(crate) struct Media {
     pub(crate) audio: Option<AudioDecoder>,
     pub(crate) video: Option<VideoDecoder>,
-    /// Сетевой источник: один кэш и одни счётчики на обе дорожки.
-    shared: Option<Arc<HttpSource>>,
+    /// Исходный адрес: нужен для перемотки HLS и текстов ошибок.
+    source: MediaSource,
+    /// Флаг отмены: читатели переоткрываются при перемотке HLS.
+    cancel: Arc<AtomicBool>,
+    /// Общий сетевой источник: один кэш и одни счётчики на обе дорожки.
+    shared: Option<SharedSource>,
     /// Можно ли перематывать источник (учитываются открытые дорожки).
     seekable: bool,
+    /// Идёт ли поток в реальном времени.
+    live: bool,
 }
 
 impl Media {
@@ -56,8 +64,8 @@ impl Media {
             return Err(PlayerError::Cancelled);
         }
 
-        // Плейлист — не медиапоток: до него ещё нет HLS-клиента.
-        if source.is_hls() {
+        // Локальный плейлист не открываем: HLS в этапе 5 — только по URL.
+        if matches!(source, MediaSource::File(_)) && source.is_hls() {
             return Err(PlayerError::UnsupportedHls {
                 target: source.clone(),
             });
@@ -76,31 +84,49 @@ impl Media {
         }
 
         // Сетевой источник открывается один раз: и звук, и видео читают из
-        // общего кэша, а не качают файл каждый сам себе.
+        // общего кэша (или общего HLS-источника), а не качают каждый сам себе.
         let shared = match source {
-            MediaSource::Url(_) => Some(HttpSource::open(
+            MediaSource::Url(_) if source.is_hls() => Some(SharedSource::Hls(HlsSource::open(
                 source,
                 HttpConfig::default(),
                 Arc::clone(&cancel),
-            )?),
+            )?)),
+            MediaSource::Url(_) => Some(SharedSource::Http(HttpSource::open(
+                source,
+                HttpConfig::default(),
+                Arc::clone(&cancel),
+            )?)),
             MediaSource::File(_) => None,
         };
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
 
+        if let Some(SharedSource::Hls(hls)) = &shared {
+            debug!(
+                source = %source,
+                live = hls.is_live(),
+                demuxed = hls.is_demuxed(),
+                "HLS-источник открыт"
+            );
+        }
+
         let audio = AudioDecoder::open_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
-        let video =
+        let mut video =
             VideoDecoder::open_source_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
+        if let (Some(SharedSource::Hls(hls)), Ok(video)) = (&shared, &mut video) {
+            video.set_pts_shift_ms(hls.video_pts_shift_ms());
+        }
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
 
         // Перемотка возможна, только если её поддерживают все открытые дорожки.
-        let seekable = audio
+        // У HLS виртуального размера нет: перематывается только VOD по времени.
+        let decoder_seekable = audio
             .as_ref()
             .map(AudioDecoder::is_seekable)
             .unwrap_or(true)
@@ -108,34 +134,24 @@ impl Media {
                 .as_ref()
                 .map(VideoDecoder::is_seekable)
                 .unwrap_or(true);
+        let live = matches!(&shared, Some(SharedSource::Hls(hls)) if hls.is_live());
+        let seekable = match &shared {
+            Some(SharedSource::Hls(_)) => !live,
+            _ => decoder_seekable,
+        };
 
-        match (audio, video) {
+        let (audio, video) = match (audio, video) {
             (Ok(audio), Ok(video)) => {
                 info!(source = %source, "открыты звук и видео");
-                Ok(Self {
-                    audio: Some(audio),
-                    video: Some(video),
-                    shared,
-                    seekable,
-                })
+                (Some(audio), Some(video))
             }
             (Ok(audio), Err(video_error)) => {
                 debug!(source = %source, %video_error, "видеодорожка недоступна");
-                Ok(Self {
-                    audio: Some(audio),
-                    video: None,
-                    shared,
-                    seekable,
-                })
+                (Some(audio), None)
             }
             (Err(audio_error), Ok(video)) => {
                 debug!(source = %source, %audio_error, "аудиодорожка недоступна");
-                Ok(Self {
-                    audio: None,
-                    video: Some(video),
-                    shared,
-                    seekable,
-                })
+                (None, Some(video))
             }
             (Err(audio_error), Err(video_error)) => {
                 error!(
@@ -144,9 +160,19 @@ impl Media {
                     %video_error,
                     "источник не открылся ни как звук, ни как видео"
                 );
-                Err(audio_error)
+                return Err(audio_error);
             }
-        }
+        };
+
+        Ok(Self {
+            audio,
+            video,
+            source: source.clone(),
+            cancel,
+            shared,
+            seekable,
+            live,
+        })
     }
 
     /// Можно ли перематывать источник.
@@ -154,22 +180,102 @@ impl Media {
         self.seekable
     }
 
+    /// Перематывает источник к позиции.
+    ///
+    /// Файл и обычный URL перематывают декодеры байтовым `seek`. У HLS
+    /// виртуального потока нет размера, поэтому декодеры переоткрываются на
+    /// сегменте целевого времени, а затем отбрасывают сэмплы до точной позиции.
+    pub(crate) fn seek(&mut self, position: Duration) -> Result<(), PlayerError> {
+        if let Some(SharedSource::Hls(hls)) = self.shared.clone() {
+            return self.seek_hls(&hls, position);
+        }
+
+        if let Some(video) = self.video.as_mut() {
+            video.seek(position)?;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.seek(position)?;
+        }
+        Ok(())
+    }
+
+    /// Переоткрывает обе дорожки на сегменте `position` и отбрасывает сэмплы
+    /// раньше неё. Так перемотка обходит отсутствие байтового размера у HLS.
+    fn seek_hls(&mut self, hls: &Arc<HlsSource>, position: Duration) -> Result<(), PlayerError> {
+        hls.seek_time(position)?;
+
+        // Старые читатели не должны пережить переоткрытие.
+        self.audio = None;
+        self.video = None;
+        let shared = self.shared.clone();
+
+        let audio =
+            AudioDecoder::open_with_cancel(&self.source, Arc::clone(&self.cancel), shared.as_ref());
+        let video = VideoDecoder::open_source_with_cancel(
+            &self.source,
+            Arc::clone(&self.cancel),
+            shared.as_ref(),
+        );
+
+        let (mut audio, mut video) = match (audio, video) {
+            (Ok(audio), Ok(video)) => (Some(audio), Some(video)),
+            (Ok(audio), Err(error)) => {
+                debug!(%error, "видеодорожка не открылась после перемотки");
+                (Some(audio), None)
+            }
+            (Err(error), Ok(video)) => {
+                debug!(%error, "аудиодорожка не открылась после перемотки");
+                (None, Some(video))
+            }
+            (Err(audio_error), Err(video_error)) => {
+                error!(
+                    %audio_error,
+                    %video_error,
+                    "HLS не открылся после перемотки"
+                );
+                return Err(audio_error);
+            }
+        };
+
+        if let Some(video) = video.as_mut() {
+            video.set_pts_shift_ms(hls.video_pts_shift_ms());
+            video.skip_to(position)?;
+        }
+        if let Some(audio) = audio.as_mut() {
+            audio.skip_to(position)?;
+        }
+
+        self.audio = audio;
+        self.video = video;
+        Ok(())
+    }
+
     /// Ждёт ли хотя бы одна дорожка сеть.
     pub(crate) fn is_buffering(&self) -> bool {
-        self.audio.as_ref().is_some_and(AudioDecoder::is_buffering)
-            || self.video.as_ref().is_some_and(VideoDecoder::is_buffering)
+        let decoders = self.audio.as_ref().is_some_and(AudioDecoder::is_buffering)
+            || self.video.as_ref().is_some_and(VideoDecoder::is_buffering);
+        let source = matches!(&self.shared, Some(SharedSource::Hls(hls)) if hls.is_buffering());
+        decoders || source
     }
 
     /// Счётчики сети для статистики.
     ///
     /// Кэш у источника один, поэтому запросы и байты считаются один раз и не
-    /// складываются по дорожкам.
+    /// складываются по дорожкам; у HLS счётчики общие для обеих дорожек.
     pub(crate) fn network_stats(&self) -> Option<NetworkStats> {
-        self.shared.as_ref().map(|shared| shared.network_stats())
+        match &self.shared {
+            Some(SharedSource::Http(http)) => Some(http.network_stats()),
+            Some(SharedSource::Hls(hls)) => Some(hls.network_stats()),
+            None => None,
+        }
     }
 
-    /// Длительность: из звука, иначе из видео.
+    /// Длительность: у HLS — из плейлиста, иначе из звука, затем из видео.
     pub(crate) fn duration(&self) -> Option<Duration> {
+        if let Some(SharedSource::Hls(hls)) = &self.shared {
+            return hls.duration();
+        }
+
         self.audio
             .as_ref()
             .and_then(|audio| audio.duration())
@@ -188,7 +294,7 @@ impl Media {
             video_info: self.video_info(),
             duration: self.duration(),
             seekable: self.seekable,
-            live: false,
+            live: self.live,
         }
     }
 
@@ -258,7 +364,7 @@ pub struct MediaReady {
     pub duration: Option<Duration>,
     /// Поддерживает ли источник перемотку.
     pub seekable: bool,
-    /// Идёт ли поток в реальном времени (пока всегда `false`).
+    /// Идёт ли поток в реальном времени (HLS без `#EXT-X-ENDLIST`).
     pub live: bool,
 }
 
@@ -338,6 +444,8 @@ fn probe_tracks(path: &Path) -> ProbedTracks {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::video::test_support::{sample_clip, sample_video};
 
@@ -358,6 +466,19 @@ mod tests {
         assert!(ready.media_info.container.is_some(), "контейнер");
         assert!(ready.seekable, "локальный файл перематывается");
         assert!(!ready.live, "файл не является live-потоком");
+    }
+
+    #[test]
+    fn local_playlist_is_unsupported() {
+        let source = MediaSource::File(PathBuf::from("index.m3u8"));
+        let error = match Media::open(&source) {
+            Err(error) => error,
+            Ok(_) => panic!("локальный HLS не поддерживается"),
+        };
+        assert!(
+            matches!(error, PlayerError::UnsupportedHls { .. }),
+            "{error}"
+        );
     }
 
     /// Замер трафика для этапа 4.

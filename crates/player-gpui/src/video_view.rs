@@ -64,6 +64,7 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         )
     };
     let buffering = shows_buffering(state, buffering);
+    let live = shows_live(state, player.read(cx).live());
 
     let action = match state {
         PlaybackState::Ended => Some(action_button("vgpu-restart", Action::Restart, player)),
@@ -88,6 +89,9 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
     // спектроанализатор. Состояния `Idle` и `Failed` остаются текстовыми.
     if shows_spectrum(state, has_video) {
         let mut root = root.child(spectrum_view(spectrum));
+        if live {
+            root = root.child(live_badge());
+        }
         if buffering {
             root = root.child(buffering_overlay());
         }
@@ -153,6 +157,9 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         if buffering {
             root = root.child(buffering_overlay());
         }
+        if live {
+            root = root.child(live_badge());
+        }
 
         return root;
     }
@@ -169,6 +176,9 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
     }
     if buffering {
         root = root.child(buffering_overlay());
+    }
+    if live {
+        root = root.child(live_badge());
     }
     root
 }
@@ -189,6 +199,28 @@ fn shows_buffering(state: PlaybackState, buffering: bool) -> bool {
             state,
             PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
         )
+}
+
+/// Рисуем ли плашку `LIVE`: только у открытого live-потока.
+fn shows_live(state: PlaybackState, live: bool) -> bool {
+    live && !matches!(
+        state,
+        PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
+    )
+}
+
+/// Плашка `LIVE` в правом верхнем углу кадра.
+fn live_badge() -> Div {
+    div()
+        .absolute()
+        .top(px(12.0))
+        .right(px(12.0))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(gpui::rgb(0xcc_2b_2b))
+        .text_xs()
+        .child("LIVE")
 }
 
 /// Плашка «Буферизация…» поверх кадра.
@@ -554,6 +586,17 @@ mod tests {
         assert!(!shows_buffering(PlaybackState::Loading, true));
         assert!(!shows_buffering(PlaybackState::Idle, true));
         assert!(!shows_buffering(PlaybackState::Failed, true));
+    }
+
+    #[test]
+    fn live_badge_is_shown_only_for_open_live_streams() {
+        assert!(shows_live(PlaybackState::Ready, true));
+        assert!(shows_live(PlaybackState::Playing, true));
+        assert!(shows_live(PlaybackState::Paused, true));
+        assert!(!shows_live(PlaybackState::Loading, true));
+        assert!(!shows_live(PlaybackState::Idle, true));
+        assert!(!shows_live(PlaybackState::Failed, true));
+        assert!(!shows_live(PlaybackState::Playing, false));
     }
 
     #[test]

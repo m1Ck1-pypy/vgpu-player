@@ -17,7 +17,8 @@ use ffmpeg::util::frame::video::Video as FfmpegFrame;
 use ffmpeg::{Error as FfmpegError, Rational};
 use tracing::debug;
 
-use crate::http::{HttpFailure, HttpSource};
+use crate::http::HttpFailure;
+use crate::reader::SharedSource;
 use crate::{PlayerError, Source};
 
 /// Допуск при точной перемотке: PTS кадра может быть чуть раньше цели.
@@ -99,6 +100,15 @@ pub struct VideoDecoder {
     eof_sent: bool,
     /// Кадр, уже декодированный перемоткой и ждущий конвертации.
     pending: Option<FfmpegFrame>,
+    /// Сдвиг PTS видео для demuxed live, в миллисекундах.
+    pts_shift_ms: i64,
+    /// PTS, соответствующий началу live-потока (в единицах `time_base`).
+    ///
+    /// У live fMP4 абсолютные PTS (tfdt) могут начинаться не с нуля,
+    /// а часы ядра стартуют с 0 по аудио. Для VOD и файлов — 0.
+    pts_origin: i64,
+    /// Пересечён `#EXT-X-DISCONTINUITY`: перед следующим пакетом сбросить декодер.
+    discontinuity: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: контексты FFmpeg и swscale не потокобезопасны для одновременного
@@ -131,10 +141,10 @@ impl VideoDecoder {
     pub(crate) fn open_source_with_cancel(
         source: &Source,
         reader_cancel: Arc<AtomicBool>,
-        shared: Option<&Arc<HttpSource>>,
+        shared: Option<&SharedSource>,
     ) -> Result<Self, PlayerError> {
-        // Плейлист — не медиапоток: сообщаем это до любых попыток открытия.
-        if source.is_hls() {
+        // Локальный плейлист — не медиапоток: HLS в этапе 5 — только по URL.
+        if matches!(source, Source::File(_)) && source.is_hls() {
             return Err(PlayerError::UnsupportedHls {
                 target: source.clone(),
             });
@@ -142,10 +152,13 @@ impl VideoDecoder {
 
         init_ffmpeg(source)?;
 
-        let opened = crate::reader::open_reader(source, reader_cancel, shared)?;
+        debug!("видео: открываем читатель");
+        let opened =
+            crate::reader::open_reader(source, crate::reader::Track::Video, reader_cancel, shared)?;
         let seekable = opened.reader.is_seekable();
         let failure = opened.failure;
         let buffering = opened.buffering;
+        let discontinuity = opened.discontinuity;
         let reader = opened.reader;
         let hint = reader.hint_name().map(str::to_owned);
         debug!(
@@ -154,8 +167,17 @@ impl VideoDecoder {
             hint = ?hint,
             "видеоисточник открыт"
         );
-        let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(reader)
-            .map_err(|error| open_error(source, &failure, error))?;
+        // Не даём FFmpeg seek-колбэк, если источник его не поддерживает:
+        // иначе демуксер fMP4 у live пытается найти конец/размер и читает
+        // сегменты бесконечно. Реальная перемотка HLS идёт через
+        // `Media::seek`, а не через этот поток.
+        let stream_io = if seekable {
+            ffmpeg::format::context::StreamIo::from_read_seek(reader)
+        } else {
+            ffmpeg::format::context::StreamIo::from_read(reader)
+        }
+        .map_err(|error| open_error(source, &failure, error))?;
+        debug!("видео: StreamIo готов");
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::clone(&cancel);
         let input = ffmpeg::format::input_from_stream_with_interrupt(
@@ -165,8 +187,9 @@ impl VideoDecoder {
             move || interrupt.load(Ordering::Relaxed),
         )
         .map_err(|error| open_error(source, &failure, error))?;
+        debug!("видео: демультиплексор открыт");
 
-        let (stream_index, time_base, frame_rate, decoder, codec) = {
+        let (stream_index, time_base, frame_rate, decoder, codec, stream_start) = {
             let stream =
                 input
                     .streams()
@@ -190,8 +213,19 @@ impl VideoDecoder {
                 frame_rate,
                 decoder,
                 codec,
+                stream.start_time(),
             )
         };
+
+        // У live HLS абсолютные PTS не обязаны начинаться с нуля: видео-часы
+        // в ядре ведёт звук от 0. Сдвигаем видео на начало потока.
+        let live_hls = matches!(shared, Some(SharedSource::Hls(hls)) if hls.is_live());
+        let pts_origin = if live_hls && stream_start != i64::MIN {
+            stream_start
+        } else {
+            0
+        };
+        debug!(stream_start, pts_origin, live_hls, "видео: опорный PTS");
 
         let info = VideoInfo {
             width: decoder.width(),
@@ -217,7 +251,16 @@ impl VideoDecoder {
             buffering,
             eof_sent: false,
             pending: None,
+            pts_shift_ms: 0,
+            pts_origin,
+            discontinuity,
         })
+    }
+
+    /// Сдвиг PTS относительно звука: для demuxed live дорожки стартуют
+    /// в разные моменты, и общая шкала строится от более раннего из них.
+    pub(crate) fn set_pts_shift_ms(&mut self, shift_ms: Option<i64>) {
+        self.pts_shift_ms = shift_ms.unwrap_or(0);
     }
 
     /// Можно ли перематывать источник.
@@ -341,10 +384,25 @@ impl VideoDecoder {
         self.decoder.flush();
         self.eof_sent = false;
 
+        self.discard_before(position)
+    }
+
+    /// Переходит к позиции без байтовой перемотки.
+    ///
+    /// Нужен HLS: виртуальный поток не имеет размера, но читатель уже
+    /// начинается с сегмента целевого времени. Кадры раньше позиции
+    /// просто декодируются и выбрасываются.
+    pub(crate) fn skip_to(&mut self, position: Duration) -> Result<(), PlayerError> {
+        self.pending = None;
+        self.discard_before(position)
+    }
+
+    /// Выбрасывает декодированные кадры, целиком лежащие до `position`.
+    fn discard_before(&mut self, position: Duration) -> Result<(), PlayerError> {
         while let Some(decoded) = self.receive_decoded()? {
             let pts = decoded
                 .pts()
-                .and_then(|timestamp| timestamp_to_duration(timestamp, self.time_base));
+                .and_then(|timestamp| self.frame_pts(timestamp));
             let too_early = pts.is_some_and(|pts| pts.saturating_add(SEEK_EPSILON) < position);
             if too_early {
                 continue;
@@ -367,6 +425,15 @@ impl VideoDecoder {
             let mut packet = ffmpeg::Packet::empty();
             match packet.read(&mut self.input) {
                 Ok(()) => {
+                    // Разрыв HLS: пакет уже из нового сегмента, декодер
+                    // должен начать с чистого листа.
+                    if self
+                        .discontinuity
+                        .as_ref()
+                        .is_some_and(|flag| flag.swap(false, Ordering::Relaxed))
+                    {
+                        self.decoder.flush();
+                    }
                     if packet.stream() == self.stream_index {
                         return Ok(Some(packet));
                     }
@@ -401,8 +468,15 @@ impl VideoDecoder {
             bgra,
             pts: decoded
                 .pts()
-                .and_then(|timestamp| timestamp_to_duration(timestamp, self.time_base)),
+                .and_then(|timestamp| self.frame_pts(timestamp)),
         })
+    }
+
+    /// PTS кадра на общей шкале потока: отбрасывает live-начало и добавляет
+    /// сдвиг demuxed-дорожек.
+    fn frame_pts(&self, timestamp: i64) -> Option<Duration> {
+        timestamp_to_duration(timestamp.saturating_sub(self.pts_origin), self.time_base)
+            .map(|pts| shift_pts(pts, self.pts_shift_ms))
     }
 }
 
@@ -546,6 +620,20 @@ fn timestamp_to_duration(timestamp: i64, time_base: Rational) -> Option<Duration
     // с большим запасом.
     let nanos = i128::from(timestamp) * numerator * 1_000_000_000 / denominator;
     u64::try_from(nanos).ok().map(Duration::from_nanos)
+}
+
+/// Сдвигает PTS на миллисекунды без паники на переполнении.
+fn shift_pts(pts: Duration, shift_ms: i64) -> Duration {
+    if shift_ms == 0 {
+        return pts;
+    }
+
+    let delta = Duration::from_millis(shift_ms.unsigned_abs());
+    if shift_ms > 0 {
+        pts.saturating_add(delta)
+    } else {
+        pts.saturating_sub(delta)
+    }
 }
 
 /// `ffmpeg-next` отдаёт EAGAIN как `Error::Other` с POSIX-кодом.
@@ -844,19 +932,15 @@ mod tests {
     }
 
     #[test]
-    fn hls_is_rejected_before_opening() {
-        for source in [
-            Source::File(temp_path("m3u8")),
-            Source::Url("https://example.com/live/index.m3u8?token=1".to_owned()),
-        ] {
-            let Err(error) = VideoDecoder::open_source(&source) else {
-                panic!("HLS должен быть отклонён");
-            };
-            assert!(
-                matches!(error, PlayerError::UnsupportedHls { .. }),
-                "ожидалась ошибка HLS, получено: {error}"
-            );
-        }
+    fn local_hls_is_rejected_before_opening() {
+        let source = Source::File(temp_path("m3u8"));
+        let Err(error) = VideoDecoder::open_source(&source) else {
+            panic!("локальный HLS должен быть отклонён");
+        };
+        assert!(
+            matches!(error, PlayerError::UnsupportedHls { .. }),
+            "ожидалась ошибка HLS, получено: {error}"
+        );
     }
 
     #[test]

@@ -92,7 +92,7 @@ fn tls_config() -> ureq::tls::TlsConfig {
 }
 
 /// Собирает агент с таймаутами и следованием редиректам.
-fn agent(config: &HttpConfig) -> ureq::Agent {
+pub(crate) fn agent(config: &HttpConfig) -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(tls_config())
         .timeout_resolve(Some(config.connect_timeout))
@@ -122,6 +122,13 @@ pub(crate) enum HttpFailure {
     NotMedia,
     /// Открытие или чтение отменено.
     Cancelled,
+    /// Ошибка HLS-слоя: плейлист, вариант или сегмент.
+    Hls {
+        /// URL ресурса, на котором произошла ошибка.
+        url: String,
+        /// Причина в готовом для показа виде.
+        reason: String,
+    },
 }
 
 impl HttpFailure {
@@ -146,11 +153,15 @@ impl HttpFailure {
                 target: source.clone(),
             },
             Self::Cancelled => PlayerError::Cancelled,
+            Self::Hls { url, reason } => PlayerError::Hls {
+                target: Source::Url(url),
+                reason,
+            },
         }
     }
 
     /// В `io::Error` — для `Read` и `Seek`.
-    fn into_io(self) -> io::Error {
+    pub(crate) fn into_io(self) -> io::Error {
         match self {
             Self::Cancelled => io::Error::new(io::ErrorKind::Interrupted, "открытие отменено"),
             Self::Status(status) => io::Error::other(format!("сервер вернул {status}")),
@@ -161,32 +172,35 @@ impl HttpFailure {
             ),
             Self::Empty => io::Error::new(io::ErrorKind::UnexpectedEof, "по ссылке нет данных"),
             Self::NotMedia => io::Error::other("по ссылке не медиафайл"),
+            Self::Hls { url, reason } => {
+                io::Error::other(format!("HLS: {reason}: {}", Source::Url(url).log_name()))
+            }
         }
     }
 }
 
 /// Неудачный запрос и признак, стоит ли его повторять.
-struct HttpError {
-    failure: HttpFailure,
-    retryable: bool,
+pub(crate) struct HttpError {
+    pub(crate) failure: HttpFailure,
+    pub(crate) retryable: bool,
 }
 
 impl HttpError {
-    fn fatal(failure: HttpFailure) -> Self {
+    pub(crate) fn fatal(failure: HttpFailure) -> Self {
         Self {
             failure,
             retryable: false,
         }
     }
 
-    fn retryable(failure: HttpFailure) -> Self {
+    pub(crate) fn retryable(failure: HttpFailure) -> Self {
         Self {
             failure,
             retryable: true,
         }
     }
 
-    fn cancelled() -> Self {
+    pub(crate) fn cancelled() -> Self {
         Self::fatal(HttpFailure::Cancelled)
     }
 }
@@ -621,7 +635,7 @@ fn fetch_range(
 }
 
 /// Значение заголовка как строка.
-fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
+pub(crate) fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
     response
         .headers()
         .get(name)
@@ -642,7 +656,7 @@ fn parse_content_range(value: &str) -> Option<Option<u64>> {
 ///
 /// `stop` шире, чем флаг отмены: кэш взводит `abort`, когда блок устарел
 /// после перемотки.
-fn with_retries<T>(
+pub(crate) fn with_retries<T>(
     config: &HttpConfig,
     stop: &dyn Fn() -> bool,
     counters: &CacheCounters,
@@ -681,17 +695,17 @@ fn with_retries<T>(
 }
 
 /// Ошибка транспорта: почти всегда имеет смысл повторить.
-fn request_error(error: ureq::Error) -> HttpError {
+pub(crate) fn request_error(error: ureq::Error) -> HttpError {
     HttpError::retryable(HttpFailure::Network(error.to_string()))
 }
 
 /// Ошибка чтения тела — тоже сетевой обрыв.
-fn body_error(error: io::Error) -> HttpError {
+pub(crate) fn body_error(error: io::Error) -> HttpError {
     HttpError::retryable(HttpFailure::Network(error.to_string()))
 }
 
 /// Статус: 5xx повторяем, 4xx — сразу ошибка.
-fn status_error(status: u16) -> HttpError {
+pub(crate) fn status_error(status: u16) -> HttpError {
     let failure = HttpFailure::Status(status);
     if status >= 500 {
         HttpError::retryable(failure)

@@ -150,6 +150,9 @@ fn play(source: &Source) -> anyhow::Result<()> {
             match event {
                 Event::Ready(ready) => {
                     duration = ready.duration;
+                    if ready.live {
+                        println!("live: true");
+                    }
                     if let Some(known) = ready.duration {
                         println!("duration: {}", format_clock(known));
                     }

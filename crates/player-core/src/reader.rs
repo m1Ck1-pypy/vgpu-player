@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::hls::HlsSource;
 use crate::http::{HttpConfig, HttpFailure, HttpReader, HttpSource};
 use crate::{PlayerError, Source};
 
@@ -77,6 +78,16 @@ impl MediaReader for FileReader {
     }
 }
 
+/// Какая дорожка запрашивает читатель.
+///
+/// Файловый и обычный HTTP-источник дорожку игнорируют: звук и видео читают
+/// один и тот же поток. HLS выбирает по дорожке свой плейлист.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Track {
+    Video,
+    Audio,
+}
+
 /// Открытый читатель и слот сетевой ошибки, если она есть.
 pub(crate) struct OpenedReader {
     pub(crate) reader: Box<dyn MediaReader>,
@@ -84,18 +95,34 @@ pub(crate) struct OpenedReader {
     pub(crate) failure: Option<Arc<Mutex<Option<HttpFailure>>>>,
     /// Флаг «ждём сеть» для события `Buffering`.
     pub(crate) buffering: Option<Arc<AtomicBool>>,
+    /// Признак `#EXT-X-DISCONTINUITY`: декодер должен сбросить состояние.
+    pub(crate) discontinuity: Option<Arc<AtomicBool>>,
+}
+
+/// Уже открытый источник, общий для звука и видео.
+///
+/// Для обычного URL это кэш [`HttpSource`], для HLS — [`HlsSource`] с двумя
+/// плейлистами. Декодеры не различают эти случаи, а читатель выбирает
+/// дорожку по [`Track`].
+#[derive(Clone)]
+pub(crate) enum SharedSource {
+    Http(Arc<HttpSource>),
+    Hls(Arc<HlsSource>),
 }
 
 /// Открывает читатель для источника.
 ///
-/// Файл даёт [`FileReader`], URL — [`HttpReader`] поверх общего кэша;
-/// декодеры дальше не знают, откуда пришли байты. `cancel` — флаг ядра:
-/// сетевой читатель должен прервать блокирующее чтение при `Stop`/`Drop`.
-/// `shared` — уже открытый сетевой источник: кэш у звука и видео один.
+/// Файл даёт [`FileReader`], URL — [`HttpReader`] поверх общего кэша или
+/// [`crate::hls::HlsReader`] поверх HLS-плейлистов. Декодеры дальше не знают,
+/// откуда пришли байты. `cancel` — флаг ядра: сетевой читатель должен
+/// прервать блокирующее чтение при `Stop`/`Drop`. `shared` — уже открытый
+/// источник: кэш и счётчики у звука и видео общие. `track` важен только для
+/// HLS; файл и обычный HTTP-источник дорожку игнорируют.
 pub(crate) fn open_reader(
     source: &Source,
+    track: Track,
     cancel: Arc<AtomicBool>,
-    shared: Option<&Arc<HttpSource>>,
+    shared: Option<&SharedSource>,
 ) -> Result<OpenedReader, PlayerError> {
     match source {
         Source::File(path) => {
@@ -107,13 +134,34 @@ pub(crate) fn open_reader(
                 reader: Box::new(reader),
                 failure: None,
                 buffering: None,
+                discontinuity: None,
+            })
+        }
+        Source::Url(_) if source.is_hls() => {
+            let hls = match shared {
+                Some(SharedSource::Hls(hls)) => Arc::clone(hls),
+                // Одиночный читатель (тесты, CLI): свой HLS-источник.
+                _ => HlsSource::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
+            };
+            let reader = hls.reader(track).ok_or_else(|| PlayerError::Hls {
+                target: source.clone(),
+                reason: "у выбранной дорожки нет плейлиста".to_owned(),
+            })?;
+            let failure = reader.failure_slot();
+            let buffering = reader.buffering_flag();
+            let discontinuity = reader.discontinuity_flag();
+            Ok(OpenedReader {
+                reader: Box::new(reader),
+                failure: Some(failure),
+                buffering: Some(buffering),
+                discontinuity: Some(discontinuity),
             })
         }
         Source::Url(_) => {
             let reader = match shared {
-                Some(shared) => shared.reader(Arc::clone(&cancel)),
+                Some(SharedSource::Http(shared)) => shared.reader(Arc::clone(&cancel)),
                 // Одиночный читатель (тесты, CLI): свой кэш на источник.
-                None => HttpReader::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
+                _ => HttpReader::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
             };
             let failure = reader.failure_slot();
             let buffering = reader.buffering_flag();
@@ -121,6 +169,7 @@ pub(crate) fn open_reader(
                 reader: Box::new(reader),
                 failure: Some(failure),
                 buffering: Some(buffering),
+                discontinuity: None,
             })
         }
     }
@@ -208,6 +257,7 @@ mod tests {
         let path = write_sample(b"data");
         let opened = open_reader(
             &Source::File(path.clone()),
+            Track::Video,
             Arc::new(AtomicBool::new(false)),
             None,
         )
@@ -215,6 +265,7 @@ mod tests {
 
         assert!(opened.failure.is_none());
         assert!(opened.buffering.is_none());
+        assert!(opened.discontinuity.is_none());
         let _ = std::fs::remove_file(path);
     }
 }

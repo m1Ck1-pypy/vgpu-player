@@ -102,6 +102,8 @@ struct Engine<'a> {
     pending_frame: Option<PendingFrame>,
     last_shown_pts: Option<Duration>,
     tail_started: bool,
+    /// Звук ждёт первый кадр после старта/перемотки: так A/V стартуют вместе.
+    waiting_first_frame: bool,
     stats: SyncCounters,
     frame_epoch: u64,
     waiting_output_logged: bool,
@@ -266,6 +268,7 @@ impl<'a> Engine<'a> {
             pending_frame: None,
             last_shown_pts: None,
             tail_started: false,
+            waiting_first_frame: false,
             stats: SyncCounters::new(None),
             frame_epoch: 0,
             waiting_output_logged: false,
@@ -308,6 +311,7 @@ impl<'a> Engine<'a> {
         self.buffer_pool.clear();
         self.tail_started = false;
         self.last_shown_pts = None;
+        self.waiting_first_frame = false;
         self.end_reported = false;
         self.audio_finished = true;
         self.video_finished = true;
@@ -350,6 +354,8 @@ impl<'a> Engine<'a> {
         self.audio_chunks = 0;
         self.tail_started = false;
         self.last_shown_pts = None;
+        // Если есть видео, не запускаем звук раньше первого кадра.
+        self.waiting_first_frame = opened.video.is_some();
         self.pending_frame = None;
         self.buffer_pool.clear();
         self.video_timer = VideoTimer::new();
@@ -361,7 +367,7 @@ impl<'a> Engine<'a> {
 
         if let Some(sink) = self.output.as_ref() {
             sink.player.stop();
-            if self.paused {
+            if self.paused || self.waiting_first_frame {
                 sink.player.pause();
             } else {
                 sink.player.play();
@@ -396,7 +402,10 @@ impl<'a> Engine<'a> {
                 }
                 self.paused = false;
                 self.video_timer.start(Instant::now());
-                if let Some(sink) = self.output.as_ref() {
+                // Первый кадр ещё не показан: звук стартует вместе с ним.
+                if !self.waiting_first_frame
+                    && let Some(sink) = self.output.as_ref()
+                {
                     sink.player.play();
                 }
             }
@@ -497,11 +506,8 @@ impl<'a> Engine<'a> {
         if let Some(sink) = self.output.as_ref() {
             sink.player.pause();
         }
-        if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
-            video.seek(position)?;
-        }
-        if let Some(audio) = self.media.as_mut().and_then(|media| media.audio.as_mut()) {
-            audio.seek(position)?;
+        if let Some(media) = self.media.as_mut() {
+            media.seek(position)?;
         }
         if let Some(clock) = self.clock.as_mut() {
             clock.rebase(position);
@@ -512,6 +518,15 @@ impl<'a> Engine<'a> {
         }
         self.scheduler.reset();
         self.video_timer.rebase(position, Instant::now());
+        // После `Ended` таймер остановлен; перемотка возвращает его в игру.
+        if !self.paused {
+            self.video_timer.start(Instant::now());
+        }
+        // Новый кадр после перемотки ждём прежде, чем включать звук.
+        self.waiting_first_frame = self
+            .media
+            .as_ref()
+            .is_some_and(|media| media.video.is_some());
         self.restart_playback();
         // Старый звук в кольце к новой позиции не относится.
         reset_spectrum(
@@ -530,7 +545,7 @@ impl<'a> Engine<'a> {
     fn restart_playback(&mut self) {
         if let Some(sink) = self.output.as_ref() {
             sink.player.stop();
-            if self.paused {
+            if self.paused || self.waiting_first_frame {
                 sink.player.pause();
             } else {
                 sink.player.play();
@@ -590,7 +605,11 @@ impl<'a> Engine<'a> {
                         )?);
                     }
                     None => {
-                        debug!("аудио закончилось");
+                        debug!(
+                            position = ?self.clock.as_ref().map(AudioClock::position),
+                            last_shown = ?self.last_shown_pts,
+                            "аудио закончилось"
+                        );
                         self.audio_finished = true;
                     }
                 }
@@ -646,7 +665,10 @@ impl<'a> Engine<'a> {
                             self.pending_frame = Some(PendingFrame { frame, pts });
                         }
                         None => {
-                            debug!("видео закончилось");
+                            debug!(
+                                last_shown = ?self.last_shown_pts,
+                                "видео закончилось"
+                            );
                             self.video_finished = true;
                             break;
                         }
@@ -662,7 +684,15 @@ impl<'a> Engine<'a> {
                     self.video_timer.position(Instant::now())
                 };
 
-                match FrameScheduler::decide(pending.pts, position) {
+                // После старта/перемотки первый кадр показываем сразу: иначе
+                // звук уйдёт вперёд, а видео будет ждать часы.
+                let action = if self.waiting_first_frame {
+                    FrameAction::Show
+                } else {
+                    FrameScheduler::decide(pending.pts, position)
+                };
+
+                match action {
                     // Ещё рано: оставляем кадр до следующего тика.
                     FrameAction::Wait => {
                         self.pending_frame = Some(pending);
@@ -686,6 +716,15 @@ impl<'a> Engine<'a> {
                                 self.last_shown_pts = Some(pts);
                                 self.stats.record_shown(lag);
                                 handled += 1;
+                                if self.waiting_first_frame {
+                                    self.waiting_first_frame = false;
+                                    debug!("первый кадр показан: запускаем звук");
+                                    if !self.paused
+                                        && let Some(sink) = self.output.as_ref()
+                                    {
+                                        sink.player.play();
+                                    }
+                                }
                             }
                             // Очередь полна: вернём кадр и подождём UI.
                             Err(TrySendError::Full(tagged)) => {
@@ -699,6 +738,17 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
+            }
+        }
+
+        // Видео есть, но кадров не будет (битая дорожка): не держим звук
+        // выключенным до бесконечности.
+        if self.waiting_first_frame && self.video_finished {
+            self.waiting_first_frame = false;
+            if !self.paused
+                && let Some(sink) = self.output.as_ref()
+            {
+                sink.player.play();
             }
         }
 
@@ -741,6 +791,9 @@ impl<'a> Engine<'a> {
 
         if audio_done && video_done && output_empty && !self.end_reported && !audio_blocked {
             self.end_reported = true;
+            // Хвост видео закончился: часы больше не идут, иначе позиция
+            // уходила бы за длительность уже после `Ended`.
+            self.video_timer.pause(Instant::now());
             info!("файл доигран до конца");
             if media.video.is_some() {
                 let snapshot = self.stats.snapshot(media.network_stats());
@@ -759,10 +812,22 @@ impl<'a> Engine<'a> {
 
     /// Отправляет текущую позицию в UI.
     fn report(&mut self, force: bool) {
-        let position = current_position(
-            self.clock.as_ref(),
-            video_timer_ref(self.media.as_ref(), &self.video_timer),
-        );
+        let timer = video_timer_ref(self.media.as_ref(), &self.video_timer);
+        // После конца звука видео доигрывает по своему таймеру: позиция в UI
+        // должна идти за ним, а не стоять на последнем аудио-отсчёте.
+        let position = if self.tail_started {
+            timer
+                .map(|timer| timer.position(Instant::now()))
+                .or_else(|| self.clock.as_ref().map(AudioClock::position))
+        } else {
+            current_position(self.clock.as_ref(), timer)
+        };
+        // За известную длительность не выходим: хвост и дрожание таймера
+        // иначе показывают 10:10 у десятиминутного ролика.
+        let position = match (position, self.media.as_ref().and_then(Media::duration)) {
+            (Some(position), Some(duration)) => Some(position.min(duration)),
+            (position, _) => position,
+        };
         report_position(
             self.events,
             position,

@@ -797,7 +797,7 @@ impl PlayerWindow {
             };
 
             card = card
-                .child(div().text_sm().child("Ссылка на видео"))
+                .child(div().text_sm().child("Ссылка на видео или .m3u8"))
                 .child(field)
                 .child(panel_hint(
                     "Enter — открыть · Ctrl+V — вставить · Esc — закрыть",

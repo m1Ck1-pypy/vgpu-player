@@ -16,7 +16,7 @@ use player_core::{
     Command, Event, MediaInfo, Player, Source, SpectrumBars, SyncStats, VideoFrame, VideoInfo,
     preview_frame,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Как часто UI проверяет события ядра.
 ///
@@ -105,6 +105,8 @@ pub struct VideoPlayer {
     seekable: bool,
     /// Идёт ли буферизация (для сети появится на этапе 3).
     buffering: bool,
+    /// Идёт ли поток в реальном времени (HLS без `#EXT-X-ENDLIST`).
+    live: bool,
     error: Option<String>,
     video_info: Option<VideoInfo>,
     /// Контейнер, кодеки и параметры звука открытого файла.
@@ -158,6 +160,7 @@ impl VideoPlayer {
             seek_hint: None,
             seekable: false,
             buffering: false,
+            live: false,
             error: None,
             video_info: None,
             media_info: None,
@@ -198,6 +201,7 @@ impl VideoPlayer {
     /// повторить открытие той же кнопкой, не вызывая диалог.
     pub fn open(&mut self, source: impl Into<Source>, cx: &mut Context<Self>) {
         let source = source.into();
+        info!(source = %source, "UI открывает источник");
         self.source = Some(source.clone());
 
         // Новая попытка: старые метаданные и кадр больше не относятся к файлу.
@@ -211,6 +215,7 @@ impl VideoPlayer {
         self.position = Duration::ZERO;
         self.seekable = false;
         self.buffering = false;
+        self.live = false;
         self.error = None;
         self.state = PlaybackState::Loading;
 
@@ -355,9 +360,17 @@ impl VideoPlayer {
 
     /// Перейти к позиции.
     pub fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
-        if self.state == PlaybackState::Loading || !self.seekable {
+        if self.state == PlaybackState::Loading || !self.seekable || self.live {
+            debug!(
+                ?position,
+                state = ?self.state,
+                seekable = self.seekable,
+                live = self.live,
+                "Seek отклонён в UI"
+            );
             return;
         }
+        debug!(?position, "Seek из UI");
         let from = self.position();
         if self.send(Command::Seek(position), cx) {
             self.position = position;
@@ -376,7 +389,13 @@ impl VideoPlayer {
     /// здесь, откатывалась бы назад. UI показывает накопленную цель и ждёт
     /// `Seeked`.
     pub fn seek_relative(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
-        if self.state == PlaybackState::Loading || !self.seekable {
+        if self.state == PlaybackState::Loading || !self.seekable || self.live {
+            debug!(
+                forward,
+                ?step,
+                state = ?self.state,
+                "SeekRelative отклонён в UI"
+            );
             return;
         }
         let current = self.position();
@@ -433,6 +452,7 @@ impl VideoPlayer {
         self.duration = None;
         self.seekable = false;
         self.buffering = false;
+        self.live = false;
         self.video_info = None;
         self.media_info = None;
         self.stats = None;
@@ -508,6 +528,11 @@ impl VideoPlayer {
     /// Идёт ли буферизация источника.
     pub fn buffering(&self) -> bool {
         self.buffering
+    }
+
+    /// Идёт ли поток в реальном времени.
+    pub fn live(&self) -> bool {
+        self.live
     }
 
     /// Контейнер, кодеки и параметры дорожек открытого файла.
@@ -789,10 +814,19 @@ impl VideoPlayer {
             match event {
                 Event::Ready(ready) => {
                     let ready = *ready;
+                    info!(
+                        duration = ?ready.duration,
+                        seekable = ready.seekable,
+                        live = ready.live,
+                        video = ?ready.video_info,
+                        audio = ?ready.media_info.audio,
+                        "источник готов"
+                    );
                     self.video_info = ready.video_info;
                     self.media_info = Some(ready.media_info);
                     self.duration = ready.duration;
                     self.seekable = ready.seekable;
+                    self.live = ready.live;
                     self.seek_hint = None;
                     self.buffering = false;
                     self.state = PlaybackState::Ready;
@@ -805,6 +839,9 @@ impl VideoPlayer {
                     }
                 }
                 Event::PositionChanged(position) => {
+                    if position.as_secs() != self.position.as_secs() {
+                        debug!(?position, "позиция из ядра");
+                    }
                     // Пока идёт перемотка, старые позиции не должны
                     // откатывать ползунок с выбранной цели.
                     if self.seek_hint.is_none() {
@@ -812,6 +849,7 @@ impl VideoPlayer {
                     }
                 }
                 Event::Seeked(position) => {
+                    info!(?position, "перемотка завершена");
                     if let Some(hint) = self.seek_hint {
                         if hint.accepts(position) {
                             self.position = hint.target;
@@ -821,8 +859,23 @@ impl VideoPlayer {
                         self.position = position;
                     }
                 }
-                Event::Buffering(buffering) => self.buffering = buffering,
-                Event::Stats(stats) => self.stats = Some(stats),
+                Event::Buffering(buffering) => {
+                    if self.buffering != buffering {
+                        info!(buffering, "буферизация");
+                    }
+                    self.buffering = buffering;
+                }
+                Event::Stats(stats) => {
+                    debug!(
+                        shown = stats.shown,
+                        dropped = stats.dropped,
+                        fps = stats.fps,
+                        lag_ms = stats.lag.as_millis(),
+                        network = ?stats.network,
+                        "синхронизация"
+                    );
+                    self.stats = Some(stats);
+                }
                 Event::Spectrum(bars) => self.spectrum = Some(bars),
                 Event::Ended => {
                     info!("воспроизведение завершено");
@@ -841,6 +894,15 @@ impl VideoPlayer {
         }
 
         if let Some(frame) = frame {
+            if self.frame_serial == 0 || self.frame_serial.is_multiple_of(30) {
+                debug!(
+                    serial = self.frame_serial,
+                    width = frame.width,
+                    height = frame.height,
+                    pts = ?frame.pts,
+                    "кадр из ядра"
+                );
+            }
             // Старый кадр больше не нужен: его буфер возвращается в пул ядра,
             // чтобы следующий кадр не выделял 8 МБ памяти заново.
             if let Some(previous) = self.frame.replace(frame)

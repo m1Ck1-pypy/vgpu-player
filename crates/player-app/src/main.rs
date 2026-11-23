@@ -21,8 +21,8 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            error!(error = %format!("{failure:#}"), "player-app завершился с ошибкой");
-            eprintln!("player-app: {failure:#}");
+            error!(error = %format!("{failure:#}"), "vgpu завершился с ошибкой");
+            eprintln!("vgpu: {failure:#}");
             ExitCode::FAILURE
         }
     }
@@ -47,7 +47,7 @@ fn run() -> anyhow::Result<()> {
 /// Источник из командной строки: первый аргумент без обрамляющих кавычек.
 ///
 /// Так Windows запускает плеер по ассоциации — из «Открыть с помощью» и по
-/// двойному клику в Проводнике: `player-app.exe "C:\video\movie.mp4"`.
+/// двойному клику в Проводнике: `vgpu.exe "C:\video\movie.mp4"`.
 /// Парсер командной строки Rust кавычки обычно снимает сам; повторное снятие
 /// нужно для лаунчеров, которые передают строку целиком и экранируют её сами.
 /// `https://…` распознаётся как URL, а не как путь.

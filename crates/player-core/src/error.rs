@@ -89,6 +89,14 @@ pub enum PlayerError {
         /// Источник.
         target: Source,
     },
+    /// Ошибка HLS: плейлист, вариант или сегмент.
+    #[error("HLS: {reason}: {target}")]
+    Hls {
+        /// Источник, на котором произошла ошибка.
+        target: Source,
+        /// Причина в готовом для показа виде.
+        reason: String,
+    },
     /// Сетевой источник ещё не подключён (этап 3).
     #[error("источник пока не поддерживается: {target}")]
     UnsupportedSource {
@@ -211,6 +219,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "HLS пока не поддерживается: https://example.com/v.mp4?…"
+        );
+    }
+
+    #[test]
+    fn hls_errors_name_the_reason_and_link() {
+        let error = PlayerError::Hls {
+            target: Source::Url("https://example.com/v/index.m3u8?token=secret".to_owned()),
+            reason: "сегмент не скачался".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "HLS: сегмент не скачался: https://example.com/v/index.m3u8?…"
         );
     }
 
