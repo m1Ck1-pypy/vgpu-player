@@ -18,6 +18,8 @@ rodio.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+tiny_http.workspace = true

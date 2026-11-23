@@ -55,16 +55,19 @@ pub use gpui;
 pub use gpui_platform;
 
 /// Типы, которые возвращает [`VideoPlayer`]: метаданные файла и уровни спектра.
-pub use player_core::{AudioTrackInfo, MediaInfo, SPECTRUM_BARS, SpectrumBars, VideoTrackInfo};
+pub use player_core::{
+    AudioTrackInfo, MediaInfo, SPECTRUM_BARS, Source, SourceError, SpectrumBars, VideoTrackInfo,
+};
 
 mod app;
 mod controls;
 mod icons;
+mod open_panel;
 mod settings;
 mod video_player;
 mod video_view;
 
-pub use app::{LaunchError, WINDOW_TITLE, run_app};
+pub use app::{LaunchError, WINDOW_TITLE, run_app, run_app_source};
 pub use controls::controls_view;
 pub use video_player::{PlaybackState, VideoPlayer};
 pub use video_view::video_view;

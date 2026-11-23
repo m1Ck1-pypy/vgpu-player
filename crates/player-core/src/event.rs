@@ -5,16 +5,23 @@
 
 use std::time::Duration;
 
-use crate::SpectrumBars;
 use crate::SyncStats;
+use crate::{MediaReady, SpectrumBars};
 
 /// Что ядро сообщает UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Известна длительность файла.
-    DurationKnown(Duration),
+    /// Источник открыт: метаданные, длительность и возможность перемотки.
+    Ready(Box<MediaReady>),
     /// Позиция воспроизведения изменилась (этап 2).
     PositionChanged(Duration),
+    /// Перемотка завершена: ядро стоит на этой позиции.
+    ///
+    /// UI держит ползунок на цели и игнорирует запоздавшие `PositionChanged`,
+    /// пока не придёт это событие.
+    Seeked(Duration),
+    /// Читатель ждёт сеть: `true` — показывать плашку буферизации.
+    Buffering(bool),
     /// Статистика синхронизации видео (этап 5).
     Stats(SyncStats),
     /// Уровни столбиков спектроанализатора (этап 13).

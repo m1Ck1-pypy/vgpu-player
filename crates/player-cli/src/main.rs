@@ -3,24 +3,32 @@
 //! Аргументы разбираются вручную: у CLI по-прежнему мало параметров, `clap`
 //! появится вместе с диалогом открытия и плейлистом на этапе 9.
 
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use player_core::{Command, Event, Player, PlayerError, SyncStats, VideoDecoder, VideoInfo};
+use player_core::{
+    Command, Event, Player, PlayerError, Source, SyncStats, VideoDecoder, VideoInfo,
+};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 /// Строка подсказки — одна для всех ошибок разбора аргументов.
-const USAGE: &str = "usage: player-cli <file> [--decode-frames <n> [--seek <seconds>]]";
+const USAGE: &str = "usage: player-cli <file|url> [--decode-frames <n> [--seek <seconds>]]";
 
 fn main() -> ExitCode {
     init_tracing();
 
     let mut args = std::env::args_os().skip(1);
-    let Some(path) = args.next().map(PathBuf::from) else {
+    let Some(argument) = args.next() else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
+    };
+    let source = match Source::from_os_string(argument) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("player-cli: {error}");
+            return ExitCode::FAILURE;
+        }
     };
 
     let mut decode_frames = None;
@@ -62,8 +70,8 @@ fn main() -> ExitCode {
     }
 
     let result = match decode_frames {
-        Some(limit) => decode_video(&path, limit, seek),
-        None => play(&path),
+        Some(limit) => decode_video(&source, limit, seek),
+        None => play(&source),
     };
 
     match result {
@@ -80,10 +88,10 @@ fn main() -> ExitCode {
 ///
 /// Нужен для приёмки этапа 3 (скорость декодирования) и этапа 6 (цена точной
 /// перемотки).
-fn decode_video(path: &Path, limit: usize, seek: Option<f64>) -> anyhow::Result<()> {
-    info!(path = %path.display(), limit, seek, "декодирование кадров");
+fn decode_video(source: &Source, limit: usize, seek: Option<f64>) -> anyhow::Result<()> {
+    info!(source = %source, limit, seek, "декодирование кадров");
 
-    let mut decoder = to_anyhow(VideoDecoder::open(path))?;
+    let mut decoder = to_anyhow(VideoDecoder::open_source(source))?;
     println!("video: {}", describe_video(*decoder.info()));
 
     if let Some(seconds) = seek {
@@ -123,17 +131,13 @@ fn decode_video(path: &Path, limit: usize, seek: Option<f64>) -> anyhow::Result<
     Ok(())
 }
 
-fn play(path: &Path) -> anyhow::Result<()> {
-    // Сначала открываем ядро: если файл битый или отсутствует, отдельный
-    // декодер только добавит шума в лог.
-    let player = to_anyhow(Player::open(path))?;
-
-    // Параметры видео берём из отдельного декодера: в контракте событий их
-    // пока нет (передача кадров и метаданных в UI — этап 4).
-    let video = video_info(path);
+fn play(source: &Source) -> anyhow::Result<()> {
+    // Открытие теперь асинхронное: `open` только запускает поток, а метаданные
+    // и длительность приходят событием `Ready`.
+    let player = to_anyhow(Player::open(source.clone()))?;
 
     to_anyhow(player.send(Command::Play))?;
-    info!(path = %path.display(), "воспроизведение начато");
+    info!(source = %source, "воспроизведение начато");
 
     // Позиция приходит на порядок чаще, чем меняется секунда, поэтому печатаем
     // только при смене секунды — иначе консоль превращается в ленту.
@@ -144,10 +148,15 @@ fn play(path: &Path) -> anyhow::Result<()> {
     loop {
         while let Some(event) = player.try_recv_event() {
             match event {
-                Event::DurationKnown(known) => {
-                    duration = Some(known);
-                    println!("duration: {}", format_clock(known));
-                    if let Some(info) = video {
+                Event::Ready(ready) => {
+                    duration = ready.duration;
+                    if ready.live {
+                        println!("live: true");
+                    }
+                    if let Some(known) = ready.duration {
+                        println!("duration: {}", format_clock(known));
+                    }
+                    if let Some(info) = ready.video_info {
                         println!("video: {}", describe_video(info));
                     }
                 }
@@ -185,6 +194,9 @@ fn play(path: &Path) -> anyhow::Result<()> {
                 Event::Stats(stats) => last_stats = Some(stats),
                 // CLI не рисует визуализатор: уровни нужны только окну.
                 Event::Spectrum(_) => {}
+                // Ползунка в CLI нет: подтверждение перемотки не печатаем.
+                Event::Seeked(_) => {}
+                Event::Buffering(_) => {}
             }
         }
 
@@ -195,19 +207,6 @@ fn play(path: &Path) -> anyhow::Result<()> {
             player.recycle_frame(frame);
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Параметры видео, если в файле есть видеодорожка.
-fn video_info(path: &Path) -> Option<VideoInfo> {
-    match VideoDecoder::open(path) {
-        Ok(decoder) => Some(*decoder.info()),
-        // Файл только со звуком — нормальный сценарий, не ошибка CLI.
-        Err(PlayerError::NoVideoTrack { .. }) => None,
-        Err(video_error) => {
-            error!(%video_error, "не удалось прочитать параметры видео");
-            None
-        }
     }
 }
 

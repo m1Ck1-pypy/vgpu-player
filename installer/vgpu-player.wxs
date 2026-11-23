@@ -9,7 +9,7 @@
         Id="*"
         Name="VGPU Player"
         Language="1033"
-        Version="0.2.1"
+        Version="0.3.0"
         Manufacturer="VGPU Player"
         UpgradeCode="{C2D7A4F0-5B8E-4A31-9C6D-3F1E8B2A7D90}"
     >
@@ -45,7 +45,7 @@
                 <Shortcut
                     Id="StartMenuShortcut"
                     Name="VGPU Player"
-                    Target="[INSTALLFOLDER]player-app.exe"
+                    Target="[INSTALLFOLDER]vgpu.exe"
                     WorkingDirectory="INSTALLFOLDER"
                     Icon="AppIcon"
                 />
@@ -83,13 +83,13 @@
                     Root="HKCU"
                     Key="Software\Classes\VGPUPlayer.Video\DefaultIcon"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot;,0"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot;,0"
                 />
                 <RegistryValue
                     Root="HKCU"
                     Key="Software\Classes\VGPUPlayer.Video\shell\open\command"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot; &quot;%1&quot;"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot; &quot;%1&quot;"
                 />
                 <RegistryValue
                     Root="HKCU"
@@ -101,236 +101,236 @@
                     Root="HKCU"
                     Key="Software\Classes\VGPUPlayer.Audio\DefaultIcon"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot;,0"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot;,0"
                 />
                 <RegistryValue
                     Root="HKCU"
                     Key="Software\Classes\VGPUPlayer.Audio\shell\open\command"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot; &quot;%1&quot;"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot; &quot;%1&quot;"
                 />
 
                 <!-- The application itself, visible in the "Open with" list. -->
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe"
+                    Key="Software\Classes\Applications\vgpu.exe"
                     Name="FriendlyAppName"
                     Type="string"
                     Value="VGPU Player"
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\DefaultIcon"
+                    Key="Software\Classes\Applications\vgpu.exe\DefaultIcon"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot;,0"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot;,0"
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\shell\open\command"
+                    Key="Software\Classes\Applications\vgpu.exe\shell\open\command"
                     Type="string"
-                    Value="&quot;[INSTALLFOLDER]player-app.exe&quot; &quot;%1&quot;"
+                    Value="&quot;[INSTALLFOLDER]vgpu.exe&quot; &quot;%1&quot;"
                 />
 
                 <!-- Same extension lists as installer\vgpu-player.iss. -->
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mp4"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".m4v"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mov"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mkv"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".webm"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".ogv"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".avi"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".ts"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".m2ts"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mts"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mpg"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mpeg"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".flv"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".wmv"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".3gp"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".3g2"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mp3"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".m4a"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".m4b"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".mp2"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".aac"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".flac"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".wav"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".ogg"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".oga"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".opus"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".wma"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".ac3"
                     Type="string"
                     Value=""
                 />
                 <RegistryValue
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe\SupportedTypes"
+                    Key="Software\Classes\Applications\vgpu.exe\SupportedTypes"
                     Name=".dts"
                     Type="string"
                     Value=""
@@ -555,7 +555,7 @@
                 />
                 <RemoveRegistryKey
                     Root="HKCU"
-                    Key="Software\Classes\Applications\player-app.exe"
+                    Key="Software\Classes\Applications\vgpu.exe"
                     Action="removeOnUninstall"
                 />
             </Component>

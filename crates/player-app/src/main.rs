@@ -9,9 +9,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
+use player_gpui::{Source, SourceError};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -21,8 +21,8 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            error!(error = %format!("{failure:#}"), "player-app завершился с ошибкой");
-            eprintln!("player-app: {failure:#}");
+            error!(error = %format!("{failure:#}"), "vgpu завершился с ошибкой");
+            eprintln!("vgpu: {failure:#}");
             ExitCode::FAILURE
         }
     }
@@ -31,37 +31,46 @@ fn main() -> ExitCode {
 /// Запускает окно. `anyhow` здесь — чтобы `main` оставался коротким, а цепочка
 /// причин печаталась одним `{:#}`.
 fn run() -> anyhow::Result<()> {
-    let path = file_argument(std::env::args_os().skip(1));
-    match path.as_ref() {
-        Some(path) => info!(path = %path.display(), "запуск плеера"),
-        None => info!("запуск плеера без файла"),
+    let source = match source_argument(std::env::args_os().skip(1)) {
+        Ok(source) => source,
+        Err(error) => return Err(anyhow::Error::new(error)),
+    };
+    match source.as_ref() {
+        Some(source) => info!(source = %source, "запуск плеера"),
+        None => info!("запуск плеера без источника"),
     }
 
-    player_gpui::run_app(path)?;
+    player_gpui::run_app_source(source)?;
     Ok(())
 }
 
-/// Файл из командной строки: первый аргумент без обрамляющих кавычек.
+/// Источник из командной строки: первый аргумент без обрамляющих кавычек.
 ///
 /// Так Windows запускает плеер по ассоциации — из «Открыть с помощью» и по
-/// двойному клику в Проводнике: `player-app.exe "C:\video\movie.mp4"`.
+/// двойному клику в Проводнике: `vgpu.exe "C:\video\movie.mp4"`.
 /// Парсер командной строки Rust кавычки обычно снимает сам; повторное снятие
 /// нужно для лаунчеров, которые передают строку целиком и экранируют её сами.
-fn file_argument(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
-    let argument = args.into_iter().next()?;
+/// `https://…` распознаётся как URL, а не как путь.
+fn source_argument(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Option<Source>, SourceError> {
+    let Some(argument) = args.into_iter().next() else {
+        return Ok(None);
+    };
     let text = argument.to_string_lossy();
     let trimmed = text.trim_matches('"');
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Без кавычек отдаём исходный `OsString`: `to_string_lossy` испортил бы
     // путь с символами вне Unicode.
-    if trimmed.len() == text.len() {
-        Some(PathBuf::from(argument))
+    let value = if trimmed.len() == text.len() {
+        argument
     } else {
-        Some(PathBuf::from(trimmed.to_owned()))
-    }
+        OsString::from(trimmed)
+    };
+    Source::from_os_string(value).map(Some)
 }
 
 /// Подписчик логов: по умолчанию только предупреждения и ошибки, уровень
@@ -73,7 +82,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::file_argument;
+    use super::source_argument;
+    use player_gpui::Source;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -83,22 +93,41 @@ mod tests {
 
     #[test]
     fn takes_the_file_passed_by_the_shell() {
-        let path = file_argument(args(&[r"C:\video\movie.mp4"]));
+        let source = source_argument(args(&[r"C:\video\movie.mp4"])).expect("путь");
 
-        assert_eq!(path, Some(PathBuf::from(r"C:\video\movie.mp4")));
+        assert_eq!(
+            source,
+            Some(Source::File(PathBuf::from(r"C:\video\movie.mp4")))
+        );
     }
 
     #[test]
     fn strips_quotes_around_a_path_with_spaces() {
-        let path = file_argument(args(&[r#""C:\my video\a b.mkv""#]));
+        let source = source_argument(args(&[r#""C:\my video\a b.mkv""#])).expect("путь");
 
-        assert_eq!(path, Some(PathBuf::from(r"C:\my video\a b.mkv")));
+        assert_eq!(
+            source,
+            Some(Source::File(PathBuf::from(r"C:\my video\a b.mkv")))
+        );
+    }
+
+    #[test]
+    fn url_is_not_treated_as_a_path() {
+        let source =
+            source_argument(args(&["https://example.com/video.mp4?token=1"])).expect("URL");
+
+        assert_eq!(
+            source,
+            Some(Source::Url(
+                "https://example.com/video.mp4?token=1".to_owned()
+            ))
+        );
     }
 
     #[test]
     fn launch_without_a_file_gives_nothing() {
-        assert_eq!(file_argument(args(&[])), None);
-        assert_eq!(file_argument(args(&[""])), None);
-        assert_eq!(file_argument(args(&[r#""""#])), None);
+        assert_eq!(source_argument(args(&[])).expect("пусто"), None);
+        assert_eq!(source_argument(args(&[""])).expect("пусто"), None);
+        assert_eq!(source_argument(args(&[r#"""""#])).expect("пусто"), None);
     }
 }

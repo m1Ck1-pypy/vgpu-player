@@ -4,7 +4,8 @@ set shell := ["powershell", "-NoProfile", "-Command"]
 portable:
     $env:RUSTFLAGS = "-Clinker=rust-lld"; cargo build --release -p player-app
     New-Item -ItemType Directory -Force -Path dist/vgpu-player | Out-Null
-    Copy-Item target/release/player-app.exe dist/vgpu-player/ -Force
+    if (Test-Path dist/vgpu-player/player-app.exe) { Remove-Item dist/vgpu-player/player-app.exe -Force }
+    Copy-Item target/release/vgpu.exe dist/vgpu-player/ -Force
     Copy-Item installer/register-associations.cmd dist/vgpu-player/ -Force
     $dlls = @("avcodec-63.dll", "avdevice-63.dll", "avfilter-12.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll", "dav1d.dll"); foreach ($dll in $dlls) { Copy-Item ".tools/vcpkg/installed/x64-windows/bin/$dll" dist/vgpu-player/ -Force }
 

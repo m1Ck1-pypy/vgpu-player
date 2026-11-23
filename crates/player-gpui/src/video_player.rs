@@ -5,7 +5,7 @@
 //! управления) читают его состояние и зовут его методы, поэтому чужому
 //! приложению не нужно знать про команды и события ядра.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
@@ -13,10 +13,10 @@ use gpui::{
     PathPromptOptions, Pixels, Size, Task, WeakEntity, Window, point, size,
 };
 use player_core::{
-    Command, Event, MediaInfo, Player, SpectrumBars, SyncStats, VideoFrame, VideoInfo,
+    Command, Event, MediaInfo, Player, Source, SpectrumBars, SyncStats, VideoFrame, VideoInfo,
     preview_frame,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Как часто UI проверяет события ядра.
 ///
@@ -30,6 +30,8 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 pub enum PlaybackState {
     /// Файл ещё не открыт.
     Idle,
+    /// Источник открывается: ждём `Ready` или `Error`.
+    Loading,
     /// Файл открыт, воспроизведение не начато.
     Ready,
     /// Играет.
@@ -61,18 +63,50 @@ pub(crate) struct VideoTexture {
     serial: u64,
 }
 
+/// Цель перемотки, которую UI показывает до подтверждения ядром.
+///
+/// Пока ядро ищет данные, `PositionChanged` из прошлого игнорируются: ползунок
+/// стоит на цели и ждёт `Seeked`, а не откатывается назад.
+#[derive(Debug, Clone, Copy)]
+struct SeekHint {
+    target: Duration,
+    /// Позиция, от которой считался шаг: задаёт направление.
+    from: Duration,
+}
+
+impl SeekHint {
+    /// Допуск: ядро может встать чуть раньше цели (ключевой кадр).
+    const TOLERANCE: Duration = Duration::from_millis(250);
+
+    fn accepts(self, position: Duration) -> bool {
+        if self.target >= self.from {
+            position + Self::TOLERANCE >= self.target
+        } else {
+            position <= self.target + Self::TOLERANCE
+        }
+    }
+}
+
 /// Плеер как сущность GPUI.
 ///
 /// Хранит состояние, которое нужно UI, и держит ссылку на ядро. Задачу опроса
 /// событий держим в поле, чтобы она жила ровно столько же, сколько сущность.
 pub struct VideoPlayer {
     core: Option<Player>,
-    /// Файл, который открыт или который не удалось открыть (для повтора).
-    path: Option<PathBuf>,
+    /// Источник, который открыт или который не удалось открыть (для повтора).
+    source: Option<Source>,
     state: PlaybackState,
     volume: f32,
     duration: Option<Duration>,
     position: Duration,
+    /// Цель перемотки, ещё не подтверждённая ядром.
+    seek_hint: Option<SeekHint>,
+    /// Можно ли перематывать источник.
+    seekable: bool,
+    /// Идёт ли буферизация (для сети появится на этапе 3).
+    buffering: bool,
+    /// Идёт ли поток в реальном времени (HLS без `#EXT-X-ENDLIST`).
+    live: bool,
     error: Option<String>,
     video_info: Option<VideoInfo>,
     /// Контейнер, кодеки и параметры звука открытого файла.
@@ -118,11 +152,15 @@ impl VideoPlayer {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             core: None,
-            path: None,
+            source: None,
             state: PlaybackState::Idle,
             volume: 1.0,
             duration: None,
             position: Duration::ZERO,
+            seek_hint: None,
+            seekable: false,
+            buffering: false,
+            live: false,
             error: None,
             video_info: None,
             media_info: None,
@@ -148,68 +186,80 @@ impl VideoPlayer {
     ///
     /// Ошибка открытия не паникует: она попадает в [`Self::error`] и в
     /// [`PlaybackState::Failed`], чтобы приложение могло её показать.
-    pub fn create(path: impl Into<PathBuf>, cx: &mut App) -> Entity<Self> {
-        let path = path.into();
+    pub fn create(source: impl Into<Source>, cx: &mut App) -> Entity<Self> {
+        let source = source.into();
         cx.new(|cx| {
             let mut player = Self::new(cx);
-            player.open(path, cx);
+            player.open(source, cx);
             player
         })
     }
 
-    /// Открывает (или меняет) файл и сразу начинает воспроизведение.
+    /// Открывает (или меняет) источник и сразу начинает воспроизведение.
     ///
-    /// Путь запоминается в любом случае: после ошибки пользователь может
+    /// Источник запоминается в любом случае: после ошибки пользователь может
     /// повторить открытие той же кнопкой, не вызывая диалог.
-    pub fn open(&mut self, path: impl Into<PathBuf>, cx: &mut Context<Self>) {
-        let path = path.into();
-        self.path = Some(path.clone());
+    pub fn open(&mut self, source: impl Into<Source>, cx: &mut Context<Self>) {
+        let source = source.into();
+        info!(source = %source, "UI открывает источник");
+        self.source = Some(source.clone());
 
-        match Player::open(&path) {
-            Ok(core) => {
-                info!(path = %path.display(), "файл открыт в UI");
-                self.video_info = core.video_info();
-                self.media_info = Some(core.media_info().clone());
-                self.reset_video();
-                self.stats = None;
-                self.spectrum = None;
-                self.core = Some(core);
-                self.state = PlaybackState::Ready;
-                self.duration = None;
-                self.position = Duration::ZERO;
-                self.error = None;
+        // Новая попытка: старые метаданные и кадр больше не относятся к файлу.
+        // `reset_video` ещё видит прежнее ядро и возвращает ему буфер.
+        self.reset_video();
+        self.stats = None;
+        self.spectrum = None;
+        self.video_info = None;
+        self.media_info = None;
+        self.duration = None;
+        self.position = Duration::ZERO;
+        self.seekable = false;
+        self.buffering = false;
+        self.live = false;
+        self.error = None;
+        self.state = PlaybackState::Loading;
 
-                // Новое ядро начинает со своей громкости: переносим уровень
-                // из UI (с учтённым mute), иначе смена файла его сбрасывала.
-                self.send(Command::SetVolume(self.engine_volume()), cx);
+        // Одно ядро на плеер: живой поток получает `Command::Open`, а новый
+        // создаётся только если ядра ещё нет или предыдущее уже завершилось.
+        let mut reused = false;
+        if let Some(core) = self.core.as_ref()
+            && core.send(Command::Open(source.clone())).is_ok()
+        {
+            reused = true;
+        }
 
-                // Файл открывают, чтобы его посмотреть: при включённой настройке
-                // команду `Play` шлём сразу, без ожидания кнопки. Так ведут
-                // себя все пути открытия — двойной клик и «Открыть с помощью»
-                // (§15.5), drop, диалог.
-                if self.autoplay {
-                    self.play(cx);
+        if !reused {
+            // Старое ядро мертво (или его не было): его `Drop` взведёт отмену.
+            self.core = None;
+            match Player::open(source.clone()) {
+                Ok(core) => {
+                    info!(source = %source, "поток ядра запущен");
+                    self.core = Some(core);
                 }
-
-                // Пока ядро раскручивается, показываем первый кадр, чтобы окно
-                // не оставалось чёрным.
-                if let Some(frame) = preview_frame(&path) {
-                    self.frame = Some(frame);
-                    self.frame_serial = self.frame_serial.wrapping_add(1);
+                Err(open_error) => {
+                    error!(source = %source, error = %open_error, "не удалось запустить ядро");
+                    self.state = PlaybackState::Failed;
+                    self.error = Some(open_error.to_string());
+                    cx.notify();
+                    return;
                 }
-            }
-            Err(open_error) => {
-                error!(path = %path.display(), error = %open_error, "не удалось открыть файл");
-                self.core = None;
-                self.video_info = None;
-                self.media_info = None;
-                self.reset_video();
-                self.stats = None;
-                self.spectrum = None;
-                self.state = PlaybackState::Failed;
-                self.error = Some(open_error.to_string());
             }
         }
+
+        // Громкость запоминается в ядре, но повтор не вредит: при новом потоке
+        // уровень мог сброситься.
+        self.send(Command::SetVolume(self.engine_volume()), cx);
+
+        // Пока ядро открывает источник, показываем первый кадр, чтобы
+        // окно не оставалось чёрным. Для URL и плейлиста превью нет.
+        if let Some(path) = source.as_file()
+            && !is_playlist(path)
+            && let Some(frame) = preview_frame(path)
+        {
+            self.frame = Some(frame);
+            self.frame_serial = self.frame_serial.wrapping_add(1);
+        }
+
         cx.notify();
     }
 
@@ -254,6 +304,9 @@ impl VideoPlayer {
 
     /// Начать (или продолжить) воспроизведение.
     pub fn play(&mut self, cx: &mut Context<Self>) {
+        if self.state == PlaybackState::Loading {
+            return;
+        }
         if self.send(Command::Play, cx) {
             self.state = PlaybackState::Playing;
             cx.notify();
@@ -262,6 +315,9 @@ impl VideoPlayer {
 
     /// Поставить на паузу.
     pub fn pause(&mut self, cx: &mut Context<Self>) {
+        if self.state == PlaybackState::Loading {
+            return;
+        }
         if self.send(Command::Pause, cx) {
             self.state = PlaybackState::Paused;
             cx.notify();
@@ -274,6 +330,7 @@ impl VideoPlayer {
     /// воспроизведение с упёртого в конец декодера.
     pub fn toggle_playback(&mut self, cx: &mut Context<Self>) {
         match self.state {
+            PlaybackState::Loading => {}
             PlaybackState::Playing => self.pause(cx),
             PlaybackState::Ended => self.restart(cx),
             _ => self.play(cx),
@@ -282,29 +339,80 @@ impl VideoPlayer {
 
     /// Начинает файл с начала (кнопка «Повторить» после завершения).
     pub fn restart(&mut self, cx: &mut Context<Self>) {
-        if self.core.is_none() {
+        if self.core.is_none() || self.state == PlaybackState::Loading {
             return;
         }
         self.seek(Duration::ZERO, cx);
         self.play(cx);
     }
 
-    /// Повторяет открытие последнего файла (кнопка после ошибки).
+    /// Повторяет открытие последнего источника (кнопка после ошибки).
     pub fn retry(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.path.clone() {
-            self.open(path, cx);
+        if let Some(source) = self.source.clone() {
+            self.open(source, cx);
         }
     }
 
-    /// Есть ли путь, открытие которого можно повторить.
+    /// Есть ли источник, открытие которого можно повторить.
     pub fn can_retry(&self) -> bool {
-        self.path.is_some() && self.state == PlaybackState::Failed
+        self.source.is_some() && self.state == PlaybackState::Failed
     }
 
     /// Перейти к позиции.
     pub fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
+        if self.state == PlaybackState::Loading || !self.seekable || self.live {
+            debug!(
+                ?position,
+                state = ?self.state,
+                seekable = self.seekable,
+                live = self.live,
+                "Seek отклонён в UI"
+            );
+            return;
+        }
+        debug!(?position, "Seek из UI");
+        let from = self.position();
         if self.send(Command::Seek(position), cx) {
             self.position = position;
+            self.seek_hint = Some(SeekHint {
+                target: position,
+                from,
+            });
+            cx.notify();
+        }
+    }
+
+    /// Перемотать на шаг вперёд или назад.
+    ///
+    /// Цель считает ядро от своей позиции: при удержании клавиши события
+    /// `PositionChanged` доходят с задержкой, и абсолютная цель, посчитанная
+    /// здесь, откатывалась бы назад. UI показывает накопленную цель и ждёт
+    /// `Seeked`.
+    pub fn seek_relative(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
+        if self.state == PlaybackState::Loading || !self.seekable || self.live {
+            debug!(
+                forward,
+                ?step,
+                state = ?self.state,
+                "SeekRelative отклонён в UI"
+            );
+            return;
+        }
+        let current = self.position();
+        let mut target = if forward {
+            current.saturating_add(step)
+        } else {
+            current.saturating_sub(step)
+        };
+        if let Some(duration) = self.duration {
+            target = target.min(duration);
+        }
+        if self.send(Command::SeekRelative { forward, step }, cx) {
+            self.position = target;
+            self.seek_hint = Some(SeekHint {
+                target,
+                from: current,
+            });
             cx.notify();
         }
     }
@@ -329,19 +437,27 @@ impl VideoPlayer {
     }
 
     /// Остановить воспроизведение и закрыть файл.
+    ///
+    /// Команда `Stop` взводит флаг отмены внутри [`Player`], поэтому закрытие
+    /// не ждёт завершения текущего открытия. Ядро после `Stop` завершается, и
+    /// следующее открытие создаст новое.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        if self.send(Command::Stop, cx) {
-            self.core = None;
-            self.state = PlaybackState::Idle;
-            self.position = Duration::ZERO;
-            self.duration = None;
-            self.video_info = None;
-            self.media_info = None;
-            self.reset_video();
-            self.stats = None;
-            self.spectrum = None;
-            cx.notify();
+        // Кадр возвращаем в пул, пока ядро ещё живо.
+        self.reset_video();
+        if let Some(core) = self.core.take() {
+            let _ = core.send(Command::Stop);
         }
+        self.state = PlaybackState::Idle;
+        self.position = Duration::ZERO;
+        self.duration = None;
+        self.seekable = false;
+        self.buffering = false;
+        self.live = false;
+        self.video_info = None;
+        self.media_info = None;
+        self.stats = None;
+        self.spectrum = None;
+        cx.notify();
     }
 
     /// Текущее состояние.
@@ -378,7 +494,9 @@ impl VideoPlayer {
     /// Пока пользователь тянет полосу, отдаём позицию предпросмотра: ядро
     /// в это время ещё не перематывалось.
     pub fn position(&self) -> Duration {
-        self.scrub.unwrap_or(self.position)
+        self.scrub
+            .or(self.seek_hint.map(|hint| hint.target))
+            .unwrap_or(self.position)
     }
 
     /// Текст последней ошибки, если она была.
@@ -392,8 +510,29 @@ impl VideoPlayer {
     }
 
     /// Путь открытого (или последнего открывавшегося) файла.
-    pub fn path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
+    /// Источник, который открыт или не открылся (для повтора).
+    pub fn source(&self) -> Option<&Source> {
+        self.source.as_ref()
+    }
+
+    /// Путь к файлу, если источник локальный.
+    pub fn path(&self) -> Option<&Path> {
+        self.source.as_ref().and_then(Source::as_file)
+    }
+
+    /// Можно ли перематывать источник.
+    pub fn seekable(&self) -> bool {
+        self.seekable
+    }
+
+    /// Идёт ли буферизация источника.
+    pub fn buffering(&self) -> bool {
+        self.buffering
+    }
+
+    /// Идёт ли поток в реальном времени.
+    pub fn live(&self) -> bool {
+        self.live
     }
 
     /// Контейнер, кодеки и параметры дорожек открытого файла.
@@ -567,6 +706,7 @@ impl VideoPlayer {
         self.progress_bounds = None;
         self.volume_bounds = None;
         self.scrub = None;
+        self.seek_hint = None;
         self.volume_scrubbing = false;
         self.volume_hover = None;
     }
@@ -647,6 +787,7 @@ impl VideoPlayer {
             Err(send_error) => {
                 error!(%send_error, "команда ядру не доставлена");
                 self.error = Some(send_error.to_string());
+                self.seek_hint = None;
                 self.state = PlaybackState::Failed;
                 cx.notify();
                 false
@@ -671,16 +812,81 @@ impl VideoPlayer {
 
         for event in events {
             match event {
-                Event::DurationKnown(duration) => self.duration = Some(duration),
-                Event::PositionChanged(position) => self.position = position,
-                Event::Stats(stats) => self.stats = Some(stats),
+                Event::Ready(ready) => {
+                    let ready = *ready;
+                    info!(
+                        duration = ?ready.duration,
+                        seekable = ready.seekable,
+                        live = ready.live,
+                        video = ?ready.video_info,
+                        audio = ?ready.media_info.audio,
+                        "источник готов"
+                    );
+                    self.video_info = ready.video_info;
+                    self.media_info = Some(ready.media_info);
+                    self.duration = ready.duration;
+                    self.seekable = ready.seekable;
+                    self.live = ready.live;
+                    self.seek_hint = None;
+                    self.buffering = false;
+                    self.state = PlaybackState::Ready;
+                    self.error = None;
+                    // Файл открывают, чтобы его посмотреть: при включённой
+                    // настройке запускаем сразу, но только теперь, когда ядро
+                    // действительно готово. Иначе `Play` терялся бы в `Loading`.
+                    if self.autoplay {
+                        self.play(cx);
+                    }
+                }
+                Event::PositionChanged(position) => {
+                    if position.as_secs() != self.position.as_secs() {
+                        debug!(?position, "позиция из ядра");
+                    }
+                    // Пока идёт перемотка, старые позиции не должны
+                    // откатывать ползунок с выбранной цели.
+                    if self.seek_hint.is_none() {
+                        self.position = position;
+                    }
+                }
+                Event::Seeked(position) => {
+                    info!(?position, "перемотка завершена");
+                    if let Some(hint) = self.seek_hint {
+                        if hint.accepts(position) {
+                            self.position = hint.target;
+                            self.seek_hint = None;
+                        }
+                    } else {
+                        self.position = position;
+                    }
+                }
+                Event::Buffering(buffering) => {
+                    if self.buffering != buffering {
+                        info!(buffering, "буферизация");
+                    }
+                    self.buffering = buffering;
+                }
+                Event::Stats(stats) => {
+                    debug!(
+                        shown = stats.shown,
+                        dropped = stats.dropped,
+                        fps = stats.fps,
+                        lag_ms = stats.lag.as_millis(),
+                        network = ?stats.network,
+                        "синхронизация"
+                    );
+                    self.stats = Some(stats);
+                }
                 Event::Spectrum(bars) => self.spectrum = Some(bars),
                 Event::Ended => {
                     info!("воспроизведение завершено");
+                    self.buffering = false;
+                    self.seek_hint = None;
                     self.state = PlaybackState::Ended;
                 }
                 Event::Error(message) => {
                     error!(%message, "ошибка воспроизведения");
+                    self.buffering = false;
+                    self.seek_hint = None;
                     self.error = Some(message);
                     self.state = PlaybackState::Failed;
                 }
@@ -688,6 +894,15 @@ impl VideoPlayer {
         }
 
         if let Some(frame) = frame {
+            if self.frame_serial == 0 || self.frame_serial.is_multiple_of(30) {
+                debug!(
+                    serial = self.frame_serial,
+                    width = frame.width,
+                    height = frame.height,
+                    pts = ?frame.pts,
+                    "кадр из ядра"
+                );
+            }
             // Старый кадр больше не нужен: его буфер возвращается в пул ядра,
             // чтобы следующий кадр не выделял 8 МБ памяти заново.
             if let Some(previous) = self.frame.replace(frame)
@@ -730,6 +945,13 @@ fn first_file(paths: &[PathBuf]) -> Option<&PathBuf> {
     paths.iter().find(|path| path.is_file())
 }
 
+/// Плейлист не превьюится: это не медиафайл.
+fn is_playlist(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("m3u8"))
+}
+
 /// Доля координаты внутри границ элемента, ограниченная диапазоном `[0, 1]`.
 ///
 /// За ширину берём расстояние между центрами крайних пикселей (`width - 1`).
@@ -768,6 +990,25 @@ fn spawn_event_pump(cx: &mut Context<VideoPlayer>) -> Task<()> {
 mod tests {
     use super::*;
     use gpui::px;
+
+    #[test]
+    fn seek_hint_waits_for_the_target() {
+        let forward = SeekHint {
+            from: Duration::from_secs(10),
+            target: Duration::from_secs(20),
+        };
+        assert!(!forward.accepts(Duration::from_secs(15)));
+        assert!(forward.accepts(Duration::from_millis(19_900)));
+        assert!(forward.accepts(Duration::from_secs(20)));
+
+        let backward = SeekHint {
+            from: Duration::from_secs(20),
+            target: Duration::from_secs(10),
+        };
+        assert!(!backward.accepts(Duration::from_secs(15)));
+        assert!(backward.accepts(Duration::from_millis(10_100)));
+        assert!(backward.accepts(Duration::from_secs(10)));
+    }
 
     fn slider_bounds() -> Bounds<Pixels> {
         Bounds {

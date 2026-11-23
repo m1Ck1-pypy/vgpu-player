@@ -2,9 +2,9 @@
 ; Build: "C:\Program Files\Inno Setup 7\ISCC.exe" installer\vgpu-player.iss
 
 #define MyAppName "VGPU Player"
-#define MyAppVersion "0.2.1"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "VGPU Player"
-#define MyAppExeName "player-app.exe"
+#define MyAppExeName "vgpu.exe"
 
 [Setup]
 ; Stable AppId: upgrades and uninstall find the same installation.
@@ -27,10 +27,17 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+ChangesEnvironment=yes
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[CustomMessages]
+russian.PathLimit=Не удалось добавить VGPU Player в PATH: переменная пользователя превысит 2047 символов.
+english.PathLimit=Could not add VGPU Player to PATH: the user PATH would exceed 2047 characters.
+russian.PathWriteFailed=Не удалось изменить пользовательский PATH.
+english.PathWriteFailed=Could not update the user PATH.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -38,6 +45,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\dist\vgpu-player\*"; DestDir: "{app}"; Excludes: "register-associations.cmd"; Flags: ignoreversion
 Source: "..\assets\app-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[InstallDelete]
+; Older builds shipped player-app.exe; remove it on upgrade.
+Type: files; Name: "{app}\player-app.exe"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
@@ -47,6 +58,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Registry]
+; Older builds registered the app as player-app.exe; remove the stale key.
+Root: HKCU; Subkey: "Software\Classes\Applications\player-app.exe"; Flags: deletekey
 ; File associations, per user (HKCU), no admin rights needed.
 ; Two ProgIDs let Windows remember "Always use this app": video and audio
 ; files get separate type names, the command line is the same.
@@ -125,3 +138,133 @@ Root: HKCU; Subkey: "Software\Classes\.opus\OpenWithProgids"; ValueType: string;
 Root: HKCU; Subkey: "Software\Classes\.wma\OpenWithProgids"; ValueType: string; ValueName: "VGPUPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Classes\.ac3\OpenWithProgids"; ValueType: string; ValueName: "VGPUPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Classes\.dts\OpenWithProgids"; ValueType: string; ValueName: "VGPUPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
+
+[Code]
+const
+  UserEnvironmentKey = 'Environment';
+  PathValueName = 'Path';
+  UserPathLimit = 2047;
+
+function ReadUserPath: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, PathValueName, Result) then
+    Result := '';
+end;
+
+function NormalizedDir(const Dir: string): string;
+begin
+  Result := Trim(Dir);
+  while (Length(Result) > 3) and (Result[Length(Result)] = '\') do
+    Delete(Result, Length(Result), 1);
+end;
+
+function NormalizedPathEntry(const Entry: string): string;
+begin
+  Result := Uppercase(NormalizedDir(Entry));
+end;
+
+function PathHasEntry(const Path, Entry: string): Boolean;
+var
+  Parts: TStringList;
+  I: Integer;
+  Target: string;
+begin
+  Result := False;
+  Target := NormalizedPathEntry(Entry);
+  Parts := TStringList.Create;
+  try
+    Parts.Delimiter := ';';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := Path;
+    for I := 0 to Parts.Count - 1 do
+      if NormalizedPathEntry(Parts[I]) = Target then
+      begin
+        Result := True;
+        Exit;
+      end;
+  finally
+    Parts.Free;
+  end;
+end;
+
+procedure AddToUserPath;
+var
+  CurrentPath, AppDir, NewPath: string;
+begin
+  AppDir := NormalizedDir(ExpandConstant('{app}'));
+  CurrentPath := ReadUserPath;
+  if PathHasEntry(CurrentPath, AppDir) then
+    Exit;
+  if CurrentPath = '' then
+    NewPath := AppDir
+  else
+    NewPath := CurrentPath + ';' + AppDir;
+  if Length(NewPath) > UserPathLimit then
+  begin
+    MsgBox(ExpandConstant('{cm:PathLimit}'), mbError, MB_OK);
+    Exit;
+  end;
+  if not RegWriteExpandStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, PathValueName, NewPath) then
+    MsgBox(ExpandConstant('{cm:PathWriteFailed}'), mbError, MB_OK);
+end;
+
+function RemovePathEntry(const Path, Entry: string; var Removed: Boolean): string;
+var
+  Parts: TStringList;
+  I: Integer;
+  Part, Target: string;
+begin
+  Result := '';
+  Removed := False;
+  Target := NormalizedPathEntry(Entry);
+  Parts := TStringList.Create;
+  try
+    Parts.Delimiter := ';';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := Path;
+    for I := 0 to Parts.Count - 1 do
+    begin
+      Part := Trim(Parts[I]);
+      if NormalizedPathEntry(Part) = Target then
+        Removed := True
+      else if Part <> '' then
+      begin
+        if Result <> '' then
+          Result := Result + ';';
+        Result := Result + Part;
+      end;
+    end;
+  finally
+    Parts.Free;
+  end;
+end;
+
+procedure RemoveFromUserPath;
+var
+  CurrentPath, AppDir, NewPath: string;
+  Removed: Boolean;
+begin
+  CurrentPath := ReadUserPath;
+  if CurrentPath = '' then
+    Exit;
+  AppDir := NormalizedDir(ExpandConstant('{app}'));
+  NewPath := RemovePathEntry(CurrentPath, AppDir, Removed);
+  if not Removed then
+    Exit;
+  if NewPath = '' then
+    RegDeleteValue(HKEY_CURRENT_USER, UserEnvironmentKey, PathValueName)
+  else if not RegWriteExpandStringValue(HKEY_CURRENT_USER, UserEnvironmentKey, PathValueName, NewPath) then
+    MsgBox(ExpandConstant('{cm:PathWriteFailed}'), mbError, MB_OK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    AddToUserPath;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RemoveFromUserPath;
+end;

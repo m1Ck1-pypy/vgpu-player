@@ -50,7 +50,7 @@ enum Action {
 /// растягивает картинку. Размер и скругления задаёт вызывающий код —
 /// `.size_full()`, `.rounded_md()` и так далее.
 pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
-    let (state, has_video, has_frame, stats_text, can_retry, placeholder, spectrum) = {
+    let (state, has_video, has_frame, stats_text, can_retry, placeholder, spectrum, buffering) = {
         let video = player.read(cx);
         (
             video.state(),
@@ -60,8 +60,11 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             video.can_retry(),
             describe(video.state(), video.error()),
             video.spectrum(),
+            video.buffering(),
         )
     };
+    let buffering = shows_buffering(state, buffering);
+    let live = shows_live(state, player.read(cx).live());
 
     let action = match state {
         PlaybackState::Ended => Some(action_button("vgpu-restart", Action::Restart, player)),
@@ -86,6 +89,12 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
     // спектроанализатор. Состояния `Idle` и `Failed` остаются текстовыми.
     if shows_spectrum(state, has_video) {
         let mut root = root.child(spectrum_view(spectrum));
+        if live {
+            root = root.child(live_badge());
+        }
+        if buffering {
+            root = root.child(buffering_overlay());
+        }
         if let Some(action) = action {
             root = root.child(action);
         }
@@ -111,18 +120,23 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         );
 
         if let Some(stats) = stats_text {
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(8.0))
-                    .top(px(8.0))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(gpui::rgba(0x00_00_00_99))
-                    .text_xs()
-                    .child(stats),
-            );
+            let mut overlay = div()
+                .absolute()
+                .left(px(8.0))
+                .top(px(8.0))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(gpui::rgba(0x00_00_00_99))
+                .text_xs()
+                .flex()
+                .flex_col();
+            // По строке на ребёнка: переносами внутри одного текста
+            // раскладка не управляет.
+            for line in stats.lines() {
+                overlay = overlay.child(line.to_owned());
+            }
+            root = root.child(overlay);
         }
 
         // Кнопка поверх последнего кадра: сам кадр не перерисовывается.
@@ -140,6 +154,13 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             );
         }
 
+        if buffering {
+            root = root.child(buffering_overlay());
+        }
+        if live {
+            root = root.child(live_badge());
+        }
+
         return root;
     }
 
@@ -153,12 +174,73 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
     if let Some(action) = action {
         root = root.child(action);
     }
+    if buffering {
+        root = root.child(buffering_overlay());
+    }
+    if live {
+        root = root.child(live_badge());
+    }
     root
 }
 
 /// Рисуем ли спектр: только для файла без видео и не в текстовых состояниях.
 fn shows_spectrum(state: PlaybackState, has_video: bool) -> bool {
-    !has_video && !matches!(state, PlaybackState::Idle | PlaybackState::Failed)
+    !has_video
+        && !matches!(
+            state,
+            PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
+        )
+}
+
+/// Рисуем ли плашку буферизации: только поверх уже открытого источника.
+fn shows_buffering(state: PlaybackState, buffering: bool) -> bool {
+    buffering
+        && !matches!(
+            state,
+            PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
+        )
+}
+
+/// Рисуем ли плашку `LIVE`: только у открытого live-потока.
+fn shows_live(state: PlaybackState, live: bool) -> bool {
+    live && !matches!(
+        state,
+        PlaybackState::Idle | PlaybackState::Loading | PlaybackState::Failed
+    )
+}
+
+/// Плашка `LIVE` в правом верхнем углу кадра.
+fn live_badge() -> Div {
+    div()
+        .absolute()
+        .top(px(12.0))
+        .right(px(12.0))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(gpui::rgb(0xcc_2b_2b))
+        .text_xs()
+        .child("LIVE")
+}
+
+/// Плашка «Буферизация…» поверх кадра.
+fn buffering_overlay() -> Div {
+    div()
+        .absolute()
+        .top(px(12.0))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(gpui::rgba(0x00_00_00_cc))
+                .text_sm()
+                .child("Буферизация…"),
+        )
 }
 
 /// Визуализатор звука: столбики растут от нижнего края окна вверх, как
@@ -237,13 +319,42 @@ fn action_button(id: &'static str, action: Action, player: &Entity<VideoPlayer>)
 }
 
 /// Строка оверлея: fps, пропуски и отставание последнего кадра.
+///
+/// Для сетевого источника добавляются ещё две строки: счётчики читателя
+/// (`net:`) и занятость общего кэша (`cache:`). По ним видно, откуда берутся
+/// `drop` и рост памяти: трафик и резидентный кэш — разные величины.
 fn format_stats(stats: SyncStats) -> String {
-    format!(
+    let mut text = format!(
         "{:.1} fps · drop {} · lag {} ms",
         stats.fps,
         stats.dropped,
         stats.lag.as_millis()
-    )
+    );
+
+    if let Some(network) = stats.network {
+        text.push('\n');
+        text.push_str(&format!(
+            "net: {} req · {} · slow {} ({:.1} s) · retries {}",
+            network.requests,
+            format_mb(network.bytes),
+            network.slow_reads,
+            network.slow_ms as f64 / 1000.0,
+            network.retries
+        ));
+        // Перезапуски бывают только у источника без `Range`.
+        if network.restarts > 0 {
+            text.push_str(&format!(" · restarts {}", network.restarts));
+        }
+        text.push('\n');
+        text.push_str(&format!("cache: {}", format_mb(network.cache_bytes)));
+    }
+
+    text
+}
+
+/// Байты в мегабайтах с одним знаком: `12.3 MB`.
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Текст оверлея с учётом настройки видимости.
@@ -299,6 +410,7 @@ fn fit_rect(bounds: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels> {
 fn describe(state: PlaybackState, error: Option<&str>) -> Option<(SharedString, SharedString)> {
     match state {
         PlaybackState::Idle => Some(("видео не открыто".into(), "player-gpui <file>".into())),
+        PlaybackState::Loading => Some(("Загрузка…".into(), "".into())),
         PlaybackState::Ready | PlaybackState::Paused => None,
         PlaybackState::Playing => Some(("воспроизведение".into(), "ожидание первого кадра".into())),
         PlaybackState::Ended => Some((
@@ -316,6 +428,8 @@ fn describe(state: PlaybackState, error: Option<&str>) -> Option<(SharedString, 
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use player_core::NetworkStats;
 
     fn bounds(width: f32, height: f32) -> Bounds<Pixels> {
         Bounds {
@@ -371,8 +485,52 @@ mod tests {
             dropped: 2,
             lag: Duration::from_millis(12),
             fps: 29.97,
+            network: None,
         };
         assert_eq!(format_stats(stats), "30.0 fps · drop 2 · lag 12 ms");
+    }
+
+    #[test]
+    fn network_counters_get_their_own_line() {
+        let stats = SyncStats {
+            shown: 100,
+            dropped: 40,
+            lag: Duration::ZERO,
+            fps: 60.0,
+            network: Some(NetworkStats {
+                requests: 14,
+                bytes: 26_000_000,
+                slow_reads: 9,
+                slow_ms: 2_500,
+                retries: 1,
+                restarts: 0,
+                cache_bytes: 26_000_000,
+            }),
+        };
+        assert_eq!(
+            format_stats(stats),
+            "60.0 fps · drop 40 · lag 0 ms\nnet: 14 req · 24.8 MB · slow 9 (2.5 s) · retries 1\ncache: 24.8 MB"
+        );
+    }
+
+    #[test]
+    fn restarts_show_only_when_present() {
+        let stats = SyncStats {
+            shown: 10,
+            dropped: 0,
+            lag: Duration::ZERO,
+            fps: 30.0,
+            network: Some(NetworkStats {
+                requests: 3,
+                bytes: 0,
+                slow_reads: 0,
+                slow_ms: 0,
+                retries: 0,
+                restarts: 2,
+                cache_bytes: 0,
+            }),
+        };
+        assert!(format_stats(stats).contains("restarts 2"));
     }
 
     #[test]
@@ -382,6 +540,7 @@ mod tests {
             dropped: 0,
             lag: Duration::ZERO,
             fps: 30.0,
+            network: None,
         };
         assert_eq!(
             stats_overlay(Some(stats), true).as_deref(),
@@ -419,12 +578,43 @@ mod tests {
     }
 
     #[test]
+    fn buffering_is_shown_only_for_open_states() {
+        assert!(shows_buffering(PlaybackState::Playing, true));
+        assert!(shows_buffering(PlaybackState::Paused, true));
+        assert!(shows_buffering(PlaybackState::Ready, true));
+        assert!(!shows_buffering(PlaybackState::Playing, false));
+        assert!(!shows_buffering(PlaybackState::Loading, true));
+        assert!(!shows_buffering(PlaybackState::Idle, true));
+        assert!(!shows_buffering(PlaybackState::Failed, true));
+    }
+
+    #[test]
+    fn live_badge_is_shown_only_for_open_live_streams() {
+        assert!(shows_live(PlaybackState::Ready, true));
+        assert!(shows_live(PlaybackState::Playing, true));
+        assert!(shows_live(PlaybackState::Paused, true));
+        assert!(!shows_live(PlaybackState::Loading, true));
+        assert!(!shows_live(PlaybackState::Idle, true));
+        assert!(!shows_live(PlaybackState::Failed, true));
+        assert!(!shows_live(PlaybackState::Playing, false));
+    }
+
+    #[test]
+    fn loading_state_shows_progress_text() {
+        let (title, detail) =
+            describe(PlaybackState::Loading, None).expect("у загрузки есть текст");
+        assert_eq!(title, "Загрузка…");
+        assert!(detail.is_empty());
+    }
+
+    #[test]
     fn spectrum_is_only_for_audio_files() {
         assert!(shows_spectrum(PlaybackState::Ready, false));
         assert!(shows_spectrum(PlaybackState::Playing, false));
         assert!(shows_spectrum(PlaybackState::Paused, false));
         assert!(shows_spectrum(PlaybackState::Ended, false));
         assert!(!shows_spectrum(PlaybackState::Idle, false));
+        assert!(!shows_spectrum(PlaybackState::Loading, false));
         assert!(!shows_spectrum(PlaybackState::Failed, false));
         assert!(!shows_spectrum(PlaybackState::Playing, true));
     }

@@ -204,24 +204,27 @@ impl Screen {
 }
 ```
 
-Метаданные файла доступны без обращений к FFmpeg: `path()`, `media_info()`
-(контейнер, кодек и разрешение видео, кодек/каналы/частота звука),
-`video_info()` (разрешение, частота кадров, длительность). Панель
-«Информация о файле» в демо-окне собрана из них; библиотека сама такой панели
-не рисует.
+Метаданные приходят событием `Ready`: открытие асинхронное, и до него
+`video_info()`/`media_info()` пусты. В них — контейнер, кодек и разрешение
+видео, кодек/каналы/частота звука, а также `seekable()` и `buffering()`.
+Панель «Информация о файле» в демо-окне собрана из них; библиотека сама такой
+панели не рисует.
 
 ## Публичный API
 
 Сущность `VideoPlayer`:
 
-| Группа     | Методы                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Создание   | `new(cx)`, `create(path, cx)`                                                                                                              |
-| Открытие   | `open(path, cx)`, `open_dialog(cx)`, `open_dropped(paths, cx)`                                                                             |
-| Управление | `play`, `pause`, `toggle_playback`, `seek`, `set_volume`, `toggle_mute`, `restart`, `retry`, `stop`                                        |
-| Чтение     | `state`, `position`, `duration`, `volume`, `muted`, `path`, `video_info`, `media_info`, `frame`, `stats`, `spectrum`, `error`, `can_retry` |
-| Статистика | `stats_visible`, `set_stats_visible`, `toggle_stats`                                                                                       |
-| Окно       | `fullscreen`, `set_fullscreen(bool, cx)` — иконка кнопки в `controls_view`                                                                 |
+| Группа     | Методы                                                                                                                                                                        |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Создание   | `new(cx)`, `create(source, cx)`                                                                                                                                               |
+| Открытие   | `open(source, cx)`, `open_dialog(cx)`, `open_dropped(paths, cx)`                                                                                                              |
+| Управление | `play`, `pause`, `toggle_playback`, `seek`, `set_volume`, `toggle_mute`, `restart`, `retry`, `stop`                                                                           |
+| Чтение     | `state`, `position`, `duration`, `volume`, `muted`, `source`, `path`, `seekable`, `buffering`, `video_info`, `media_info`, `frame`, `stats`, `spectrum`, `error`, `can_retry` |
+| Статистика | `stats_visible`, `set_stats_visible`, `toggle_stats`                                                                                                                          |
+| Окно       | `fullscreen`, `set_fullscreen(bool, cx)` — иконка кнопки в `controls_view`                                                                                                    |
+
+`create` и `open` принимают `impl Into<Source>`: путь, `PathBuf` или
+`Source::Url(…)`. `path()` возвращает путь только для локального источника.
 
 Функции и типы:
 
@@ -230,7 +233,9 @@ impl Screen {
 | `video_view(&player, cx)`                       | кадр с letterbox, превью, оверлеем статистики и кнопкой «Повторить»; для файла без видео — спектроанализатор |
 | `controls_view(&player, cx)`                    | готовая панель с кнопками-иконками (включая fullscreen) и слайдерами                                         |
 | `run_app(Option<PathBuf>)`                      | готовое демо-окно — для бинарника и примеров                                                                 |
-| `PlaybackState`                                 | `Idle`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()`                                      |
+| `run_app_source(Option<Source>)`                | то же, но источник — путь или URL                                                                            |
+| `Source`, `SourceError`                         | разбор строки на файл/URL (реэкспорт `player-core`)                                                          |
+| `PlaybackState`                                 | `Idle`, `Loading`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()`                           |
 | `SpectrumBars`, `SPECTRUM_BARS`                 | уровни визуализатора: 48 чисел `0…1`; `SpectrumBars::levels()`                                               |
 | `MediaInfo`, `VideoTrackInfo`, `AudioTrackInfo` | метаданные открытого файла: контейнер, кодеки, параметры дорожек                                             |
 | `LaunchError`, `WINDOW_TITLE`                   | ошибка запуска окна и заголовок демо-окна                                                                    |
@@ -254,19 +259,23 @@ cargo run -p player-gpui --example embed_in_app -- assets/test/sync_test.mp4
 # just example-embed
 ```
 
+Демо-окно открывает источник из аргумента: путь, `file://` или `https://`.
+Сетевой читатель появится на этапе 3; до него URL доходит до состояния
+`Loading` и показывает понятную ошибку.
+
 ## Подключение по git
 
 Репозиторий: <https://github.com/m1Ck1-pypy/vgpu-player>.
 
 1. Поставить тег, чтобы зависимость была воспроизводимой:
    ```bash
-   git tag v0.2.1
-   git push origin v0.2.1
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
 2. В чужом проекте подключить тег (предпочтительно) или ветку:
    ```toml
    [dependencies]
-   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.2.1", package = "player-gpui" }
+   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.3.0", package = "player-gpui" }
    # или
    player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", branch = "main", package = "player-gpui" }
    ```

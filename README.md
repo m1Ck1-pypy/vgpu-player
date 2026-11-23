@@ -6,7 +6,7 @@
 для Windows. Учебный проект: цель — понять каждую строку и научиться Rust, а не
 сделать конкурирующий плеер.
 
-Версия 0.2.1. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
+Версия 0.3.0. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
 аудио-часам, управление, надёжность, пул BGRA-буферов, полировка интерфейса,
 библиотека `player-gpui`, установщики, ассоциации файлов, автовоспроизведение,
 сохранение настроек, спектроанализатор для аудиофайлов.
@@ -40,7 +40,7 @@
 | `crates/player-app`  | демонстрационное приложение                                                |
 | `crates/player-cli`  | консольный запуск ядра и замеры                                            |
 | `installer/`         | Inno Setup и WiX-исходники установщиков, `.cmd` ассоциаций для портативной |
-| `docs/`              | `SPEC.md`, `CURRENT_TASK.md` и история решений                             |
+| `docs/`              | `SPEC.md`, `CURRENT_TASK.md`, `CHANGELOG.md` и история решений             |
 | `assets/`            | иконка; тестовые медиафайлы генерируются локально                          |
 
 ## Требования
@@ -75,7 +75,22 @@ cp .tools/vcpkg/installed/x64-windows/bin/*.dll target/debug/deps/
 ```bash
 cargo build -p player-app
 cargo run -p player-app -- path/to/video.mp4
+cargo run -p player-app -- file:///C:/video/movie.mp4
 ```
+
+Release-бинарник называется `vgpu.exe`. После установки Inno/MSI каталог
+приложения добавляется в пользовательский `PATH`, поэтому в новой консоли
+можно запускать:
+
+```bat
+vgpu "https://…"
+vgpu
+```
+
+Аргумент разбирается как источник: путь, `file://` или `https://`. Без
+аргумента открывается пустое окно плеера. Прямые `http(s)`-ссылки на
+MP4/MKV/WebM/MP3 и HLS (`.m3u8`, VOD и live) играют. Окно во время открытия
+показывает «Загрузка…» и не замирает.
 
 Если сборка идёт из Git Bash и `PATH` подхватывает `/usr/bin/link.exe`, добавьте
 `RUSTFLAGS="-Clinker=rust-lld"` (см. `docs/SPEC.md`, раздел 12.4).
@@ -94,6 +109,7 @@ cargo run -p player-app -- path/to/video.mp4
 | Открыть файл        | `O` / `Ctrl+O`, меню «⋯» → «Открыть…», перетаскивание |
 | Громкость           | ползунок или колесо мыши (±1 %)                       |
 | Автовоспроизведение | меню «⋯» → «Запускать сразу» (по умолчанию включено)  |
+| Оверлей статистики  | меню «⋯» → «Показать оверлей статистики»              |
 | Закрыть меню/панели | `Esc` или клик по кадру                               |
 
 Процент громкости не занимает место в панели постоянно: он появляется
@@ -128,8 +144,8 @@ volume = 0.8
 
 ```bash
 just portable        # release-exe + dist/vgpu-player/ (exe + DLL)
-just installer-inno  # dist/vgpu-player-0.2.1-setup.exe
-just installer-msi   # dist/vgpu-player-0.2.1.msi
+just installer-inno  # dist/vgpu-player-0.3.0-setup.exe
+just installer-msi   # dist/vgpu-player-0.3.0.msi
 just installers      # portable + оба установщика
 ```
 
@@ -140,6 +156,19 @@ just installers      # portable + оба установщика
 скачайте `wix314-binaries.zip` с
 <https://github.com/wixtoolset/wix3/releases> и распакуйте в `.tools/wix`.
 Для Inno нужен установленный Inno Setup 7 (`ISCC.exe`).
+
+Оба установщика добавляют каталог установки в пользовательский `PATH`
+(`HKCU\Environment`, без прав администратора). После установки откройте
+**новую** консоль и проверьте:
+
+```bat
+where vgpu
+vgpu "https://…"
+```
+
+Уже открытые консоли сохраняют старое окружение. URL с `&` передавайте в
+кавычках: в `cmd` этот символ разделяет команды. Удаление установщика
+убирает из `PATH` только свою запись.
 
 ### Ассоциации файлов
 
@@ -153,7 +182,9 @@ just installers      # portable + оба установщика
 в `UserChoice` и защищён хэшем, поэтому прямая запись в `.mp4` всё равно была
 бы проигнорирована. Удаление снимает только свои записи. Для портативной
 папки то же делает `dist/vgpu-player/register-associations.cmd` (снять —
-`register-associations.cmd remove`).
+`register-associations.cmd remove`). Добавить или убрать портативную папку
+в пользовательском `PATH` можно вручную:
+`register-associations.cmd path` и `register-associations.cmd path remove`.
 
 Второй клик по видео при уже запущенном плеере запускает второй экземпляр:
 передачи пути в существующее окно пока нет.
@@ -182,7 +213,8 @@ CI — `.github/workflows/ci.yml` (Ubuntu, те же проверки).
 ## Документация
 
 - `docs/SPEC.md` — требования, архитектура, этапы, решения, упаковка;
-- `docs/CURRENT_TASK.md` — состояние последней сессии и что осталось;
+- `docs/CURRENT_TASK.md` — текущая задача (PATH установщиков) и что осталось;
+- `docs/CHANGELOG.md` — история завершённых этапов 1–4;
 - `crates/player-gpui/README.md` — встраивание библиотеки;
 - `assets/test/README.md` — генерация тестовых файлов.
 

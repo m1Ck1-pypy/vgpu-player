@@ -10,10 +10,7 @@
                 Directory="INSTALLFOLDER"
                 Guid="{A3F1C2D4-6B7E-4A90-8C1D-2E5F7A9B3C60}"
             >
-                <File
-                    Id="PlayerAppExe"
-                    Source="$(var.SourceDir)\player-app.exe"
-                />
+                <File Id="PlayerAppExe" Source="$(var.SourceDir)\vgpu.exe" />
                 <File
                     Id="AvcodecDll"
                     Source="$(var.SourceDir)\avcodec-63.dll"
@@ -40,6 +37,25 @@
                     Source="$(var.SourceDir)\swscale-10.dll"
                 />
                 <File Id="Dav1dDll" Source="$(var.SourceDir)\dav1d.dll" />
+
+                <!-- Old builds shipped player-app.exe; drop it on upgrade. -->
+                <RemoveFile
+                    Id="RemoveLegacyPlayerApp"
+                    Name="player-app.exe"
+                    On="install"
+                />
+
+                <!-- Per-user PATH: MSI appends on install and removes only this
+                     entry on uninstall. No admin rights (System="no"). -->
+                <Environment
+                    Id="UserPath"
+                    Name="PATH"
+                    Value="[INSTALLFOLDER]"
+                    Part="last"
+                    Action="set"
+                    System="no"
+                    Permanent="no"
+                />
 
                 <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
                 <RegistryValue

@@ -8,11 +8,18 @@
 //! [`Command`] и [`Event`] как контракт с UI, [`PlayerError`] для ошибок.
 
 mod audio;
+mod cache;
 mod clock;
 mod command;
+mod engine;
 mod error;
 mod event;
+mod hls;
+mod http;
+mod media;
 mod player;
+mod reader;
+mod source;
 mod spectrum;
 mod sync;
 mod versions;
@@ -21,8 +28,10 @@ mod video;
 pub use command::Command;
 pub use error::PlayerError;
 pub use event::Event;
-pub use player::{AudioTrackInfo, MediaInfo, Player, VideoTrackInfo};
+pub use media::{AudioTrackInfo, MediaInfo, MediaReady, VideoTrackInfo};
+pub use player::Player;
+pub use source::{Source, SourceError};
 pub use spectrum::{SPECTRUM_BARS, SpectrumBars};
-pub use sync::SyncStats;
+pub use sync::{NetworkStats, SyncStats};
 pub use versions::{FfmpegVersion, FfmpegVersions};
 pub use video::{VideoDecoder, VideoFrame, VideoInfo, preview_frame};
