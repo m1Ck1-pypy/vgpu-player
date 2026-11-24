@@ -50,7 +50,9 @@ fn run() -> anyhow::Result<()> {
 /// двойному клику в Проводнике: `vgpu.exe "C:\video\movie.mp4"`.
 /// Парсер командной строки Rust кавычки обычно снимает сам; повторное снятие
 /// нужно для лаунчеров, которые передают строку целиком и экранируют её сами.
-/// `https://…` распознаётся как URL, а не как путь.
+/// Кроме ASCII-кавычек снимаются парные типографские: команду часто копируют
+/// из документации или мессенджера.
+/// `https://…` и `file:` распознаются как URL, а не как путь.
 fn source_argument(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<Option<Source>, SourceError> {
@@ -58,7 +60,7 @@ fn source_argument(
         return Ok(None);
     };
     let text = argument.to_string_lossy();
-    let trimmed = text.trim_matches('"');
+    let trimmed = strip_typographic_quotes(text.trim_matches('"'));
     if trimmed.is_empty() {
         return Ok(None);
     }
@@ -71,6 +73,21 @@ fn source_argument(
         OsString::from(trimmed)
     };
     Source::from_os_string(value).map(Some)
+}
+
+/// Снимает парные типографские кавычки: `“…”`, `‘…’`, `«…»`.
+fn strip_typographic_quotes(text: &str) -> &str {
+    const PAIRS: [(char, char); 3] = [('“', '”'), ('‘', '’'), ('«', '»')];
+
+    for (open, close) in PAIRS {
+        if let Some(rest) = text.strip_prefix(open)
+            && let Some(inner) = rest.strip_suffix(close)
+        {
+            return inner;
+        }
+    }
+
+    text
 }
 
 /// Подписчик логов: по умолчанию только предупреждения и ошибки, уровень
@@ -109,6 +126,18 @@ mod tests {
             source,
             Some(Source::File(PathBuf::from(r"C:\my video\a b.mkv")))
         );
+    }
+
+    #[test]
+    fn strips_typographic_quotes_around_a_source() {
+        let source = source_argument(args(&["“C:\\video\\a b.mp4”"])).expect("путь");
+        assert_eq!(
+            source,
+            Some(Source::File(PathBuf::from(r"C:\video\a b.mp4")))
+        );
+
+        let source = source_argument(args(&["«file:///D:/video/a.mp4»"])).expect("URL");
+        assert_eq!(source, Some(Source::File(PathBuf::from("D:/video/a.mp4"))));
     }
 
     #[test]

@@ -130,8 +130,10 @@ pub struct VideoPlayer {
     /// `Window::is_fullscreen()`, чтобы панель показывала верную иконку.
     fullscreen: bool,
     /// Доля громкости под курсором, пока он над ползунком: предпросмотр
-    /// процента в подсказке. `None` — курсор вне ползунка.
+    /// процента в выдвижной панели. `None` — курсор вне ползунка.
     volume_hover: Option<f32>,
+    /// Открыта ли выдвижная панель громкости (значок динамика в панели).
+    volume_panel_open: bool,
     muted: bool,
     /// Начинать воспроизведение сразу после открытия файла.
     ///
@@ -172,6 +174,7 @@ impl VideoPlayer {
             stats_visible: false,
             fullscreen: false,
             volume_hover: None,
+            volume_panel_open: false,
             muted: false,
             autoplay: true,
             scrub: None,
@@ -484,6 +487,30 @@ impl VideoPlayer {
         }
     }
 
+    /// Открыта ли выдвижная панель громкости.
+    pub fn volume_panel_open(&self) -> bool {
+        self.volume_panel_open
+    }
+
+    /// Открывает и закрывает выдвижную панель громкости.
+    ///
+    /// Предпросмотр под курсором сбрасывается: ползунок исчезает из дерева,
+    /// и событие «курсор ушёл» может не прийти.
+    pub fn toggle_volume_panel(&mut self, cx: &mut Context<Self>) {
+        self.volume_panel_open = !self.volume_panel_open;
+        self.volume_hover = None;
+        cx.notify();
+    }
+
+    /// Закрывает выдвижную панель громкости, если она открыта.
+    pub fn close_volume_panel(&mut self, cx: &mut Context<Self>) {
+        if self.volume_panel_open {
+            self.volume_panel_open = false;
+            self.volume_hover = None;
+            cx.notify();
+        }
+    }
+
     /// Длительность файла, если ядро её сообщило.
     pub fn duration(&self) -> Option<Duration> {
         self.duration
@@ -709,6 +736,7 @@ impl VideoPlayer {
         self.seek_hint = None;
         self.volume_scrubbing = false;
         self.volume_hover = None;
+        self.volume_panel_open = false;
     }
 
     /// Запоминает границы полосы прогресса (их сообщает canvas при отрисовке).

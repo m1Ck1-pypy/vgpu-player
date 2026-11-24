@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, AsyncApp, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, ExternalPaths,
     FileDropEvent, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollDelta, ScrollEvent, SharedString, Stateful, Task,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    MouseMoveEvent, MouseUpEvent, Platform, Render, ScrollDelta, ScrollEvent, SharedString,
+    Stateful, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, size,
 };
 use player_core::{FfmpegVersions, MediaInfo, Source};
 use tracing::{debug, error, info, warn};
@@ -26,6 +27,7 @@ use crate::controls::{format_clock, volume_percent};
 use crate::icons::{ICON_SIZE, Icon, icon};
 use crate::open_panel::{OpenPanel, PanelAction, PanelChoice};
 use crate::settings::Settings;
+use crate::theme;
 use crate::{VideoPlayer, controls_view, video_view};
 
 /// Заголовок окна.
@@ -45,6 +47,12 @@ const VOLUME_NOTICE_DURATION: Duration = Duration::from_millis(1_500);
 
 /// Шаг перемотки стрелками.
 const SEEK_STEP: Duration = Duration::from_secs(5);
+
+/// Окно двойного клика: столько одиночный клик ждёт второй.
+///
+/// Одиночный клик переключает паузу не сразу: иначе первый клик двойного
+/// успевал бы поставить видео на паузу до прихода второго.
+const DOUBLE_CLICK_DELAY: Duration = Duration::from_millis(250);
 
 /// Высота панели управления с отступом — насколько меню «⋯» поднимается
 /// над нижним краем кадра.
@@ -87,6 +95,22 @@ fn shortcut(key: &str) -> Option<Shortcut> {
     }
 }
 
+/// Что делает клик по кадру.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickAction {
+    TogglePlayback,
+    ToggleFullscreen,
+}
+
+/// Одиночный клик — пауза или продолжение, двойной — полный экран.
+fn click_action(click_count: usize) -> ClickAction {
+    if click_count >= 2 {
+        ClickAction::ToggleFullscreen
+    } else {
+        ClickAction::TogglePlayback
+    }
+}
+
 /// Пора ли скрыть панель управления.
 fn should_hide(playing: bool, enabled: bool, idle: Duration) -> bool {
     enabled && playing && idle >= AUTO_HIDE_DELAY
@@ -105,6 +129,9 @@ fn volume_after_step(current: f32, up: bool) -> f32 {
 /// Корневое окно демонстрационного приложения.
 struct PlayerWindow {
     player: Entity<VideoPlayer>,
+    /// Платформа нужна, чтобы прятать курсор, пока панель скрыта по
+    /// автоскрытию: вернуть его при движении мыши — задача платформы.
+    platform: Rc<dyn Platform>,
     focus_handle: FocusHandle,
     focused: bool,
     controls_visible: bool,
@@ -137,12 +164,17 @@ struct PlayerWindow {
     skip_next_click: bool,
     /// Плашка с громкостью: значение и момент последнего шага колесом.
     volume_notice: Option<(f32, Instant)>,
+    /// Отложенное переключение паузы после одиночного клика.
+    ///
+    /// Задача отменяется, когда приходит второй клик: пара должна уйти в
+    /// fullscreen, а не поставить видео на паузу.
+    pending_click: Option<Task<()>>,
     last_activity: Instant,
     _auto_hide: Task<()>,
 }
 
 impl PlayerWindow {
-    fn new(source: Option<Source>, cx: &mut Context<Self>) -> Self {
+    fn new(source: Option<Source>, platform: Rc<dyn Platform>, cx: &mut Context<Self>) -> Self {
         let settings_path = Settings::default_path();
         let settings = settings_path
             .as_deref()
@@ -166,6 +198,7 @@ impl PlayerWindow {
 
         Self {
             player,
+            platform,
             focus_handle,
             focused: false,
             controls_visible: true,
@@ -181,6 +214,7 @@ impl PlayerWindow {
             dragging: false,
             skip_next_click: false,
             volume_notice: None,
+            pending_click: None,
             last_activity: Instant::now(),
             _auto_hide: auto_hide,
         }
@@ -310,6 +344,9 @@ impl PlayerWindow {
     /// Открывает и закрывает меню «⋯».
     fn toggle_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.menu_open = !self.menu_open;
+        // Меню и регулятор громкости не должны висеть одновременно.
+        self.player
+            .update(cx, |video, cx| video.close_volume_panel(cx));
         self.note_activity(cx);
         cx.notify();
     }
@@ -327,16 +364,45 @@ impl PlayerWindow {
         }
     }
 
-    /// Клик по кадру — пауза или продолжение воспроизведения.
-    fn toggle_playback_on_click(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Клик по кадру: один — пауза или продолжение, два — полный экран.
+    ///
+    /// Одиночный клик откладывается на [`DOUBLE_CLICK_DELAY`], чтобы первый
+    /// клик двойного не ставил видео на паузу. `on_click` приходит на каждый
+    /// клик серии, поэтому счётчик и таймер вместе дают нужную пару.
+    fn handle_video_click_release(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.skip_next_click {
             self.skip_next_click = false;
             return;
         }
 
         self.note_activity(cx);
+        match click_action(event.click_count()) {
+            ClickAction::TogglePlayback => {
+                self.pending_click = Some(spawn_pending_playback(cx));
+            }
+            ClickAction::ToggleFullscreen => {
+                // Второй клик отменяет ожидающую паузу: иначе двойной клик
+                // переключал бы и режим окна, и воспроизведение.
+                self.pending_click = None;
+                self.toggle_fullscreen(window, cx);
+            }
+        }
+    }
+
+    /// Переключает полный экран и сразу обновляет иконку кнопки.
+    ///
+    /// Платформа меняет режим асинхронно, поэтому признак ставим по ожидаемому
+    /// состоянию — так же, как это делает кнопка панели управления.
+    fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = !window.is_fullscreen();
+        window.toggle_fullscreen();
         self.player
-            .update(cx, |video, cx| video.toggle_playback(cx));
+            .update(cx, |video, cx| video.set_fullscreen(target, cx));
     }
 
     /// Колесо мыши меняет громкость шагами по 1 %.
@@ -380,12 +446,20 @@ impl PlayerWindow {
     /// Возвращает `true`, если что-то действительно было открыто: по этому
     /// признаку `Escape` переключается на выход из fullscreen.
     fn close_overlays(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.menu_open || self.about_open || self.file_info_open || self.open_panel.is_open() {
+        let volume_panel_open = self.player.read(cx).volume_panel_open();
+        if self.menu_open
+            || self.about_open
+            || self.file_info_open
+            || self.open_panel.is_open()
+            || volume_panel_open
+        {
             self.menu_open = false;
             self.about_open = false;
             self.file_info_open = false;
             self.open_panel.close();
             self.open_panel_error = None;
+            self.player
+                .update(cx, |video, cx| video.close_volume_panel(cx));
             cx.notify();
             true
         } else {
@@ -409,6 +483,8 @@ impl PlayerWindow {
         self.file_info_open = false;
         self.open_panel_error = None;
         self.open_panel.reset();
+        self.player
+            .update(cx, |video, cx| video.close_volume_panel(cx));
         self.note_activity(cx);
         cx.notify();
     }
@@ -583,7 +659,12 @@ impl PlayerWindow {
             cx.notify();
         }
 
-        if self.menu_open || self.about_open || self.file_info_open || self.open_panel.is_open() {
+        if self.menu_open
+            || self.about_open
+            || self.file_info_open
+            || self.open_panel.is_open()
+            || self.player.read(cx).volume_panel_open()
+        {
             return;
         }
 
@@ -596,6 +677,9 @@ impl PlayerWindow {
             )
         {
             self.controls_visible = false;
+            // Панель и курсор скрываются вместе: платформа вернёт курсор,
+            // когда мышь сдвинется с места.
+            self.platform.hide_cursor_until_mouse_moves();
             cx.notify();
         }
     }
@@ -610,10 +694,10 @@ impl PlayerWindow {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(gpui::rgb(0x44_44_44))
+            .bg(gpui::rgb(theme::RAISED))
             .cursor_pointer()
             .aria_label("Ещё")
-            .child(icon(Icon::More, ICON_SIZE, gpui::rgb(0xee_ee_ee)))
+            .child(icon(Icon::More, ICON_SIZE, gpui::rgb(theme::TEXT)))
             .on_click(cx.listener(PlayerWindow::toggle_menu))
     }
 
@@ -641,7 +725,7 @@ impl PlayerWindow {
             .flex()
             .items_center()
             .gap_4()
-            .bg(gpui::rgba(0x11_11_11_cc))
+            .bg(gpui::rgba(theme::CONTROLS_BG))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(controls_view(&self.player, cx).flex_1())
             .child(self.menu_button(cx))
@@ -664,8 +748,8 @@ impl PlayerWindow {
             .p_1()
             .rounded_md()
             .border_1()
-            .border_color(gpui::rgb(0x44_44_44))
-            .bg(gpui::rgb(0x22_22_22))
+            .border_color(gpui::rgb(theme::BORDER))
+            .bg(gpui::rgb(theme::SURFACE))
             .flex()
             .flex_col()
             // GPUI считает наведённым любой хитбокс под курсором, а не
@@ -739,8 +823,8 @@ impl PlayerWindow {
             .p_4()
             .rounded_md()
             .border_1()
-            .border_color(gpui::rgb(0x44_44_44))
-            .bg(gpui::rgb(0x22_22_22))
+            .border_color(gpui::rgb(theme::BORDER))
+            .bg(gpui::rgb(theme::SURFACE))
             .flex()
             .flex_col()
             .gap_3()
@@ -775,8 +859,8 @@ impl PlayerWindow {
                 .py_2()
                 .rounded_sm()
                 .border_1()
-                .border_color(gpui::rgb(0x55_55_55))
-                .bg(gpui::rgb(0x11_11_11))
+                .border_color(gpui::rgb(theme::BORDER))
+                .bg(gpui::rgb(theme::INPUT))
                 .text_sm()
                 .overflow_hidden()
                 .whitespace_nowrap();
@@ -786,7 +870,7 @@ impl PlayerWindow {
             field = if input.text().is_empty() {
                 field.child(panel_caret()).child(
                     div()
-                        .text_color(gpui::rgb(0x77_77_77))
+                        .text_color(gpui::rgb(theme::FAINT))
                         .child("https://example.com/movie.mp4"),
                 )
             } else {
@@ -807,7 +891,7 @@ impl PlayerWindow {
                 card = card.child(
                     div()
                         .text_sm()
-                        .text_color(gpui::rgb(0xff_88_88))
+                        .text_color(gpui::rgb(theme::ERROR))
                         .child(error.clone()),
                 );
             }
@@ -821,7 +905,7 @@ impl PlayerWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x00_00_00_66))
+            .bg(gpui::rgba(theme::BACKDROP))
             .child(card)
     }
 
@@ -855,8 +939,8 @@ impl PlayerWindow {
             .p_4()
             .rounded_md()
             .border_1()
-            .border_color(gpui::rgb(0x44_44_44))
-            .bg(gpui::rgb(0x22_22_22))
+            .border_color(gpui::rgb(theme::BORDER))
+            .bg(gpui::rgb(theme::SURFACE))
             .text_sm();
 
         for line in lines {
@@ -871,7 +955,7 @@ impl PlayerWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x00_00_00_66))
+            .bg(gpui::rgba(theme::BACKDROP))
             .child(content)
     }
 }
@@ -893,8 +977,8 @@ impl Render for PlayerWindow {
             .size_full()
             .flex()
             .flex_col()
-            .bg(gpui::rgb(0x11_11_11))
-            .text_color(gpui::rgb(0xee_ee_ee))
+            .bg(gpui::rgb(theme::BACKGROUND))
+            .text_color(gpui::rgb(theme::TEXT))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(PlayerWindow::handle_key_down))
             .on_mouse_move(cx.listener(PlayerWindow::handle_mouse_move))
@@ -928,7 +1012,7 @@ impl Render for PlayerWindow {
                 div()
                     .id("vgpu-video-click")
                     .size_full()
-                    .on_click(cx.listener(PlayerWindow::toggle_playback_on_click))
+                    .on_click(cx.listener(PlayerWindow::handle_video_click_release))
                     .child(video_view(&self.player, cx).size_full()),
             );
 
@@ -943,7 +1027,7 @@ impl Render for PlayerWindow {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(gpui::rgba(0x22_22_22_ee))
+                    .bg(gpui::rgba(theme::NOTICE_BG))
                     .text_sm()
                     .child(format!("{}%", volume_percent(volume))),
             );
@@ -993,14 +1077,14 @@ impl Render for PlayerWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00_00_00_66))
+                    .bg(gpui::rgba(theme::BACKDROP))
                     .child(
                         div()
                             .px_4()
                             .py_2()
                             .rounded_md()
-                            .bg(gpui::rgb(0xee_ee_ee))
-                            .text_color(gpui::rgb(0x11_11_11))
+                            .bg(gpui::rgb(theme::ACCENT))
+                            .text_color(gpui::rgb(theme::ON_ACCENT))
                             .child("Отпустите файл, чтобы открыть"),
                     )
                     .on_drop(cx.listener(PlayerWindow::handle_drop)),
@@ -1042,8 +1126,13 @@ fn menu_item(
         .rounded_sm()
         .cursor_pointer()
         .aria_label(label.clone())
-        .hover(|style| style.bg(gpui::rgb(0x33_33_33)))
-        .child(div().w(px(14.0)).child(mark))
+        .hover(|style| style.bg(gpui::rgb(theme::RAISED)))
+        .child(
+            div()
+                .w(px(14.0))
+                .text_color(gpui::rgb(theme::HIGHLIGHT))
+                .child(mark),
+        )
         .child(div().text_sm().child(label))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
@@ -1071,13 +1160,13 @@ fn panel_item(
         .rounded_sm()
         .cursor_pointer()
         .aria_label(label.clone())
-        .hover(|style| style.bg(gpui::rgb(0x33_33_33)))
+        .hover(|style| style.bg(gpui::rgb(theme::RAISED)))
         .child(div().text_sm().child(label))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click);
 
     if selected {
-        item = item.bg(gpui::rgb(0x33_33_33));
+        item = item.bg(gpui::rgb(theme::RAISED));
     }
     item
 }
@@ -1086,7 +1175,7 @@ fn panel_item(
 fn panel_hint(text: &'static str) -> Div {
     div()
         .text_sm()
-        .text_color(gpui::rgb(0x88_88_88))
+        .text_color(gpui::rgb(theme::MUTED))
         .child(text)
 }
 
@@ -1096,7 +1185,7 @@ fn panel_caret() -> Div {
         .flex_shrink_0()
         .w(px(2.0))
         .h(px(16.0))
-        .bg(gpui::rgb(0xee_ee_ee))
+        .bg(gpui::rgb(theme::HIGHLIGHT))
 }
 
 /// Подпись переключателя оверлея: действие, которое сделает клик.
@@ -1272,11 +1361,35 @@ fn spawn_auto_hide(cx: &mut Context<PlayerWindow>) -> Task<()> {
     )
 }
 
+/// Откладывает переключение паузы после одиночного клика.
+///
+/// Задача живёт в поле окна: приход второго клика заменяет её на `None` и
+/// отменяет таймер, а закрытие окна просто роняет задачу.
+fn spawn_pending_playback(cx: &mut Context<PlayerWindow>) -> Task<()> {
+    cx.spawn(
+        async move |this: WeakEntity<PlayerWindow>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(DOUBLE_CLICK_DELAY).await;
+            let _ = this.update(cx, |window, cx| {
+                window
+                    .player
+                    .update(cx, |video, cx| video.toggle_playback(cx));
+            });
+        },
+    )
+}
+
 /// Открывает главное окно в уже запущенном приложении.
-fn open_main_window(cx: &mut App, source: Option<Source>) -> gpui::Result<()> {
+fn open_main_window(
+    cx: &mut App,
+    source: Option<Source>,
+    platform: Rc<dyn Platform>,
+) -> gpui::Result<()> {
     let bounds = Bounds::centered(None, size(px(960.0), px(540.0)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // Уже этого таймлайн и время перестают помещаться: окно можно
+        // уменьшить только до разумного предела.
+        window_min_size: Some(size(px(560.0), px(315.0))),
         titlebar: Some(TitlebarOptions {
             title: Some(WINDOW_TITLE.into()),
             ..Default::default()
@@ -1286,7 +1399,7 @@ fn open_main_window(cx: &mut App, source: Option<Source>) -> gpui::Result<()> {
 
     info!("открытие главного окна");
     cx.open_window(options, |_window, cx| {
-        cx.new(|cx| PlayerWindow::new(source, cx))
+        cx.new(|cx| PlayerWindow::new(source, platform, cx))
     })?;
     Ok(())
 }
@@ -1300,8 +1413,14 @@ pub fn run_app_source(source: Option<Source>) -> Result<(), LaunchError> {
     let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let failure_slot = Rc::clone(&failure);
 
-    gpui_platform::application().run(move |cx: &mut App| {
-        if let Err(err) = open_main_window(cx, source) {
+    // Платформу создаём сами, а не через `gpui_platform::application()`:
+    // экземпляр должен быть тем же, что у приложения, иначе скрытие курсора
+    // не найдёт ни одного окна.
+    let platform = gpui_platform::current_platform(false);
+    let window_platform = Rc::clone(&platform);
+
+    gpui::Application::with_platform(platform).run(move |cx: &mut App| {
+        if let Err(err) = open_main_window(cx, source, window_platform) {
             error!(%err, "не удалось открыть окно");
             *failure_slot.borrow_mut() = Some(err.to_string());
             cx.quit();
@@ -1325,6 +1444,12 @@ pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
 mod tests {
     use super::*;
     use player_core::FfmpegVersion;
+
+    #[test]
+    fn double_click_asks_for_fullscreen() {
+        assert_eq!(click_action(1), ClickAction::TogglePlayback);
+        assert_eq!(click_action(2), ClickAction::ToggleFullscreen);
+    }
 
     #[test]
     fn shortcut_maps_player_keys() {

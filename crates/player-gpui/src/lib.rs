@@ -67,6 +67,49 @@ mod settings;
 mod video_player;
 mod video_view;
 
+/// Палитра интерфейса, снятая с иконки приложения.
+///
+/// Оранжевый корпус — основной акцент (Play/Replay, заполнение слайдеров),
+/// жёлтые «кнопки» плёнки — вторичный (отметки меню, `LIVE`, каретка), белый
+/// треугольник — текст и иконки. Фоны тёмные и тёплые, чтобы кадр оставался
+/// главным на экране.
+mod theme {
+    /// Корпус иконки: основной акцент.
+    pub(crate) const ACCENT: u32 = 0xef_8a_2e;
+    /// Жёлтые кирпичики плёнки: вторичный акцент.
+    pub(crate) const HIGHLIGHT: u32 = 0xff_d9_3d;
+    /// Белый треугольник Play: основной текст и иконки.
+    pub(crate) const TEXT: u32 = 0xf7_ef_e6;
+    /// Тёмный текст на оранжевых и жёлтых плашках.
+    pub(crate) const ON_ACCENT: u32 = 0x1b_12_0c;
+
+    /// Фон окна и поля кадра.
+    pub(crate) const BACKGROUND: u32 = 0x14_0f_0b;
+    /// Меню, карточки диалогов и панель информации.
+    pub(crate) const SURFACE: u32 = 0x24_1a_12;
+    /// Кнопки, наведение и выбранный пункт.
+    pub(crate) const RAISED: u32 = 0x3a_28_1a;
+    /// Границы и незаполненная дорожка слайдера.
+    pub(crate) const BORDER: u32 = 0x4a_35_24;
+    /// Поле ввода ссылки.
+    pub(crate) const INPUT: u32 = 0x16_0f_0a;
+    /// Подсказки и второстепенный текст.
+    pub(crate) const MUTED: u32 = 0xb3_9d_8c;
+    /// Плейсхолдер: темнее подсказок.
+    pub(crate) const FAINT: u32 = 0x7e_6a_5b;
+    /// Текст ошибки в панели «Открыть…».
+    pub(crate) const ERROR: u32 = 0xff_8a_7a;
+
+    /// Панель управления поверх кадра.
+    pub(crate) const CONTROLS_BG: u32 = 0x1b_12_0c_cc;
+    /// Плашки статистики и буферизации.
+    pub(crate) const OVERLAY_BG: u32 = 0x1b_12_0c_cc;
+    /// Плашка громкости и подсказка над ползунком.
+    pub(crate) const NOTICE_BG: u32 = 0x2a_1e_14_ee;
+    /// Затемнение под меню, диалогами и подсказкой drag-and-drop.
+    pub(crate) const BACKDROP: u32 = 0x14_0f_0b_73;
+}
+
 pub use app::{LaunchError, WINDOW_TITLE, run_app, run_app_source};
 pub use controls::controls_view;
 pub use video_player::{PlaybackState, VideoPlayer};

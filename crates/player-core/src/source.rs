@@ -20,8 +20,11 @@ pub enum Source {
 impl Source {
     /// Разбирает строку из командной строки или поля ввода.
     ///
-    /// Схема распознаётся только явно: строка без `http(s)://`, `file://`
+    /// Схема распознаётся только явно: строка без `http(s)://` или `file:`
     /// считается путём, как и в mpv. Схема сравнивается без учёта регистра.
+    /// У `file:` допускаются все привычные формы: `file:///C:/…`,
+    /// `file://C:/…`, `file:/C:/…`, `file:C:/…`, `file://localhost/…`
+    /// и UNC `file://server/share/…`.
     pub fn parse(text: &str) -> Result<Self, SourceError> {
         if text.is_empty() {
             return Err(SourceError::Empty);
@@ -33,7 +36,7 @@ impl Source {
             return Ok(Self::Url(text.to_owned()));
         }
 
-        if let Some(rest) = strip_prefix_ci(text, "file://") {
+        if let Some(rest) = strip_prefix_ci(text, "file:") {
             return file_url_path(rest).map(Self::File);
         }
 
@@ -50,13 +53,7 @@ impl Source {
         }
 
         match value.to_str() {
-            Some(text)
-                if strip_prefix_ci(text, "http://").is_some()
-                    || strip_prefix_ci(text, "https://").is_some()
-                    || strip_prefix_ci(text, "file://").is_some() =>
-            {
-                Self::parse(text)
-            }
+            Some(text) if has_explicit_scheme(text) => Self::parse(text),
             _ => Ok(Self::File(PathBuf::from(value))),
         }
     }
@@ -161,9 +158,16 @@ pub enum SourceError {
     /// Схема распознана, но в ссылке есть недопустимые данные.
     #[error("не похоже на URL или путь: {0}")]
     InvalidUrl(&'static str),
-    /// `file://` не удалось превратить в путь.
-    #[error("не удалось разобрать file://: {0}")]
+    /// `file:` не удалось превратить в путь.
+    #[error("не удалось разобрать file-ссылку: {0}")]
     InvalidFileUrl(&'static str),
+}
+
+/// Есть ли у строки схема, которую разбирает [`Source::parse`].
+fn has_explicit_scheme(text: &str) -> bool {
+    strip_prefix_ci(text, "http://").is_some()
+        || strip_prefix_ci(text, "https://").is_some()
+        || strip_prefix_ci(text, "file:").is_some()
 }
 
 /// Снимает ASCII-префикс без учёта регистра.
@@ -198,9 +202,9 @@ fn validate_url(url: &str) -> Result<(), SourceError> {
     Ok(())
 }
 
-/// Превращает часть `file://` после схемы в путь.
+/// Превращает часть `file:` после схемы в путь.
 fn file_url_path(rest: &str) -> Result<PathBuf, SourceError> {
-    if rest.is_empty() {
+    if rest.is_empty() || rest == "//" {
         return Err(SourceError::InvalidFileUrl("пустой путь"));
     }
 
@@ -208,33 +212,73 @@ fn file_url_path(rest: &str) -> Result<PathBuf, SourceError> {
     let text =
         String::from_utf8(decoded).map_err(|_| SourceError::InvalidFileUrl("путь не в UTF-8"))?;
 
-    Ok(local_path(&text))
+    Ok(match text.strip_prefix("//") {
+        // `file://host/path`, `file:///path`, `file://C:/path`.
+        Some(after_slashes) => host_form_path(after_slashes),
+        // `file:/C:/path`, `file:C:/path`.
+        None => local_path(&text),
+    })
 }
 
-/// `file:///C:/…` → `C:/…`, `file:///home/…` → `/home/…`,
-/// `file://server/share` → UNC.
+/// `file://` с двумя слэшами: хост, диск или пустой хост.
+fn host_form_path(text: &str) -> PathBuf {
+    let (host, path) = text
+        .split_once('/')
+        .map_or((text, ""), |(host, path)| (host, path));
+
+    // `file://C:/video` — это диск, а не хост `C:`.
+    if is_drive_prefix(host) {
+        return PathBuf::from(if path.is_empty() {
+            host.to_owned()
+        } else {
+            format!("{host}/{path}")
+        });
+    }
+
+    // `file:///C:/…` и `file://localhost/…` — локальная машина.
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return local_path(&format!("/{path}"));
+    }
+
+    unc_path(host, path)
+}
+
+/// `file:/C:/…` и `file:C:/…`; `/C:/video.mp4` — диск, а не POSIX-путь.
 fn local_path(text: &str) -> PathBuf {
-    if let Some(rest) = text.strip_prefix('/') {
-        // `/C:/video.mp4` — диск, а не абсолютный POSIX-путь.
-        let bytes = rest.as_bytes();
-        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            return PathBuf::from(rest);
-        }
-        return PathBuf::from(text);
+    if let Some(without_root) = text.strip_prefix('/')
+        && is_drive_prefix(without_root)
+    {
+        return PathBuf::from(without_root);
     }
 
-    if text.starts_with("//") {
-        return PathBuf::from(text);
-    }
+    PathBuf::from(text)
+}
 
+/// `file://server/share` → UNC-путь.
+fn unc_path(host: &str, path: &str) -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(format!(r"\\{}", text.replace('/', "\\")))
+        let mut text = format!(r"\\{host}");
+        if !path.is_empty() {
+            text.push('\\');
+            text.push_str(&path.replace('/', "\\"));
+        }
+        PathBuf::from(text)
     }
     #[cfg(not(windows))]
     {
-        PathBuf::from(format!("//{text}"))
+        if path.is_empty() {
+            PathBuf::from(format!("//{host}"))
+        } else {
+            PathBuf::from(format!("//{host}/{path}"))
+        }
     }
+}
+
+/// Первые два байта — буква диска и двоеточие (`C:`).
+fn is_drive_prefix(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Percent-декодирование в байты: результат может быть не UTF-8.
@@ -320,6 +364,38 @@ mod tests {
             PathBuf::from("//server/share/a.mp4")
         };
         assert_eq!(source, Source::File(expected));
+    }
+
+    #[test]
+    fn file_url_without_three_slashes_points_to_a_drive() {
+        let expected = Source::File(PathBuf::from("D:/video/movie.mp4"));
+
+        for text in [
+            "file:///D:/video/movie.mp4",
+            "file://D:/video/movie.mp4",
+            "file:/D:/video/movie.mp4",
+            "file:D:/video/movie.mp4",
+        ] {
+            assert_eq!(Source::parse(text).expect("file:"), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn file_url_with_localhost_is_local() {
+        assert_eq!(
+            Source::parse("file://localhost/D:/video/movie.mp4").expect("localhost"),
+            Source::File(PathBuf::from("D:/video/movie.mp4"))
+        );
+        assert_eq!(
+            Source::parse("file://LOCALHOST/home/user/a.mp4").expect("localhost"),
+            Source::File(PathBuf::from("/home/user/a.mp4"))
+        );
+    }
+
+    #[test]
+    fn from_os_string_recognizes_a_file_url_without_slashes() {
+        let source = Source::from_os_string(OsString::from("file:D:/video.mp4")).expect("file:");
+        assert_eq!(source, Source::File(PathBuf::from("D:/video.mp4")));
     }
 
     #[test]

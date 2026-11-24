@@ -16,6 +16,7 @@ use gpui::{
 
 use crate::VideoPlayer;
 use crate::icons::{ICON_SIZE, Icon, icon};
+use crate::theme;
 use crate::video_player::PlaybackState;
 
 /// Высота полосы слайдера: вся область клика, а не только видимая линия.
@@ -23,14 +24,19 @@ const SLIDER_HEIGHT: f32 = 18.0;
 /// Толщина видимой линии слайдера.
 const SLIDER_TRACK_HEIGHT: f32 = 4.0;
 
-/// Ширина регулятора громкости.
+/// Ширина регулятора громкости в выдвижной панели.
 const VOLUME_SLIDER_WIDTH: f32 = 120.0;
 
-/// Ширина подсказки с процентом громкости.
-///
-/// Фиксированная, чтобы её можно было центрировать под курсором без
-/// измерения текста: `100%` и `9%` не должны менять точку привязки.
-const VOLUME_HINT_WIDTH: f32 = 44.0;
+/// Минимальная ширина таймлайна: даже в самом узком окне по нему можно
+/// попасть мышью.
+const MIN_PROGRESS_WIDTH: f32 = 120.0;
+
+/// Диаметр бегунка ползунка громкости.
+const KNOB_SIZE: f32 = 12.0;
+
+/// Насколько выдвижная панель громкости поднята над рядом кнопок:
+/// высота кнопки (20 + 2×4) плюс зазор.
+const VOLUME_PANEL_OFFSET: f32 = 36.0;
 
 /// Чем отличается полоса прогресса от регулятора громкости.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +124,17 @@ fn progress_enabled(state: PlaybackState, seekable: bool, duration: Option<Durat
 /// Если панелей нужно несколько, им понадобятся разные `ElementId`; сейчас
 /// предполагается одна панель на плеер.
 pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
-    let (state, volume, muted, position, duration, fullscreen, volume_hover, seekable) = {
+    let (
+        state,
+        volume,
+        muted,
+        position,
+        duration,
+        fullscreen,
+        volume_hover,
+        seekable,
+        volume_panel_open,
+    ) = {
         let video = player.read(cx);
         (
             video.state(),
@@ -129,6 +145,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             video.fullscreen(),
             video.volume_hover(),
             video.seekable(),
+            video.volume_panel_open(),
         )
     };
     // Пока источник открывается, управление не действует: `Play`, `Seek` и
@@ -149,11 +166,15 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         _ => (Icon::Play, "Воспроизвести"),
     };
 
-    let mute_target = player.clone();
-    let (mute_icon, mute_label) = if muted {
-        (Icon::Mute, "Включить звук")
+    // Значок отражает mute, но кнопка в панели открывает регулятор:
+    // сам mute живёт внутри выдвижной панели.
+    let volume_icon = if muted { Icon::Mute } else { Icon::Volume };
+
+    let volume_target = player.clone();
+    let volume_label = if muted {
+        "Громкость: звук выключен"
     } else {
-        (Icon::Volume, "Выключить звук")
+        "Громкость"
     };
 
     let fullscreen_target = player.clone();
@@ -163,30 +184,28 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         (Icon::Fullscreen, "Полный экран")
     };
 
-    let mut volume_control = div().relative().w(px(VOLUME_SLIDER_WIDTH)).child(slider(
-        "vgpu-volume",
-        effective_volume,
-        player,
-        SliderKind::Volume,
-        true,
-    ));
-
-    // Процент — только по наведению: постоянная надпись отнимала место у
-    // кнопки fullscreen и обновлялась вслепую.
-    if let Some(ratio) = volume_hover {
-        volume_control = volume_control.child(volume_hint(volume_percent(ratio), ratio));
-    }
+    let volume_popup = volume_panel_open.then(|| {
+        volume_panel(
+            player,
+            effective_volume,
+            volume_hover.unwrap_or(effective_volume),
+            muted,
+        )
+    });
 
     let play_button = icon_button(
         "vgpu-play-pause",
         play_pause_icon,
         play_pause_label,
-        gpui::rgb(0xee_ee_ee),
-        gpui::rgb(0x11_11_11),
+        gpui::rgb(theme::ACCENT),
+        gpui::rgb(theme::TEXT),
         move |_, cx| {
-            play_pause_target.update(cx, |video, cx| match play_action(video.state()) {
-                PlayAction::OpenFile => video.open_dialog(cx),
-                PlayAction::TogglePlayback => video.toggle_playback(cx),
+            play_pause_target.update(cx, |video, cx| {
+                video.close_volume_panel(cx);
+                match play_action(video.state()) {
+                    PlayAction::OpenFile => video.open_dialog(cx),
+                    PlayAction::TogglePlayback => video.toggle_playback(cx),
+                }
             })
         },
     );
@@ -196,10 +215,11 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         play_button
     };
 
-    div()
+    let row = div()
         .flex()
         .items_center()
         .gap_4()
+        .w_full()
         .child(play_button)
         .child(
             slider(
@@ -209,60 +229,112 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
                 SliderKind::Progress,
                 progress_enabled(state, seekable, duration),
             )
-            .flex_1(),
+            .flex_1()
+            .min_w(px(MIN_PROGRESS_WIDTH)),
         )
         .child(div().text_sm().child(time_text))
         .child(icon_button(
-            "vgpu-mute",
-            mute_icon,
-            mute_label,
-            gpui::rgb(0x44_44_44),
-            gpui::rgb(0xee_ee_ee),
-            move |_, cx| mute_target.update(cx, |video, cx| video.toggle_mute(cx)),
+            "vgpu-volume-toggle",
+            volume_icon,
+            volume_label,
+            gpui::rgb(theme::RAISED),
+            gpui::rgb(theme::TEXT),
+            move |_, cx| {
+                volume_target.update(cx, |video, cx| video.toggle_volume_panel(cx));
+            },
         ))
-        .child(volume_control)
         .child(icon_button(
             "vgpu-fullscreen",
             fullscreen_icon,
             fullscreen_label,
-            gpui::rgb(0x44_44_44),
-            gpui::rgb(0xee_ee_ee),
+            gpui::rgb(theme::RAISED),
+            gpui::rgb(theme::TEXT),
             move |window, cx| {
                 // Платформа переключает режим асинхронно, поэтому иконку
                 // обновляем сразу по ожидаемому состоянию, а точное значение
                 // подтянет `PlayerWindow::render` из `Window::is_fullscreen`.
                 window.toggle_fullscreen();
                 let target = !fullscreen;
-                fullscreen_target.update(cx, |video, cx| video.set_fullscreen(target, cx));
+                fullscreen_target.update(cx, |video, cx| {
+                    video.close_volume_panel(cx);
+                    video.set_fullscreen(target, cx);
+                });
             },
-        ))
+        ));
+
+    // Обёртка нужна ради выдвижной панели: она лежит над рядом кнопок и не
+    // сдвигает ни кадр, ни панель управления.
+    let mut root = div().relative().child(row);
+    if let Some(popup) = volume_popup {
+        root = root.child(popup);
+    }
+    root
 }
 
-/// Подсказка над ползунком громкости: процент под курсором.
+/// Выдвижная панель громкости над рядом кнопок.
 ///
-/// Лежит абсолютно над слайдером и не участвует в раскладке: появление и
-/// исчезновение подсказки не сдвигает ни панель, ни кадр. По горизонтали
-/// подсказка идёт за курсором (`ratio` — доля ширины ползунка), поэтому
-/// видно, к какому значению относится процент.
-fn volume_hint(percent: i64, ratio: f32) -> Div {
-    div()
-        .absolute()
-        .left(px(volume_hint_left(ratio)))
-        .bottom(px(SLIDER_HEIGHT + 6.0))
-        .w(px(VOLUME_HINT_WIDTH))
-        .flex()
-        .justify_center()
-        .py_1()
-        .rounded_sm()
-        .bg(gpui::rgba(0x22_22_22_ee))
-        .text_xs()
-        .child(format!("{percent}%"))
-}
+/// Открывается значком динамика. Внутри — тот же значок для mute (клик
+/// выставляет 0 %) и ползунок с бегунком; справа — процент, который на
+/// наведении показывает значение под курсором.
+fn volume_panel(
+    player: &Entity<VideoPlayer>,
+    volume: f32,
+    shown: f32,
+    muted: bool,
+) -> Stateful<Div> {
+    let mute_target = player.clone();
+    let (mute_icon, mute_label) = if muted {
+        (Icon::Mute, "Включить звук")
+    } else {
+        (Icon::Volume, "Выключить звук")
+    };
 
-/// Левый край подсказки: центр над курсором, но без выхода за ползунок.
-fn volume_hint_left(ratio: f32) -> f32 {
-    (ratio.clamp(0.0, 1.0) * VOLUME_SLIDER_WIDTH - VOLUME_HINT_WIDTH / 2.0)
-        .clamp(0.0, VOLUME_SLIDER_WIDTH - VOLUME_HINT_WIDTH)
+    div()
+        .id("vgpu-volume-panel")
+        .absolute()
+        .right(px(0.0))
+        .bottom(px(VOLUME_PANEL_OFFSET))
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(gpui::rgb(theme::BORDER))
+        .bg(gpui::rgb(theme::SURFACE))
+        // Панель лежит поверх области кадра: не даём нажатию всплыть
+        // до «клик по кадру закрывает наложения».
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            div()
+                .id("vgpu-volume-mute")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(24.0))
+                .h(px(24.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .aria_label(mute_label)
+                .hover(|style| style.bg(gpui::rgb(theme::RAISED)))
+                .child(icon(mute_icon, ICON_SIZE, gpui::rgb(theme::TEXT)))
+                .on_click(move |_, _, cx| {
+                    mute_target.update(cx, |video, cx| video.toggle_mute(cx));
+                }),
+        )
+        .child(
+            slider("vgpu-volume", volume, player, SliderKind::Volume, true)
+                .w(px(VOLUME_SLIDER_WIDTH)),
+        )
+        .child(
+            div()
+                .w(px(30.0))
+                .flex()
+                .justify_end()
+                .text_sm()
+                .child(volume_percent(shown).to_string()),
+        )
 }
 
 /// Кнопка с иконкой вместо текста.
@@ -298,7 +370,7 @@ fn icon_button(
 /// `Seek` при отпускании: точная перемотка декодера не любит поток команд.
 ///
 /// У ползунка громкости дополнительно обновляется hover-процент и очищается
-/// при уходе курсора — по этому состоянию `controls_view` рисует подсказку.
+/// при уходе курсора — по нему панель показывает процент под курсором.
 fn slider(
     id: &'static str,
     ratio: f32,
@@ -344,61 +416,81 @@ fn slider(
         root.cursor_default()
     };
 
-    root.on_mouse_down(MouseButton::Left, move |event, _, cx: &mut App| {
-        if !enabled {
-            return;
-        }
-        click_entity.update(cx, |video, cx| down(video, event.position.x, cx));
-    })
-    .on_mouse_move(move |event, _, cx: &mut App| {
-        if !enabled {
-            return;
-        }
-        if event.dragging() {
-            drag_entity.update(cx, |video, cx| drag(video, event.position.x, cx));
-        }
-        if matches!(kind, SliderKind::Volume) {
-            hover_entity.update(cx, |video, cx| {
-                video.hover_volume_from_x(event.position.x, cx);
-            });
-        }
-    })
-    .on_hover(move |hovered, _, cx: &mut App| {
-        if !hovered && matches!(kind, SliderKind::Volume) {
-            hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
-        }
-    })
-    .on_mouse_up(MouseButton::Left, move |_, _, cx: &mut App| {
-        if enabled {
-            up_entity.update(cx, up);
-        }
-    })
-    .on_mouse_up_out(MouseButton::Left, move |_, _, cx: &mut App| {
-        if enabled {
-            up_out_entity.update(cx, up);
-        }
-    })
-    .child(
-        div()
-            .absolute()
-            .left_0()
-            .top(px(top))
-            .w_full()
-            .h(px(SLIDER_TRACK_HEIGHT))
-            .rounded_full()
-            .bg(gpui::rgb(0x44_44_44)),
-    )
-    .child(
-        div()
-            .absolute()
-            .left_0()
-            .top(px(top))
-            .w(relative(ratio))
-            .h(px(SLIDER_TRACK_HEIGHT))
-            .rounded_full()
-            .bg(gpui::rgb(0xee_ee_ee)),
-    )
-    .child(
+    root = root
+        .on_mouse_down(MouseButton::Left, move |event, _, cx: &mut App| {
+            if !enabled {
+                return;
+            }
+            click_entity.update(cx, |video, cx| down(video, event.position.x, cx));
+        })
+        .on_mouse_move(move |event, _, cx: &mut App| {
+            if !enabled {
+                return;
+            }
+            if event.dragging() {
+                drag_entity.update(cx, |video, cx| drag(video, event.position.x, cx));
+            }
+            if matches!(kind, SliderKind::Volume) {
+                hover_entity.update(cx, |video, cx| {
+                    video.hover_volume_from_x(event.position.x, cx);
+                });
+            }
+        })
+        .on_hover(move |hovered, _, cx: &mut App| {
+            if !hovered && matches!(kind, SliderKind::Volume) {
+                hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
+            }
+        })
+        .on_mouse_up(MouseButton::Left, move |_, _, cx: &mut App| {
+            if enabled {
+                up_entity.update(cx, up);
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_, _, cx: &mut App| {
+            if enabled {
+                up_out_entity.update(cx, up);
+            }
+        });
+
+    root = root
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .w_full()
+                .h(px(SLIDER_TRACK_HEIGHT))
+                .rounded_full()
+                .bg(gpui::rgb(theme::BORDER)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .w(relative(ratio))
+                .h(px(SLIDER_TRACK_HEIGHT))
+                .rounded_full()
+                .bg(gpui::rgb(theme::ACCENT)),
+        );
+
+    if matches!(kind, SliderKind::Volume) {
+        // Бегунок центрирован над дорожкой; сдвиг на радиус компенсирует
+        // привязку `left` к левому краю кружка.
+        root = root.child(
+            div()
+                .absolute()
+                .left(relative(ratio))
+                .top(px((SLIDER_HEIGHT - KNOB_SIZE) / 2.0))
+                .ml(px(-KNOB_SIZE / 2.0))
+                .w(px(KNOB_SIZE))
+                .h(px(KNOB_SIZE))
+                .rounded_full()
+                .bg(gpui::rgb(theme::ACCENT)),
+        );
+    }
+
+    root.child(
         div().absolute().top_0().left_0().size_full().child(
             canvas(
                 move |bounds, _window, cx| {
@@ -447,24 +539,6 @@ mod tests {
         assert_eq!(volume_percent(1.0), 100);
         assert_eq!(volume_percent(1.5), 100);
         assert_eq!(volume_percent(-0.2), 0);
-    }
-
-    #[test]
-    fn volume_hint_follows_the_cursor_and_stays_on_the_slider() {
-        // Центр подсказки — над курсором.
-        assert!((volume_hint_left(0.5) - (60.0 - VOLUME_HINT_WIDTH / 2.0)).abs() < 0.01);
-        // Края прижаты, чтобы подсказка не вылезала за ползунок.
-        assert_eq!(volume_hint_left(0.0), 0.0);
-        assert_eq!(
-            volume_hint_left(1.0),
-            VOLUME_SLIDER_WIDTH - VOLUME_HINT_WIDTH
-        );
-        // Значения вне диапазона не ломают привязку.
-        assert_eq!(volume_hint_left(-1.0), 0.0);
-        assert_eq!(
-            volume_hint_left(2.0),
-            VOLUME_SLIDER_WIDTH - VOLUME_HINT_WIDTH
-        );
     }
 
     #[test]

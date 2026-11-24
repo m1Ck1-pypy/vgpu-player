@@ -26,6 +26,11 @@ installers: installer-inno installer-msi
 set-version version:
     @$v = "{{version}}"; if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { Write-Host "version must look like 1.2.3" -ForegroundColor Red; exit 1 }; $enc = [System.Text.UTF8Encoding]::new($false); function Save($p, $t) { [System.IO.File]::WriteAllText((Resolve-Path $p).Path, $t, $enc) }; $t = [System.IO.File]::ReadAllText('Cargo.toml'); $t = $t -replace '(?m)^(version = ")[^"]*(")(\r?)$', ('${1}' + $v + '${2}${3}'); Save 'Cargo.toml' $t; $t = [System.IO.File]::ReadAllText('installer/vgpu-player.iss'); $t = $t -replace '(?m)^([^\r\n]*MyAppVersion ")[^"]*(")(\r?)$', ('${1}' + $v + '${2}${3}'); Save 'installer/vgpu-player.iss' $t; $t = [System.IO.File]::ReadAllText('installer/vgpu-player.wxs'); $t = $t -replace '(?m)^(\s*Version=")[^"]*(")', ('${1}' + $v + '${2}'); Save 'installer/vgpu-player.wxs' $t; $t = [System.IO.File]::ReadAllText('README.md'); $t = $t -replace '(Версия )\d+\.\d+\.\d+', ('${1}' + $v); $t = $t -replace '(vgpu-player-)\d+\.\d+\.\d+', ('${1}' + $v); Save 'README.md' $t; $t = [System.IO.File]::ReadAllText('crates/player-gpui/README.md'); $t = $t -replace '(v)\d+\.\d+\.\d+', ('${1}' + $v); Save 'crates/player-gpui/README.md' $t; cargo update -w; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Host "version -> $v (docs/ update manually)"
 
+# Закоммитить все изменения: just commit "feat: ..."
+commit message:
+    git add -A
+    git commit -m "{{message}}"
+
 # Создать аннотированный тег v<версия из Cargo.toml>; пуш — отдельной командой.
 tag:
     @$version = ((Select-String -Path Cargo.toml -Pattern '^version = "(?<v>\d+\.\d+\.\d+[^"]*)"' | Select-Object -First 1).Matches[0].Groups['v'].Value); if (-not $version) { Write-Host "cannot read version from Cargo.toml" -ForegroundColor Red; exit 1 }; if (git rev-parse -q --verify "refs/tags/v$version") { Write-Host "tag v$version already exists" -ForegroundColor Red; exit 1 }; if (git status --porcelain) { Write-Host "working tree is dirty: commit changes before tagging" -ForegroundColor Red; exit 1 }; git tag -a "v$version" -m "vgpu-player $version"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Host "created v$version; push: just gp $version"

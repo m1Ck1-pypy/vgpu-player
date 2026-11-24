@@ -19,6 +19,7 @@ use player_core::{SpectrumBars, SyncStats};
 
 use crate::VideoPlayer;
 use crate::icons::{Icon, LARGE_ICON_SIZE, icon};
+use crate::theme;
 use crate::video_player::PlaybackState;
 
 /// Отступы и пропорции визуализатора звука.
@@ -30,8 +31,8 @@ const SPECTRUM_GAP: f32 = 2.0;
 const SPECTRUM_MIN_BAR: f32 = 0.035;
 
 /// Цвета столбиков взятые с иконки приложения: оранжевый низ, жёлтый верх.
-const BAR_LOW_COLOR: u32 = 0xef_8a_2e;
-const BAR_HIGH_COLOR: u32 = 0xff_d9_3d;
+const BAR_LOW_COLOR: u32 = theme::ACCENT;
+const BAR_HIGH_COLOR: u32 = theme::HIGHLIGHT;
 
 /// Что делает кнопка под сообщением о конце или ошибке.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +83,8 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         .items_center()
         .justify_center()
         .gap_2()
-        .bg(gpui::black())
-        .text_color(gpui::white());
+        .bg(gpui::rgb(theme::BACKGROUND))
+        .text_color(gpui::rgb(theme::TEXT));
 
     // Файл без видео: кадра не будет никогда, поэтому вместо чёрного поля —
     // спектроанализатор. Состояния `Idle` и `Failed` остаются текстовыми.
@@ -127,7 +128,7 @@ pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
                 .px_2()
                 .py_1()
                 .rounded_sm()
-                .bg(gpui::rgba(0x00_00_00_99))
+                .bg(gpui::rgba(theme::OVERLAY_BG))
                 .text_xs()
                 .flex()
                 .flex_col();
@@ -218,7 +219,8 @@ fn live_badge() -> Div {
         .px_2()
         .py_1()
         .rounded_sm()
-        .bg(gpui::rgb(0xcc_2b_2b))
+        .bg(gpui::rgb(theme::HIGHLIGHT))
+        .text_color(gpui::rgb(theme::ON_ACCENT))
         .text_xs()
         .child("LIVE")
 }
@@ -237,7 +239,7 @@ fn buffering_overlay() -> Div {
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .bg(gpui::rgba(0x00_00_00_cc))
+                .bg(gpui::rgba(theme::OVERLAY_BG))
                 .text_sm()
                 .child("Буферизация…"),
         )
@@ -303,10 +305,10 @@ fn action_button(id: &'static str, action: Action, player: &Entity<VideoPlayer>)
         .w(px(56.0))
         .h(px(56.0))
         .rounded_full()
-        .bg(gpui::rgb(0xee_ee_ee))
+        .bg(gpui::rgb(theme::ACCENT))
         .cursor_pointer()
         .aria_label("Повторить")
-        .child(icon(Icon::Replay, LARGE_ICON_SIZE, gpui::rgb(0x11_11_11)))
+        .child(icon(Icon::Replay, LARGE_ICON_SIZE, gpui::rgb(theme::TEXT)))
         .on_click(move |_, _, cx: &mut App| {
             // Кнопка лежит внутри области клика по кадру: не даём клику
             // «Повторить» всплыть и переключить воспроизведение ещё раз.
@@ -409,16 +411,19 @@ fn fit_rect(bounds: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels> {
 /// «готов к воспроизведению».
 fn describe(state: PlaybackState, error: Option<&str>) -> Option<(SharedString, SharedString)> {
     match state {
-        PlaybackState::Idle => Some(("видео не открыто".into(), "player-gpui <file>".into())),
+        PlaybackState::Idle => Some((
+            "Перетащите видео или откройте через меню".into(),
+            "В консоле: gpui <file>".into(),
+        )),
         PlaybackState::Loading => Some(("Загрузка…".into(), "".into())),
         PlaybackState::Ready | PlaybackState::Paused => None,
-        PlaybackState::Playing => Some(("воспроизведение".into(), "ожидание первого кадра".into())),
+        PlaybackState::Playing => Some(("Воспроизведение".into(), "ожидание первого кадра".into())),
         PlaybackState::Ended => Some((
-            "воспроизведение завершено".into(),
+            "Воспроизведение завершено".into(),
             "нажмите «Повторить», чтобы начать заново".into(),
         )),
         PlaybackState::Failed => Some((
-            "ошибка".into(),
+            "Ошибка".into(),
             error.unwrap_or("неизвестная ошибка").to_owned().into(),
         )),
     }
@@ -554,7 +559,7 @@ mod tests {
     fn failed_state_shows_the_error_text() {
         let (title, detail) = describe(PlaybackState::Failed, Some("формат не поддерживается"))
             .expect("у ошибки есть текст");
-        assert_eq!(title, "ошибка");
+        assert_eq!(title, "Ошибка");
         assert_eq!(detail, "формат не поддерживается");
     }
 
@@ -567,7 +572,7 @@ mod tests {
     #[test]
     fn ended_state_offers_a_restart() {
         let (title, detail) = describe(PlaybackState::Ended, None).expect("конец файла — текст");
-        assert_eq!(title, "воспроизведение завершено");
+        assert_eq!(title, "Воспроизведение завершено");
         assert!(detail.contains("Повторить"));
     }
 
