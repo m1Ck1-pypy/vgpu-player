@@ -13,8 +13,8 @@ use gpui::{
     PathPromptOptions, Pixels, Size, Task, WeakEntity, Window, point, size,
 };
 use player_core::{
-    Command, Event, MediaInfo, Player, Source, SpectrumBars, SyncStats, VideoFrame, VideoInfo,
-    preview_frame,
+    Command, Event, HttpOptions, MediaInfo, Player, Source, SpectrumBars, SyncStats, VideoFrame,
+    VideoInfo, preview_frame,
 };
 use tracing::{debug, error, info};
 
@@ -95,6 +95,8 @@ pub struct VideoPlayer {
     core: Option<Player>,
     /// Источник, который открыт или который не удалось открыть (для повтора).
     source: Option<Source>,
+    /// Заголовки HTTP для стартового источника и всех переоткрытий.
+    http: HttpOptions,
     state: PlaybackState,
     volume: f32,
     duration: Option<Duration>,
@@ -155,6 +157,7 @@ impl VideoPlayer {
         Self {
             core: None,
             source: None,
+            http: HttpOptions::default(),
             state: PlaybackState::Idle,
             volume: 1.0,
             duration: None,
@@ -198,14 +201,40 @@ impl VideoPlayer {
         })
     }
 
+    /// Создаёт сущность с открытым источником и заголовками HTTP.
+    pub fn create_with_options(
+        source: impl Into<Source>,
+        http: HttpOptions,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let source = source.into();
+        cx.new(|cx| {
+            let mut player = Self::new(cx);
+            player.open_with_options(source, http, cx);
+            player
+        })
+    }
+
+    /// Открывает (или меняет) источник с заголовками по умолчанию.
+    pub fn open(&mut self, source: impl Into<Source>, cx: &mut Context<Self>) {
+        let http = self.http.clone();
+        self.open_with_options(source, http, cx);
+    }
+
     /// Открывает (или меняет) источник и сразу начинает воспроизведение.
     ///
-    /// Источник запоминается в любом случае: после ошибки пользователь может
-    /// повторить открытие той же кнопкой, не вызывая диалог.
-    pub fn open(&mut self, source: impl Into<Source>, cx: &mut Context<Self>) {
+    /// Источник и заголовки запоминаются в любом случае: после ошибки
+    /// пользователь может повторить открытие той же кнопкой, не вызывая диалог.
+    pub fn open_with_options(
+        &mut self,
+        source: impl Into<Source>,
+        http: HttpOptions,
+        cx: &mut Context<Self>,
+    ) {
         let source = source.into();
         info!(source = %source, "UI открывает источник");
         self.source = Some(source.clone());
+        self.http = http;
 
         // Новая попытка: старые метаданные и кадр больше не относятся к файлу.
         // `reset_video` ещё видит прежнее ядро и возвращает ему буфер.
@@ -222,11 +251,16 @@ impl VideoPlayer {
         self.error = None;
         self.state = PlaybackState::Loading;
 
-        // Одно ядро на плеер: живой поток получает `Command::Open`, а новый
-        // создаётся только если ядра ещё нет или предыдущее уже завершилось.
+        // Одно ядро на плеер: живой поток получает `Command::OpenWith`, а
+        // новый создаётся только если ядра ещё нет или предыдущее завершилось.
         let mut reused = false;
         if let Some(core) = self.core.as_ref()
-            && core.send(Command::Open(source.clone())).is_ok()
+            && core
+                .send(Command::OpenWith {
+                    source: source.clone(),
+                    http: self.http.clone(),
+                })
+                .is_ok()
         {
             reused = true;
         }
@@ -234,7 +268,7 @@ impl VideoPlayer {
         if !reused {
             // Старое ядро мертво (или его не было): его `Drop` взведёт отмену.
             self.core = None;
-            match Player::open(source.clone()) {
+            match Player::open_with_options(source.clone(), self.http.clone()) {
                 Ok(core) => {
                     info!(source = %source, "поток ядра запущен");
                     self.core = Some(core);

@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use ureq::http::{HeaderName, HeaderValue};
+
 use crate::cache::{Cache, CacheConfig, CacheCounters, CacheCursor, FetchError};
+use crate::http_options::HttpOptions;
 use crate::reader::MediaReader;
 use crate::sync::NetworkStats;
 use crate::{PlayerError, Source};
@@ -45,7 +48,7 @@ const RETRY_DELAYS: [Duration; 4] = [
 const RESUME_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// Настройки HTTP-источника.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HttpConfig {
     /// Таймаут на DNS и соединение.
     pub(crate) connect_timeout: Duration,
@@ -63,6 +66,8 @@ pub(crate) struct HttpConfig {
     pub(crate) cache: CacheConfig,
     /// До какой позиции можно перезапускать поток без `Range`.
     pub(crate) resume_limit: u64,
+    /// Эффективные заголовки: дефолты и значения `HttpOptions`.
+    headers: Arc<[(HeaderName, HeaderValue)]>,
 }
 
 impl Default for HttpConfig {
@@ -76,8 +81,54 @@ impl Default for HttpConfig {
             max_redirects: MAX_REDIRECTS,
             cache: CacheConfig::default(),
             resume_limit: RESUME_LIMIT,
+            headers: Arc::from(default_headers()),
         }
     }
+}
+
+impl HttpConfig {
+    /// Настройки с пользовательскими заголовками поверх дефолтов.
+    ///
+    /// Заголовок с тем же именем заменяет дефолт, порядок остальных
+    /// сохраняется: `Range` и одноразовые заголовки добавляются позже.
+    pub(crate) fn with_http(options: &HttpOptions) -> Self {
+        let mut headers = default_headers();
+        for (name, value) in options.headers() {
+            if let Some(existing) = headers.iter_mut().find(|(existing, _)| existing == name) {
+                *existing = (name.clone(), value.clone());
+            } else {
+                headers.push((name.clone(), value.clone()));
+            }
+        }
+
+        Self {
+            headers: Arc::from(headers),
+            ..Self::default()
+        }
+    }
+
+    /// Заголовки, которые видит каждый запрос источника.
+    pub(crate) fn headers(&self) -> &[(HeaderName, HeaderValue)] {
+        &self.headers
+    }
+}
+
+/// `User-Agent`, `Accept` и `Accept-Encoding` по умолчанию.
+fn default_headers() -> Vec<(HeaderName, HeaderValue)> {
+    let user_agent = HeaderValue::from_str(concat!("vgpu-player/", env!("CARGO_PKG_VERSION")))
+        .expect("версия пакета — допустимый User-Agent");
+
+    vec![
+        (HeaderName::from_static("user-agent"), user_agent),
+        (
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("*/*"),
+        ),
+        (
+            HeaderName::from_static("accept-encoding"),
+            HeaderValue::from_static("identity"),
+        ),
+    ]
 }
 
 /// Агент с явным native-tls и корнями платформы.
@@ -89,6 +140,27 @@ fn tls_config() -> ureq::tls::TlsConfig {
         .provider(ureq::tls::TlsProvider::NativeTls)
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .build()
+}
+
+/// Запрос `GET` с общими заголовками источника и одноразовыми `extra`.
+///
+/// Заголовки ставятся на каждый запрос, включая повторы: сервер может
+/// проверять `Referer`/`User-Agent` не только у плейлиста, но и у каждого
+/// сегмента.
+pub(crate) fn get(
+    agent: &ureq::Agent,
+    config: &HttpConfig,
+    url: &str,
+    extra: &[(&str, &str)],
+) -> Result<ureq::http::Response<ureq::Body>, HttpError> {
+    let mut request = agent.get(url);
+    for (name, value) in config.headers() {
+        request = request.header(name.as_str(), value.clone());
+    }
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    request.call().map_err(request_error)
 }
 
 /// Собирает агент с таймаутами и следованием редиректам.
@@ -245,11 +317,7 @@ impl HttpSource {
                 return Err(HttpError::cancelled());
             }
             counters.add_request();
-            let response = agent
-                .get(url)
-                .header("Range", "bytes=0-0")
-                .call()
-                .map_err(request_error)?;
+            let response = get(&agent, &config, url, &[("Range", "bytes=0-0")])?;
             let status = response.status().as_u16();
             if status != 200 && status != 206 {
                 return Err(status_error(status));
@@ -290,6 +358,7 @@ impl HttpSource {
             return Err(HttpFailure::Empty.into_player_error(source));
         }
 
+        let cache_config = config.cache;
         let loader = HttpLoader {
             agent,
             config,
@@ -305,7 +374,7 @@ impl HttpSource {
             },
         };
         let cache = Cache::start(
-            config.cache,
+            cache_config,
             len,
             Arc::clone(&counters),
             move |offset, want, abort| loader.fetch(offset, want, abort),
@@ -453,7 +522,7 @@ impl HttpLoader {
             if stop() {
                 return Err(HttpError::cancelled());
             }
-            let response = self.agent.get(&self.url).call().map_err(request_error)?;
+            let response = get(&self.agent, &self.config, &self.url, &[])?;
             let status = response.status().as_u16();
             if status != 200 {
                 return Err(status_error(status));
@@ -609,11 +678,7 @@ fn fetch_range(
         if stop() {
             return Err(HttpError::cancelled());
         }
-        let response = agent
-            .get(url)
-            .header("Range", &range)
-            .call()
-            .map_err(request_error)?;
+        let response = get(agent, config, url, &[("Range", range.as_str())])?;
 
         let status = response.status().as_u16();
         if status == 200 {
@@ -786,6 +851,20 @@ pub(crate) mod test_support {
         name: &'static str,
         honor_range: bool,
     ) -> ServedFile {
+        serve_requiring(bytes, content_type, name, honor_range, &[])
+    }
+
+    /// То же, но без обязательных заголовков отвечает `403`.
+    ///
+    /// Нужен сквозным тестам `Referer`/`User-Agent`: проверяем не только то,
+    /// что клиент отправляет заголовки, но и что сервер без них отказывает.
+    pub(crate) fn serve_requiring(
+        bytes: Vec<u8>,
+        content_type: &'static str,
+        name: &'static str,
+        honor_range: bool,
+        required: &'static [(&'static str, &'static str)],
+    ) -> ServedFile {
         let server = Server::http("127.0.0.1:0").expect("тестовый сервер");
         let address = server.server_addr().to_ip().expect("ip-адрес");
         let url = format!("http://{address}/{name}");
@@ -795,7 +874,9 @@ pub(crate) mod test_support {
                 let body = bytes.clone();
                 // Соединение без `Range` держит тело открытым; обработчик
                 // должен принимать следующий запрос параллельно.
-                std::thread::spawn(move || respond(request, body, content_type, honor_range));
+                std::thread::spawn(move || {
+                    respond(request, body, content_type, honor_range, required)
+                });
             }
         });
 
@@ -810,7 +891,19 @@ pub(crate) mod test_support {
         bytes: Vec<u8>,
         content_type: &'static str,
         honor_range: bool,
+        required: &'static [(&'static str, &'static str)],
     ) {
+        let authorized = required.iter().all(|(name, value)| {
+            request
+                .headers()
+                .iter()
+                .any(|header| header.field.equiv(name) && header.value.as_str() == *value)
+        });
+        if !authorized {
+            let _ = request.respond(Response::empty(StatusCode(403)));
+            return;
+        }
+
         let header = |name: &str, value: &str| {
             Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("заголовок")
         };
@@ -891,6 +984,10 @@ mod tests {
     }
 
     fn test_config() -> HttpConfig {
+        test_config_with(&HttpOptions::default())
+    }
+
+    fn test_config_with(options: &HttpOptions) -> HttpConfig {
         HttpConfig {
             cache: CacheConfig {
                 block: TEST_WINDOW,
@@ -902,12 +999,16 @@ mod tests {
             idle_timeout: Duration::from_millis(500),
             retry_delays: [Duration::from_millis(1); 4],
             resume_limit: 4096,
-            ..HttpConfig::default()
+            ..HttpConfig::with_http(options)
         }
     }
 
     fn open_test(source: &Source) -> Result<HttpReader, PlayerError> {
-        HttpReader::open(source, test_config(), Arc::new(AtomicBool::new(false)))
+        open_test_with(source, test_config())
+    }
+
+    fn open_test_with(source: &Source, config: HttpConfig) -> Result<HttpReader, PlayerError> {
+        HttpReader::open(source, config, Arc::new(AtomicBool::new(false)))
     }
 
     fn http_header(name: &str, value: &str) -> Header {
@@ -964,6 +1065,27 @@ mod tests {
             .map(|header| header.value.as_str().to_owned());
         history.push(range.clone());
         range
+    }
+
+    /// Все заголовки запроса в нижнем регистре имён.
+    fn request_headers(request: &tiny_http::Request) -> Vec<(String, String)> {
+        request
+            .headers()
+            .iter()
+            .map(|header| {
+                (
+                    header.field.to_string().to_ascii_lowercase(),
+                    header.value.as_str().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn seen_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     fn parse_range(value: &str) -> Option<(usize, usize)> {
@@ -1106,6 +1228,122 @@ mod tests {
             history.iter().skip(1).any(|range| range.is_none()),
             "без Range должны быть запросы без заголовка: {history:?}"
         );
+    }
+
+    #[test]
+    fn source_headers_reach_the_probe_and_range_blocks() {
+        let data = pattern(2 * TEST_WINDOW);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let body = data.clone();
+        let recorder = Arc::clone(&seen);
+        let server = spawn(Arc::clone(&ranges), move |request, history| {
+            recorder
+                .lock()
+                .expect("история заголовков")
+                .push(request_headers(request));
+            ranged(request, history, &body, true)
+        });
+
+        let options = HttpOptions::new()
+            .with_referer("https://rutube.ru/")
+            .expect("Referer")
+            .with_user_agent("Mozilla/5.0")
+            .expect("User-Agent");
+        let source = Source::Url(server.base.clone());
+        let mut reader = open_test_with(&source, test_config_with(&options)).expect("открыть URL");
+        let mut block = vec![0_u8; TEST_WINDOW];
+        reader.read_exact(&mut block).expect("первый блок");
+
+        let requests = seen.lock().expect("история заголовков");
+        assert!(requests.len() >= 2, "probe и блок: {requests:?}");
+        for headers in requests.iter() {
+            assert_eq!(seen_header(headers, "referer"), Some("https://rutube.ru/"));
+            assert_eq!(seen_header(headers, "user-agent"), Some("Mozilla/5.0"));
+        }
+        assert_eq!(
+            seen_header(&requests[0], "range"),
+            Some("bytes=0-0"),
+            "probe просит один байт"
+        );
+        assert!(
+            requests
+                .iter()
+                .skip(1)
+                .any(|headers| seen_header(headers, "range").is_some()),
+            "Range-блок не должен терять Range: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn default_headers_are_sent_without_options() {
+        let data = pattern(TEST_WINDOW);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let body = data.clone();
+        let recorder = Arc::clone(&seen);
+        let server = spawn(Arc::clone(&ranges), move |request, history| {
+            recorder
+                .lock()
+                .expect("история заголовков")
+                .push(request_headers(request));
+            ranged(request, history, &body, true)
+        });
+
+        let source = Source::Url(server.base.clone());
+        let _reader = open_test(&source).expect("открыть URL");
+
+        let requests = seen.lock().expect("история заголовков");
+        let first = &requests[0];
+        assert_eq!(
+            seen_header(first, "user-agent"),
+            Some(concat!("vgpu-player/", env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(seen_header(first, "accept"), Some("*/*"));
+        assert_eq!(seen_header(first, "accept-encoding"), Some("identity"));
+        assert_eq!(seen_header(first, "range"), Some("bytes=0-0"));
+    }
+
+    #[test]
+    fn stream_requests_send_source_headers() {
+        let data = pattern(150 * 1024);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let body = data.clone();
+        let recorder = Arc::clone(&seen);
+        let server = spawn(Arc::clone(&ranges), move |request, history| {
+            recorder
+                .lock()
+                .expect("история заголовков")
+                .push(request_headers(request));
+            ranged(request, history, &body, false)
+        });
+
+        let options = HttpOptions::new()
+            .with_referer("https://rutube.ru/")
+            .expect("Referer")
+            .with_user_agent("Mozilla/5.0")
+            .expect("User-Agent");
+        let source = Source::Url(server.base.clone());
+        let mut reader = open_test_with(&source, test_config_with(&options)).expect("открыть URL");
+
+        let mut buffer = [0_u8; 10];
+        reader.read_exact(&mut buffer).expect("прочитать начало");
+        reader
+            .read_exact(&mut buffer)
+            .expect("прочитать после блока");
+
+        let requests = seen.lock().expect("история заголовков");
+        let stream_requests: Vec<_> = requests
+            .iter()
+            .skip(1)
+            .filter(|headers| seen_header(headers, "range").is_none())
+            .collect();
+        assert!(!stream_requests.is_empty(), "нужен запрос без Range");
+        for headers in stream_requests {
+            assert_eq!(seen_header(headers, "referer"), Some("https://rutube.ru/"));
+            assert_eq!(seen_header(headers, "user-agent"), Some("Mozilla/5.0"));
+        }
     }
 
     #[test]

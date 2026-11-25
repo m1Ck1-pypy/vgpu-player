@@ -16,6 +16,7 @@ use crate::PlayerError;
 use crate::audio::AudioDecoder;
 use crate::hls::HlsSource;
 use crate::http::{HttpConfig, HttpSource};
+use crate::http_options::HttpOptions;
 use crate::reader::SharedSource;
 use crate::source::Source as MediaSource;
 use crate::sync::NetworkStats;
@@ -55,8 +56,22 @@ impl Media {
     /// `cancel` уходит в сетевой читатель: он должен прервать блокирующее
     /// чтение при `Stop`/`Drop`. `cancelled` — более широкий признак, включая
     /// смену источника (`open_seq`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_with(
         source: &MediaSource,
+        cancel: Arc<AtomicBool>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, PlayerError> {
+        Self::open_with_http(source, &HttpOptions::default(), cancel, cancelled)
+    }
+
+    /// То же, но с заголовками HTTP-источника (`Referer`, `User-Agent`).
+    ///
+    /// Заголовки получают все запросы источника: probe, `Range`-блоки и
+    /// HLS-плейлисты с сегментами.
+    pub(crate) fn open_with_http(
+        source: &MediaSource,
+        http: &HttpOptions,
         cancel: Arc<AtomicBool>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, PlayerError> {
@@ -85,15 +100,16 @@ impl Media {
 
         // Сетевой источник открывается один раз: и звук, и видео читают из
         // общего кэша (или общего HLS-источника), а не качают каждый сам себе.
+        let config = HttpConfig::with_http(http);
         let shared = match source {
             MediaSource::Url(_) if source.is_hls() => Some(SharedSource::Hls(HlsSource::open(
                 source,
-                HttpConfig::default(),
+                config,
                 Arc::clone(&cancel),
             )?)),
             MediaSource::Url(_) => Some(SharedSource::Http(HttpSource::open(
                 source,
-                HttpConfig::default(),
+                config,
                 Arc::clone(&cancel),
             )?)),
             MediaSource::File(_) => None,

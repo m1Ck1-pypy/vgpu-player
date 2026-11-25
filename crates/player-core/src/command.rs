@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::Source;
+use crate::http_options::HttpOptions;
 
 /// Что UI может попросить у ядра.
 ///
@@ -14,7 +15,12 @@ use crate::Source;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Открыть файл или URL и подготовить дорожки.
+    ///
+    /// Заголовки HTTP-источника — значения по умолчанию; явные
+    /// `Referer`/`User-Agent` передаются в [`Command::OpenWith`].
     Open(Source),
+    /// Открыть источник с явными заголовками HTTP.
+    OpenWith { source: Source, http: HttpOptions },
     /// Продолжить воспроизведение.
     Play,
     /// Приостановить воспроизведение.

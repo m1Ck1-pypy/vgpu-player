@@ -17,7 +17,8 @@ use ffmpeg::util::frame::video::Video as FfmpegFrame;
 use ffmpeg::{Error as FfmpegError, Rational};
 use tracing::debug;
 
-use crate::http::HttpFailure;
+use crate::http::{HttpConfig, HttpFailure};
+use crate::http_options::HttpOptions;
 use crate::reader::SharedSource;
 use crate::{PlayerError, Source};
 
@@ -135,6 +136,18 @@ impl VideoDecoder {
         Self::open_source_with_cancel(source, Arc::new(AtomicBool::new(false)), None)
     }
 
+    /// Открывает источник с заголовками HTTP (`Referer`, `User-Agent`).
+    ///
+    /// Нужен режиму `--decode-frames`: там нет общего `SharedSource`, и
+    /// читатель открывает свой HTTP/HLS-источник.
+    pub fn open_source_with_options(
+        source: &Source,
+        http: HttpOptions,
+    ) -> Result<Self, PlayerError> {
+        let config = HttpConfig::with_http(&http);
+        Self::open_source_with_cancel_http(source, Arc::new(AtomicBool::new(false)), None, &config)
+    }
+
     /// Открывает источник с отменой сетевого читателя.
     ///
     /// `shared` — уже открытый сетевой источник: кэш у звука и видео общий.
@@ -142,6 +155,15 @@ impl VideoDecoder {
         source: &Source,
         reader_cancel: Arc<AtomicBool>,
         shared: Option<&SharedSource>,
+    ) -> Result<Self, PlayerError> {
+        Self::open_source_with_cancel_http(source, reader_cancel, shared, &HttpConfig::default())
+    }
+
+    fn open_source_with_cancel_http(
+        source: &Source,
+        reader_cancel: Arc<AtomicBool>,
+        shared: Option<&SharedSource>,
+        config: &HttpConfig,
     ) -> Result<Self, PlayerError> {
         // Локальный плейлист — не медиапоток: HLS в этапе 5 — только по URL.
         if matches!(source, Source::File(_)) && source.is_hls() {
@@ -153,8 +175,13 @@ impl VideoDecoder {
         init_ffmpeg(source)?;
 
         debug!("видео: открываем читатель");
-        let opened =
-            crate::reader::open_reader(source, crate::reader::Track::Video, reader_cancel, shared)?;
+        let opened = crate::reader::open_reader_with_http(
+            source,
+            crate::reader::Track::Video,
+            reader_cancel,
+            shared,
+            config,
+        )?;
         let seekable = opened.reader.is_seekable();
         let failure = opened.failure;
         let buffering = opened.buffering;

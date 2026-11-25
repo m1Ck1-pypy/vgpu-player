@@ -18,6 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::audio::AudioChunk;
 use crate::clock::AudioClock;
+use crate::http_options::HttpOptions;
 use crate::media::Media;
 use crate::player::{EngineMessage, TaggedFrame, return_buffer};
 use crate::source::Source as MediaSource;
@@ -72,12 +73,20 @@ const SPECTRUM_INTERVAL: Duration = Duration::from_millis(33);
 /// В обычной жизни это [`Media::open_with`]; тесты подменяют открытие, чтобы
 /// получить «медленный» источник без сети и без новых файлов.
 pub(crate) type Opener = Box<
-    dyn Fn(&MediaSource, Arc<AtomicBool>, &dyn Fn() -> bool) -> Result<Media, PlayerError> + Send,
+    dyn Fn(
+            &MediaSource,
+            &HttpOptions,
+            Arc<AtomicBool>,
+            &dyn Fn() -> bool,
+        ) -> Result<Media, PlayerError>
+        + Send,
 >;
 
 /// Состояние и цикл одного потока ядра.
 struct Engine<'a> {
     source: MediaSource,
+    /// Заголовки текущего открытия: `Open` сбрасывает их на дефолты.
+    http: HttpOptions,
     opener: Opener,
     /// Взводится при `Stop`, новом `Open` и уничтожении [`crate::Player`].
     cancel: Arc<AtomicBool>,
@@ -126,13 +135,14 @@ pub(crate) struct EngineChannels<'a> {
 /// Цикл потока ядра: команды, дозаправка очередей, конец файла, часы.
 pub(crate) fn run_engine(
     source: MediaSource,
+    http: HttpOptions,
     opener: Opener,
     cancel: Arc<AtomicBool>,
     open_seq: Arc<AtomicU64>,
     channels: EngineChannels<'_>,
 ) -> Result<(), PlayerError> {
     let commands = channels.commands;
-    let mut engine = Engine::new(source, opener, cancel, open_seq, channels);
+    let mut engine = Engine::new(source, http, opener, cancel, open_seq, channels);
 
     // Открытие не блокирует вызывающего: код `Player::open` уже вернулся.
     engine.open_current();
@@ -150,12 +160,15 @@ pub(crate) fn run_engine(
                     messages.push(next);
                 }
                 let messages = coalesce_seeks(messages);
+                let is_open = |command: &Command| {
+                    matches!(command, Command::Open(_) | Command::OpenWith { .. })
+                };
                 let last_open = messages
                     .iter()
-                    .rposition(|message| matches!(message.command, Command::Open(_)));
+                    .rposition(|message| is_open(&message.command));
 
                 for (index, message) in messages.into_iter().enumerate() {
-                    if matches!(message.command, Command::Open(_)) && Some(index) != last_open {
+                    if is_open(&message.command) && Some(index) != last_open {
                         debug!("открытие пропущено: в очереди есть более новый источник");
                         continue;
                     }
@@ -232,6 +245,7 @@ fn flush_seek_run(merged: &mut Vec<EngineMessage>, run: &mut Option<(bool, u64, 
 impl<'a> Engine<'a> {
     fn new(
         source: MediaSource,
+        http: HttpOptions,
         opener: Opener,
         cancel: Arc<AtomicBool>,
         open_seq: Arc<AtomicU64>,
@@ -245,6 +259,7 @@ impl<'a> Engine<'a> {
         } = channels;
         Self {
             source,
+            http,
             opener,
             cancel,
             open_seq,
@@ -292,7 +307,12 @@ impl<'a> Engine<'a> {
         let cancelled =
             || self.cancel.load(Ordering::SeqCst) || self.open_seq.load(Ordering::SeqCst) != seq;
 
-        match (self.opener)(&self.source, Arc::clone(&self.cancel), &cancelled) {
+        match (self.opener)(
+            &self.source,
+            &self.http,
+            Arc::clone(&self.cancel),
+            &cancelled,
+        ) {
             Ok(opened) => self.apply(opened),
             Err(PlayerError::Cancelled) => debug!("открытие отменено"),
             Err(error) => {
@@ -483,6 +503,16 @@ impl<'a> Engine<'a> {
                 }
                 info!(source = %source, "открытие нового источника");
                 self.source = source;
+                self.http = HttpOptions::default();
+                self.open_current();
+            }
+            Command::OpenWith { source, http } => {
+                if let Some(epoch) = epoch {
+                    self.frame_epoch = epoch;
+                }
+                info!(source = %source, "открытие нового источника с заголовками");
+                self.source = source;
+                self.http = http;
                 self.open_current();
             }
             Command::Stop => {

@@ -16,6 +16,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use tracing::error;
 
 use crate::engine::{EngineChannels, Opener, run_engine};
+use crate::http_options::HttpOptions;
 use crate::media::Media;
 use crate::source::Source as MediaSource;
 use crate::video::VideoFrame;
@@ -61,9 +62,24 @@ impl Player {
     /// запустить. Ошибка открытия не завершает поток: ядро продолжает
     /// принимать `Open` и `Stop`.
     pub fn open(source: impl Into<MediaSource>) -> Result<Self, PlayerError> {
+        Self::open_with_options(source, HttpOptions::default())
+    }
+
+    /// Открывает источник с заголовками HTTP (`Referer`, `User-Agent`).
+    ///
+    /// Заголовки получают все запросы источника; последующие переоткрытия
+    /// через [`Command::OpenWith`] могут задать свой набор, а
+    /// [`Command::Open`] возвращает значения по умолчанию.
+    pub fn open_with_options(
+        source: impl Into<MediaSource>,
+        http: HttpOptions,
+    ) -> Result<Self, PlayerError> {
         Self::spawn(
             source.into(),
-            Box::new(|source, cancel, cancelled| Media::open_with(source, cancel, cancelled)),
+            http,
+            Box::new(|source, http, cancel, cancelled| {
+                Media::open_with_http(source, http, cancel, cancelled)
+            }),
         )
     }
 
@@ -71,15 +87,18 @@ impl Player {
     #[cfg(test)]
     pub(crate) fn open_with(
         source: impl Into<MediaSource>,
-        opener: impl Fn(&MediaSource, &dyn Fn() -> bool) -> Result<Media, PlayerError> + Send + 'static,
+        opener: impl Fn(&MediaSource, &HttpOptions, &dyn Fn() -> bool) -> Result<Media, PlayerError>
+        + Send
+        + 'static,
     ) -> Result<Self, PlayerError> {
         Self::spawn(
             source.into(),
-            Box::new(move |source, _cancel, cancelled| opener(source, cancelled)),
+            HttpOptions::default(),
+            Box::new(move |source, http, _cancel, cancelled| opener(source, http, cancelled)),
         )
     }
 
-    fn spawn(source: MediaSource, opener: Opener) -> Result<Self, PlayerError> {
+    fn spawn(source: MediaSource, http: HttpOptions, opener: Opener) -> Result<Self, PlayerError> {
         let (command_sender, command_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
         let (frame_sender, frame_receiver) = bounded(QUEUED_FRAMES);
@@ -95,6 +114,7 @@ impl Player {
             .spawn(move || {
                 if let Err(error) = run_engine(
                     source,
+                    http,
                     opener,
                     engine_cancel,
                     engine_seq,
@@ -137,7 +157,7 @@ impl Player {
             Command::Seek(_) | Command::SeekRelative { .. } => {
                 Some(self.frame_epoch.fetch_add(1, Ordering::Relaxed) + 1)
             }
-            Command::Open(_) => {
+            Command::Open(_) | Command::OpenWith { .. } => {
                 self.open_seq.fetch_add(1, Ordering::SeqCst);
                 Some(self.frame_epoch.fetch_add(1, Ordering::Relaxed) + 1)
             }
@@ -242,6 +262,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    use crate::HttpOptions;
     use crate::MediaReady;
     use crate::video::test_support::{
         sample_audio, sample_av, sample_av1_video, sample_clip, sample_video, temp_path,
@@ -712,7 +733,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        let player = Player::open_with(&path, |source, cancelled| {
+        let player = Player::open_with(&path, |source, _http, cancelled| {
             std::thread::sleep(Duration::from_millis(300));
             if cancelled() {
                 return Err(PlayerError::Cancelled);
@@ -894,7 +915,7 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
-        let player = Player::open_with(&path, move |source, is_cancelled| {
+        let player = Player::open_with(&path, move |source, _http, is_cancelled| {
             std::thread::sleep(Duration::from_millis(300));
             if is_cancelled() {
                 flag.store(true, Ordering::SeqCst);
@@ -930,7 +951,7 @@ mod tests {
 
         let calls = Arc::new(AtomicU64::new(0));
         let counter = Arc::clone(&calls);
-        let player = Player::open_with(&path, move |source, is_cancelled| {
+        let player = Player::open_with(&path, move |source, _http, is_cancelled| {
             counter.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(200));
             if is_cancelled() {
@@ -973,7 +994,7 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
-        let player = Player::open_with(&path, move |source, is_cancelled| {
+        let player = Player::open_with(&path, move |source, _http, is_cancelled| {
             std::thread::sleep(Duration::from_millis(300));
             if is_cancelled() {
                 flag.store(true, Ordering::SeqCst);
@@ -989,6 +1010,105 @@ mod tests {
         assert!(
             cancelled.load(Ordering::SeqCst),
             "Drop должен отменить открытие"
+        );
+    }
+
+    #[test]
+    fn url_with_required_headers_plays_and_without_them_fails() {
+        let Some(path) = sample_video() else {
+            eprintln!("тестовое видео недоступно (нет ассета и системного ffmpeg) — пропускаем");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("прочитать тестовое видео");
+        let required: &'static [(&'static str, &'static str)] = &[
+            ("Referer", "https://rutube.ru/"),
+            ("User-Agent", "Mozilla/5.0"),
+        ];
+
+        let allowed = crate::http::test_support::serve_requiring(
+            bytes.clone(),
+            "video/mp4",
+            "video.mp4",
+            true,
+            required,
+        );
+        let options = HttpOptions::new()
+            .with_referer("https://rutube.ru/")
+            .expect("Referer")
+            .with_user_agent("Mozilla/5.0")
+            .expect("User-Agent");
+        let player = Player::open_with_options(MediaSource::Url(allowed.url.clone()), options)
+            .expect("поток должен запуститься");
+        let ready = wait_ready(&player);
+        assert!(ready.video_info.is_some(), "источник должен открыться");
+
+        let denied = crate::http::test_support::serve_requiring(
+            bytes,
+            "video/mp4",
+            "video.mp4",
+            true,
+            required,
+        );
+        let player = Player::open(MediaSource::Url(denied.url.clone()))
+            .expect("поток должен запуститься без заголовков");
+        let error = wait_event(&player, Duration::from_secs(5), |event| {
+            matches!(event, Event::Error(_))
+        });
+        let Some(Event::Error(message)) = error else {
+            panic!("без Referer сервер должен ответить 403");
+        };
+        assert!(message.contains("403"), "{message}");
+    }
+
+    fn wait_headers(seen: &Arc<std::sync::Mutex<Vec<HttpOptions>>>, expected: &HttpOptions) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if seen.lock().expect("история заголовков").last() == Some(expected) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("заголовки не дошли: {expected:?}");
+    }
+
+    #[test]
+    fn open_with_replaces_headers_and_open_resets_them() {
+        let Some(path) = sample_video() else {
+            eprintln!("тестовое видео недоступно (нет ассета и системного ffmpeg) — пропускаем");
+            return;
+        };
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let player = Player::open_with(
+            &path,
+            move |_source, http, _cancelled| -> Result<Media, PlayerError> {
+                sink.lock().expect("история заголовков").push(http.clone());
+                Err(PlayerError::Cancelled)
+            },
+        )
+        .expect("поток должен запуститься");
+
+        let options = HttpOptions::new()
+            .with_referer("https://rutube.ru/")
+            .expect("Referer");
+        player
+            .send(Command::OpenWith {
+                source: MediaSource::File(path.clone()),
+                http: options.clone(),
+            })
+            .expect("OpenWith");
+        wait_headers(&seen, &options);
+
+        player
+            .send(Command::Open(MediaSource::File(path)))
+            .expect("Open");
+        wait_headers(&seen, &HttpOptions::default());
+
+        assert_eq!(
+            seen.lock().expect("история заголовков").len(),
+            3,
+            "старт, OpenWith и сброс на дефолты"
         );
     }
 }

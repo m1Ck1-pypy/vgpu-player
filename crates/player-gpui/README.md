@@ -228,18 +228,21 @@ impl Screen {
 
 Функции и типы:
 
-| Экспорт                                         | Назначение                                                                                                   |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `video_view(&player, cx)`                       | кадр с letterbox, превью, оверлеем статистики и кнопкой «Повторить»; для файла без видео — спектроанализатор |
-| `controls_view(&player, cx)`                    | готовая панель с кнопками-иконками (включая fullscreen) и слайдерами                                         |
-| `run_app(Option<PathBuf>)`                      | готовое демо-окно — для бинарника и примеров                                                                 |
-| `run_app_source(Option<Source>)`                | то же, но источник — путь или URL                                                                            |
-| `Source`, `SourceError`                         | разбор строки на файл/URL (реэкспорт `player-core`)                                                          |
-| `PlaybackState`                                 | `Idle`, `Loading`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()`                           |
-| `SpectrumBars`, `SPECTRUM_BARS`                 | уровни визуализатора: 48 чисел `0…1`; `SpectrumBars::levels()`                                               |
-| `MediaInfo`, `VideoTrackInfo`, `AudioTrackInfo` | метаданные открытого файла: контейнер, кодеки, параметры дорожек                                             |
-| `LaunchError`, `WINDOW_TITLE`                   | ошибка запуска окна и заголовок демо-окна                                                                    |
-| `gpui`, `gpui_platform`                         | реэкспорт, чтобы у библиотеки и потребителя была одна версия GPUI                                            |
+| Экспорт                                              | Назначение                                                                                                   |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `video_view(&player, cx)`                            | кадр с letterbox, превью, оверлеем статистики и кнопкой «Повторить»; для файла без видео — спектроанализатор |
+| `controls_view(&player, cx)`                         | готовая панель с кнопками-иконками (включая fullscreen) и слайдерами                                         |
+| `run_app(Option<PathBuf>)`                           | готовое демо-окно — для бинарника и примеров                                                                 |
+| `run_app_source(Option<Source>)`                     | то же, но источник — путь или URL                                                                            |
+| `run_app_source_with(Option<Source>, PlayerOptions)` | то же плюс параметры, которые не берутся из `settings.cfg`                                                   |
+| `PlayerOptions`                                      | параметры запуска окна: `volume: Option<f32>` в `0…1` и `http: HttpOptions`; не сохраняются в `settings.cfg` |
+| `HttpOptions`, `HttpOptionsError`                    | заголовки HTTP-источника (`Referer`, `User-Agent`) для RuTube и подобных ссылок                              |
+| `Source`, `SourceError`                              | разбор строки на файл/URL (реэкспорт `player-core`)                                                          |
+| `PlaybackState`                                      | `Idle`, `Loading`, `Ready`, `Playing`, `Paused`, `Ended`, `Failed`; `is_playing()`                           |
+| `SpectrumBars`, `SPECTRUM_BARS`                      | уровни визуализатора: 48 чисел `0…1`; `SpectrumBars::levels()`                                               |
+| `MediaInfo`, `VideoTrackInfo`, `AudioTrackInfo`      | метаданные открытого файла: контейнер, кодеки, параметры дорожек                                             |
+| `LaunchError`, `WINDOW_TITLE`                        | ошибка запуска окна и заголовок демо-окна                                                                    |
+| `gpui`, `gpui_platform`                              | реэкспорт, чтобы у библиотеки и потребителя была одна версия GPUI                                            |
 
 ## Примеры
 
@@ -269,13 +272,13 @@ cargo run -p player-gpui --example embed_in_app -- assets/test/sync_test.mp4
 
 1. Поставить тег, чтобы зависимость была воспроизводимой:
    ```bash
-   git tag v0.3.2
-   git push origin v0.3.2
+   git tag v0.3.4
+   git push origin v0.3.4
    ```
 2. В чужом проекте подключить тег (предпочтительно) или ветку:
    ```toml
    [dependencies]
-   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.3.2", package = "player-gpui" }
+   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.3.4", package = "player-gpui" }
    # или
    player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", branch = "main", package = "player-gpui" }
    ```

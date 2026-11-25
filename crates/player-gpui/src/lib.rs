@@ -56,7 +56,8 @@ pub use gpui_platform;
 
 /// Типы, которые возвращает [`VideoPlayer`]: метаданные файла и уровни спектра.
 pub use player_core::{
-    AudioTrackInfo, MediaInfo, SPECTRUM_BARS, Source, SourceError, SpectrumBars, VideoTrackInfo,
+    AudioTrackInfo, HttpOptions, HttpOptionsError, MediaInfo, SPECTRUM_BARS, Source, SourceError,
+    SpectrumBars, VideoTrackInfo,
 };
 
 mod app;
@@ -110,7 +111,9 @@ mod theme {
     pub(crate) const BACKDROP: u32 = 0x14_0f_0b_73;
 }
 
-pub use app::{LaunchError, WINDOW_TITLE, run_app, run_app_source};
+pub use app::{
+    LaunchError, PlayerOptions, WINDOW_TITLE, run_app, run_app_source, run_app_source_with,
+};
 pub use controls::controls_view;
 pub use video_player::{PlaybackState, VideoPlayer};
 pub use video_view::video_view;

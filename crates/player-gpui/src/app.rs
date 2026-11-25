@@ -20,7 +20,7 @@ use gpui::{
     Stateful, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, size,
 };
-use player_core::{FfmpegVersions, MediaInfo, Source};
+use player_core::{FfmpegVersions, HttpOptions, MediaInfo, Source};
 use tracing::{debug, error, info, warn};
 
 use crate::controls::{format_clock, volume_percent};
@@ -174,7 +174,13 @@ struct PlayerWindow {
 }
 
 impl PlayerWindow {
-    fn new(source: Option<Source>, platform: Rc<dyn Platform>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        source: Option<Source>,
+        options: PlayerOptions,
+        platform: Rc<dyn Platform>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let PlayerOptions { volume, http } = options;
         let settings_path = Settings::default_path();
         let settings = settings_path
             .as_deref()
@@ -187,10 +193,10 @@ impl PlayerWindow {
         player.update(cx, |video, cx| {
             video.set_autoplay(settings.autoplay, cx);
             video.set_stats_visible(settings.stats_visible, cx);
-            video.set_volume(settings.volume, cx);
+            video.set_volume(initial_volume(settings.volume, volume), cx);
         });
         if let Some(source) = source {
-            player.update(cx, |video, cx| video.open(source, cx));
+            player.update(cx, |video, cx| video.open_with_options(source, http, cx));
         }
 
         let focus_handle = cx.focus_handle();
@@ -1378,10 +1384,19 @@ fn spawn_pending_playback(cx: &mut Context<PlayerWindow>) -> Task<()> {
     )
 }
 
+/// Громкость на старте: параметр запуска важнее сохранённой настройки.
+///
+/// Ограничение диапазона страхует библиотечный вызов: `set_volume` молча
+/// игнорирует значения вне `0..=1`, а нам нужно применить валидную часть.
+fn initial_volume(settings: f32, from_cli: Option<f32>) -> f32 {
+    from_cli.map_or(settings, |volume| volume.clamp(0.0, 1.0))
+}
+
 /// Открывает главное окно в уже запущенном приложении.
 fn open_main_window(
     cx: &mut App,
     source: Option<Source>,
+    player_options: PlayerOptions,
     platform: Rc<dyn Platform>,
 ) -> gpui::Result<()> {
     let bounds = Bounds::centered(None, size(px(960.0), px(540.0)), cx);
@@ -1399,9 +1414,19 @@ fn open_main_window(
 
     info!("открытие главного окна");
     cx.open_window(options, |_window, cx| {
-        cx.new(|cx| PlayerWindow::new(source, platform, cx))
+        cx.new(|cx| PlayerWindow::new(source, player_options, platform, cx))
     })?;
     Ok(())
+}
+
+/// Параметры запуска окна, которые не сохраняются в `settings.cfg`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlayerOptions {
+    /// Громкость на этот запуск в диапазоне `0..=1`.
+    /// `None` — взять сохранённую настройку.
+    pub volume: Option<f32>,
+    /// Заголовки HTTP для стартового источника (`Referer`, `User-Agent`).
+    pub http: HttpOptions,
 }
 
 /// Запускает демонстрационное приложение и блокирует поток до закрытия окна.
@@ -1410,6 +1435,15 @@ fn open_main_window(
 /// создания окна складываем в слот, останавливаем приложение и отдаём её уже
 /// после выхода из цикла событий.
 pub fn run_app_source(source: Option<Source>) -> Result<(), LaunchError> {
+    run_app_source_with(source, PlayerOptions::default())
+}
+
+/// То же, что [`run_app_source`], но с параметрами, которые не берутся из
+/// `settings.cfg` (сейчас — громкость).
+pub fn run_app_source_with(
+    source: Option<Source>,
+    options: PlayerOptions,
+) -> Result<(), LaunchError> {
     let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let failure_slot = Rc::clone(&failure);
 
@@ -1420,7 +1454,7 @@ pub fn run_app_source(source: Option<Source>) -> Result<(), LaunchError> {
     let window_platform = Rc::clone(&platform);
 
     gpui::Application::with_platform(platform).run(move |cx: &mut App| {
-        if let Err(err) = open_main_window(cx, source, window_platform) {
+        if let Err(err) = open_main_window(cx, source, options, window_platform) {
             error!(%err, "не удалось открыть окно");
             *failure_slot.borrow_mut() = Some(err.to_string());
             cx.quit();
@@ -1473,6 +1507,17 @@ mod tests {
             AUTO_HIDE_DELAY - Duration::from_millis(1)
         ));
         assert!(!should_hide(false, true, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn cli_volume_overrides_saved_setting() {
+        assert_eq!(initial_volume(0.8, None), 0.8);
+        assert_eq!(initial_volume(0.8, Some(0.1)), 0.1);
+        assert_eq!(initial_volume(0.8, Some(0.0)), 0.0);
+        // Библиотечный вызов может передать что угодно: применяем только
+        // валидную часть, иначе `set_volume` молча проигнорирует значение.
+        assert_eq!(initial_volume(0.8, Some(1.5)), 1.0);
+        assert_eq!(initial_volume(0.8, Some(-1.0)), 0.0);
     }
 
     #[test]

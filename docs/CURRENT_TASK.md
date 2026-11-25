@@ -1,4 +1,9 @@
-# CURRENT_TASK — этап 6: PATH установщиков и запуск из консоли
+# CURRENT_TASK — задача 7.0: заголовки HTTP; этап 6 — PATH и консоль
+
+**Задача 7.0 (2026-11-25):** `Referer`/`User-Agent` для HTTP-источников
+(RuTube `play_stream`) — реализовано и принято владельцем 2026-11-25.
+Версия `0.3.4`, установщики пересобраны. Полный план — `docs/PLAN.md`;
+требования — `docs/SPEC.md` §2.8.
 
 **Этап 5 — HLS:** 5.0–5.6 ✅ (приёмка закрыта, A/V перепроверен владельцем).
 **Задача 6:** установщики добавляют приложение в пользовательский `PATH`,
@@ -6,14 +11,155 @@
 осталась ручная приёмка установщиков; 6.1 — проверка запуска по ссылке;
 6.2 — полный экран по двойному клику; 6.3 — курсор прячется вместе с панелью;
 6.4 — палитра под иконку приложения; 6.5 — тесты заголовков состояний;
-6.6 — мин. размер окна и выдвижная громкость.
-**Обновлён:** 2026-11-23 (6.0), 2026-11-24 (6.1–6.6).
+6.6 — мин. размер окна и выдвижная громкость; 6.7 — `--help` и `--volume`
+в консольном запуске.
+**Обновлён:** 2026-11-23 (6.0), 2026-11-24 (6.1–6.6), 2026-11-25 (6.7,
+7.0).
 
 Twitch-резолвер — отдельная задача (`docs/TWITCH_INTERGATE.md`), в этом
 этапе не ведётся.
 
 Требования — `docs/SPEC.md`. История этапов 1–4 — `docs/CHANGELOG.md`,
 разбор mpv — `docs/URL_LOGIC_MPV.md`.
+
+## 7.0 Заголовки HTTP: `Referer`/`User-Agent` (2026-11-25)
+
+**Статус:** реализовано и принято 2026-11-25: владелец подтвердил
+работу RuTube. Тесты 208 unit + 10 integration `player-core`,
+69 `player-gpui`, 16 + 1 `player-app`, 11 `player-cli`, 8 doc-тестов;
+clippy и fmt чистые. Версия `0.3.4`; `just installers` пересобрал
+`dist/vgpu-player-0.3.4-setup.exe` (14,0 МБ), `dist/vgpu-player-0.3.4.msi`
+(16,5 МБ) и portable `dist/vgpu-player/vgpu.exe` (15,1 МБ). Полный
+план — `docs/PLAN.md`; требования — `docs/SPEC.md` §2.8, §3.1, §3.4.
+
+Запрос владельца: RuTube `play_stream` отдаёт `referer` и `user_agent`,
+которые нужно передавать в запросах к медиа. Twitch работает без
+заголовков.
+
+**Решение:** вариант 2 — заголовки в ядре и CLI, полная замена mpv для
+RuTube. Вариант 1 (mpv для RuTube, vgpu для Twitch) отклонён как
+долгосрочный: два плеера, две приёмки, разный UX.
+
+**Объём:**
+
+- публичный `HttpOptions` (валидированные `HeaderName`/`HeaderValue`,
+  дефолты `User-Agent: vgpu-player/<version>`, `Accept: */*`,
+  `Accept-Encoding: identity`);
+- `HttpConfig.headers` и единый helper запроса; заголовки на probe,
+  `Range`-блоки, поток без `Range`, HLS master/media, `MAP`, сегменты,
+  prefetch;
+- `Player::open_with_options`, `Command::OpenWith`, `Media::open_with_http`,
+  `VideoDecoder::open_source_with_options`;
+- CLI `--referrer` (+`--referer`), `--user-agent`; GUI
+  `PlayerOptions.http`;
+- версия `0.3.4`, установщики, ручная проверка RuTube и Twitch.
+
+**Файлы:** `player-core/src/http_options.rs` (новый), `http.rs`,
+`hls.rs`, `media.rs`, `player.rs`, `engine.rs`, `command.rs`, `reader.rs`,
+`video.rs`, `lib.rs`; `player-cli/src/main.rs`; `player-app/src/main.rs`;
+`player-gpui/src/{app,video_player,lib}.rs`;
+`docs/{SPEC,PLAN,CURRENT_TASK,TWITCH_INTERGATE}.md`, `README.md`.
+
+**Тесты (сначала):** валидация и дефолты `HttpOptions`; заголовки на
+всех путях запросов; сквозной `Player` с 403 без `Referer`; парсеры
+CLI/app.
+
+**Сделано:**
+
+- `http_options.rs`: `HttpOptions` (`with_referer`, `with_user_agent`,
+  `with_header`, `header`), `HttpOptionsError`; пустые/CRLF/не-ASCII
+  значения отклоняются.
+- `http.rs`: `HttpConfig.headers` (дефолты + переопределения),
+  единый `get()`; заголовки в probe, `Range`, потоке без `Range`.
+- `hls.rs`: master/media, `#EXT-X-MAP` и сегменты идут через `get()`;
+  prefetch-воркеры наследуют те же заголовки.
+- `Player::open_with_options`, `Command::OpenWith`,
+  `Media::open_with_http`, `VideoDecoder::open_source_with_options`,
+  `reader::open_reader_with_http`.
+- CLI `--referrer`/`--referer`, `--user-agent`; справка, `USAGE`,
+  валидация, тесты. GUI: `PlayerOptions.http`,
+  `VideoPlayer::open_with_options`/`create_with_options`.
+- Сквозной тест `url_with_required_headers_plays_and_without_them_fails`:
+  сервер с обязательными `Referer`/`User-Agent`; без них — `403`.
+- Версия `0.3.4` (`just set-version 0.3.4`).
+
+**Приёмка:** `vgpu "<rutube-media-url>" --referrer https://rutube.ru/
+--user-agent "Mozilla/5.0"` играет в release; без флагов Twitch/HLS и
+локальные файлы не регрессируют; `cargo test`, clippy, fmt зелёные;
+`docs` обновлены; версия `0.3.4`; установщики собраны.
+
+**Приёмка владельцем (2026-11-25):** RuTube работает — \"все работает\".
+Внешняя проверка шла через ссылку rtbcdn HLS; присланный конкретный узел
+`river-ntv-mskix-d489` из этой сети не соединялся (TCP timeout), но
+рабочая rtbcdn HLS-ссылка с теми же заголовками открылась и декодировалась
+через `player-cli`. Осталось — коммит/тег `v0.3.4` по решению владельца.
+
+## 6.7 `--help` и `--volume` в консольном запуске (2026-11-25)
+
+Запрос владельца: в release добавить `-h`/`--help` со списком текущих
+возможностей, расширить набор параметров и задавать громкость
+(`--volume 10`) как необязательный компонент наравне с URL.
+
+- **Без `clap`.** Аргументов по-прежнему мало, а help и ошибки нужны на
+  русском; `clap` не локализуется и не решает главную проблему — печать из
+  GUI-сборки. Разбор вынесен в `parse_args` → `Action`, так что будущая
+  миграция на `clap` — замена одной функции и её тестов. Критерий перехода:
+  ≥ 4–5 опций, подкоманды, completion/`man`.
+- **`vgpu`**: `-h` (`-H`)/`--help`/`/?` (справка побеждает остальные
+  аргументы, код `0`), `--volume <0…100>` в любом месте строки. Неизвестный
+  параметр, `--volume` без значения или вне диапазона → `USAGE` и код `1`.
+  Повторный позиционный аргумент по-прежнему игнорируется (первый
+  побеждает): оболочка Windows дописывает остальные файлы мультивыбора
+  к `"%1"`, поэтому строгий отказ здесь сломал бы ассоциации и drag&drop.
+- **Громкость**: проценты переводятся в `0…1` и перекрывают `settings.cfg`
+  только на запуск. Сама по себе в файл не пишется: `saved_settings`
+  остаётся снимком файла, поэтому запись случится только если пользователь
+  реально изменит настройку или громкость в окне.
+- **Release-help без новых зависимостей**: в `player-app` inline-модуль
+  `win_console` с `unsafe extern "system"` на пять функций
+  `kernel32`/`user32`. Порядок: унаследованный перенаправленный дескриптор
+  (UTF-8) → `AttachConsole` + `CONOUT$` (`WriteConsoleW`, UTF-16) →
+  `MessageBoxW`. Модуль компилируется во всех сборках под Windows (ловит
+  ошибки FFI), вызывается только в release; в debug — `println!`/`eprintln!`.
+- **`player-cli`**: те же `-h`/`-H`/`--help`/`/?` и `--volume`; громкость
+  уходит в `Command::SetVolume` до `Play`, на `--decode-frames` не влияет.
+- **Инсталляторы не меняются.** Inno/MSI/портативный `.cmd` пишут
+  ассоциации как `"vgpu.exe" "%1"`, а `[Run]` Inno запускает exe без
+  параметров — контракт прежний, состав файлов и `PATH` тоже. Поэтому
+  `vgpu --help` и `vgpu "…" --volume N` работают после установки без
+  правок инсталляторов (в новой консоли из-за `PATH`).
+- **`player-gpui`**: `PlayerOptions { volume: Option<f32> }` и
+  `run_app_source_with`; `run_app_source`/`run_app` — прежние обёртки.
+  `initial_volume` ограничивает override диапазоном `0…1`.
+
+Файлы: `crates/player-app/src/main.rs`, `crates/player-cli/src/main.rs`,
+`crates/player-gpui/src/app.rs`, `crates/player-gpui/src/lib.rs`,
+`crates/player-gpui/README.md`, `README.md`, `docs/SPEC.md`,
+`Cargo.toml`/`Cargo.lock`, `installer/vgpu-player.iss`,
+`installer/vgpu-player.wxs` (только версия).
+
+Тесты: 12 в `player-app` (help-флаги, порядок и границы `--volume`,
+повторный/неизвестный параметр, мультивыбор, справка содержит все
+параметры, прежние тесты кавычек), 8 в `player-cli`,
+`cli_volume_overrides_saved_setting` в `player-gpui`. Прогнаны
+`cargo test -p player-app -p player-cli -p player-gpui`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all --check`, `cargo check --release -p player-app`
+(release-ветка FFI) и doc-тесты `player-gpui`.
+
+Статус: реализовано, проверено в debug (`cargo run -p player-app -- --help`,
+`--volume 101`, `player-cli --help`). В release проверено так:
+`cmd /c "dist\vgpu-player\vgpu.exe --help > help.txt"` — текст попал в файл
+(ветка перенаправленного вывода). Осталось вручную посмотреть
+`vgpu.exe --help` в живой консоли `cmd`/PowerShell (приглашение возвращается
+раньше текста) и установку новых артефактов.
+
+Версия `0.3.3` (`just set-version 0.3.3`), установщики пересобраны
+`just installers`: `dist/vgpu-player-0.3.3-setup.exe` (14 МБ),
+`dist/vgpu-player-0.3.3.msi` (16 МБ), portable — `dist/vgpu-player/`.
+MSI по-прежнему выдаёт предупреждения ICE91 (per-user каталог) — они
+были и раньше, на сборку не влияют. В `vgpu.exe` нет ресурса VERSIONINFO
+(только иконка), поэтому `VersionInfo` файла пуст — так было и до 6.7.
 
 ## 6.6 Мин. размер окна и выдвижная громкость (2026-11-24)
 
@@ -257,7 +403,11 @@ Twitch-резолвер — отдельная задача (`docs/TWITCH_INTERG
 - HLS-ссылка из `docs/CHANGELOG.md` подписана и истекает `1795806421`
   ≈ 2026-11-27. Для CI нужны локальные HLS-ассеты, сгенерированные
   `ffmpeg -f hls`; внешняя ссылка — только для ручной проверки.
-- Версия `0.3.0`; тег `v0.3.0` — 2026-11-23.
+- Версия `0.3.4` (2026-11-25); последний тег — `v0.3.0`.
+- **7.0 реализован и принят:** `HttpOptions`/`HttpConfig.headers`, единый
+  `get()`, заголовки на всех запросах, `open_with_options`/`OpenWith`,
+  CLI-флаги, GUI `PlayerOptions.http`; версия `0.3.4`, установщики
+  пересобраны, RuTube подтверждён владельцем 2026-11-25.
 - **5.6, prefetch (валидирован и доработан 2026-11-23).** Замеры показали:
   одно TCP-соединение к Twitch-CDN даёт ~100–120 КБ/с (сегмент 1,9 МБ
   качается 3–13 с), несколько параллельных — ≈1 МБ/с и выше. В `hls.rs`
@@ -318,8 +468,9 @@ Twitch-резолвер — отдельная задача (`docs/TWITCH_INTERG
   (`HKCU\Environment`), чтобы в **новой** консоли работало
   `vgpu "<URL>"` без полного пути. Реализовано, см. 6.0.
 - `vgpu` уже принимает URL/путь первым аргументом
-  (`source_argument` снимает внешние кавычки), а файловые ассоциации
-  передают `%1`; без аргумента открывается пустое окно плеера.
+  (`parse_args`/`source_from_argument` снимают внешние кавычки), а файловые
+  ассоциации передают `%1`; без аргумента открывается пустое окно плеера.
+  С 6.7 есть `--volume` и `-h`/`--help`/`/?`.
 - `RUSTFLAGS=-Clinker=rust-lld cargo check -p player-core --all-targets`
   — зелёный. Полный прогон тестов и clippy выполнен (итоги выше).
 
@@ -435,6 +586,26 @@ Twitch-резолвер — отдельная задача (`docs/TWITCH_INTERG
     старый `player-app.exe` при установке/обновлении. `vgpu` без
     аргумента открывает пустое окно, `vgpu <URL>` — сразу открывает
     источник.
+68. **Заголовки — в ядре (7.0, утверждено 2026-11-25).** `HttpOptions`
+    живёт в `player-core`; `Referer`/`User-Agent` доступны `vgpu`,
+    `player-cli` и библиотечному API. mpv для RuTube — только временный
+    обход, не долгосрочная архитектура.
+69. **`HttpOptions` с валидацией.** Внутри — `HeaderName`/`HeaderValue`
+    из `ureq::http::header`: CR/LF, не-ASCII и недопустимые имена
+    отсекаются на границе API. То же хранилище переиспользует будущий
+    Twitch-резолвер (`Origin`, `Referer`, `Client-ID`, `Content-Type`).
+70. **Дефолты:** `User-Agent: vgpu-player/<version>`, `Accept: */*`,
+    `Accept-Encoding: identity`; пользовательский заголовок с тем же
+    именем переопределяет дефолт. `Cookie`/`Authorization` не шлём.
+71. **CLI:** `--referrer` (как у mpv; алиас `--referer`) и
+    `--user-agent`. Произвольный `--header` пока не выводим; внутренний
+    `HttpOptions::with_header` для будущего есть.
+72. **Область действия:** заголовки на всё открытие, а не на первый
+    запрос: probe, `Range`, поток без `Range`, HLS master/media, `MAP`,
+    сегменты и prefetch. Смена на лету — `Command::OpenWith`.
+73. **Версия `0.3.4`.** Изменения аддитивные: новые флаги и методы,
+    `Command::OpenWith` рядом с `Command::Open`. Тег и установщики —
+    после приёмки.
 
 ## План
 
@@ -862,6 +1033,12 @@ timeout: per read`). yt-dlp проходит только своим клиен�
   `video_view.rs` — плашка `LIVE`; `app.rs` — панель URL для `.m3u8`;
   `controls.rs` — без правок (серый слайдер уже от `seekable`/`duration`).
 - `player-cli`: печать `live: true` при `Ready`; HLS-ссылка как аргумент.
+- 7.0 (сделано): `player-core/src/http_options.rs` (новый), `http.rs`
+  (`HttpConfig.headers`, единый `get`), `hls.rs` (плейлисты/сегменты),
+  `media.rs`/`player.rs`/`engine.rs`/`command.rs`/`reader.rs`/`video.rs`
+  (`open_with_options`/`OpenWith`/`open_source_with_options`);
+  `player-cli`/`player-app` — флаги; `player-gpui` — `PlayerOptions.http`;
+  `docs/PLAN.md` — план этапа.
 - `Cargo.toml`: этап 5 без новых зависимостей.
 - `crates/player-app/Cargo.toml` (6.0): `autobins = false`, `[[bin]]`
   с именем `vgpu` и путём `src/main.rs`.
@@ -909,6 +1086,15 @@ timeout: per read`). yt-dlp проходит только своим клиен�
   `crates/player-app/tests/binary.rs`; `where vgpu` через PATH, компиляция
   Inno и WiX; установка, upgrade, удаление и чистота `PATH` — ручная
   матрица.
+- 6.7: разбор аргументов `vgpu` (12 тестов) и `player-cli` (8 тестов),
+  `cli_volume_overrides_saved_setting` в `player-gpui`; ручная проверка
+  release-help — в «Следующей сессии».
+- 7.0 (сделано): `HttpOptions` (валидация/дефолты/переопределение),
+  заголовки на probe, `Range`, потоке без `Range`, HLS master/media/`MAP`/
+  сегментах/prefetch; 403 без `Referer` и успешный `Ready` с ним;
+  парсеры флагов `vgpu`/`player-cli` (16 `player-app`, 11 `player-cli`).
+  Итог: 208 unit + 10 integration `player-core`, 69 + 16 + 1 + 11,
+  8 doc-тестов; clippy и fmt — зелёные.
 
 ## Проверка (повторить перед приёмкой)
 
@@ -1023,7 +1209,8 @@ PATH в Inno/MSI, `register-associations.cmd path`; оба установщик�
 ## Открытые вопросы
 
 Все решения 46–65 утверждены владельцем 2026-11-23, включая demuxed-аудио.
-Решение 66 (PATH) и 67 (`vgpu`) реализованы; незакрытые детали — вопрос 9.
+Решение 66 (PATH) и 67 (`vgpu`) реализованы; 68–73 (7.0) утверждены
+2026-11-25, реализация не начата. Незакрытые детали — вопрос 9.
 
 1. **Ссылки для ручной проверки:** свежий rtbcdn VOD и Apple fMP4;
    YouTube master — если нужен end-to-end. CI — только локальные ассеты
@@ -1054,9 +1241,19 @@ PATH в Inno/MSI, `register-associations.cmd path`; оба установщик�
    `HKCU\Environment`, лимит 2047 и удаление только своей записи
    (Inno код и WiX `Environment`; портативно — `register-associations.cmd
 path`).
+10. ~~**RuTube (7.0):** ...~~ — **закрыто 2026-11-25:** владелец
+    подтвердил работу; заголовки уходят на все запросы источника.
+11. **CLI `--header` (7.0):** произвольные заголовки не выводим; вернуться,
+    если появятся источники с `Origin`/`Cookie` в media-запросах.
 
 ## Следующая сессия
 
+**7.0 (принято):** реализовано по `docs/PLAN.md`, тесты/clippy/fmt
+зелёные, версия `0.3.4`, установщики пересобраны, RuTube подтверждён
+владельцем 2026-11-25. Осталось — коммит и тег `v0.3.4` по решению
+владельца.
+
+Ниже — незакрытые хвосты 6.0; они не блокируют 7.0.
 Реализация 6.0 сделана; установка Inno проверена на этой машине.
 Осталось проверить удаление и MSI на чистой Windows.
 
@@ -1067,5 +1264,9 @@ path`).
 3. **Портативная сборка:** `register-associations.cmd path` и
    `path remove`; ассоциации на `vgpu.exe`.
 4. **Регрессии:** `cargo test --workspace`, clippy, fmt — пройдены
-   перед коммитом `v0.3.0`.
-5. **Коммит/тег** — `v0.3.0`; ветка `feat/url-vipeo`, `main` не трогаем.
+   перед коммитом 7.0.
+5. **Коммит/тег** — `v0.3.4` после 7.0; ветка `feat/url-vipeo`, `main`
+   не трогаем.
+6. **6.7:** `vgpu.exe --help` и `vgpu "…" --volume 10` в release из `cmd`
+   и PowerShell (приглашение возвращается раньше текста) и
+   `vgpu --help > help.txt` (перенаправленный вывод).

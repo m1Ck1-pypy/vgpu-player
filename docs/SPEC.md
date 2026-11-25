@@ -88,8 +88,10 @@ pub(crate) trait MediaReader: Read + Seek + Send {
 
 Один читатель на дорожку (звук и видео независимы).
 
-**Запрос:** `GET`, `Range: bytes=<pos>-`, `Accept-Encoding: identity`,
-`User-Agent: vgpu-player/<version>`, `Accept: */*`.
+**Запрос:** `GET`, `Range: bytes=<pos>-` и заголовки из `HttpConfig`
+(по умолчанию `User-Agent: vgpu-player/<version>`, `Accept: */*`,
+`Accept-Encoding: identity`; см. §2.8). `Range` ставится поверх общих
+заголовков.
 
 - 206 — `Range` поддержан, длина из `Content-Range`.
 - 200 — `Range` не поддержан: читаем последовательно, `seekable = false`;
@@ -298,6 +300,32 @@ vcpkg-FFmpeg нет `https`/`tls`, но есть демуксеры `hls`, `mpeg
 Вариант A (HLS-демуксер FFmpeg) отклонён: обходит наш HTTP-слой, кэш и
 счётчики, а два декодера могут дать двойной трафик.
 
+### 2.8 Заголовки HTTP-источника (этап 7)
+
+Некоторым источникам мало URL: RuTube `play_stream` отдаёт
+`referer: https://rutube.ru/` и `user_agent: Mozilla/5.0`, и без них
+сервер не отдаёт поток. Заголовки задаются публичным `HttpOptions`
+(`with_referer`, `with_user_agent` и `with_header(name, value)`) и
+применяются ко всем запросам источника.
+
+- **Публичный тип:** `HttpOptions` хранит проверенные `HeaderName` и
+  `HeaderValue`; CR/LF, не-ASCII и недопустимые имена отвергаются с
+  `HttpOptionsError`. Ошибка не `PlayerError`: это ошибка аргументов или
+  API, CLI печатает её с `USAGE` и кодом `1`.
+- **Дефолты:** `User-Agent: vgpu-player/<version>`, `Accept: */*`,
+  `Accept-Encoding: identity`. Пользовательский заголовок с тем же именем
+  переопределяет дефолт (сравнение без учёта регистра).
+- **Область:** заголовки уходят в probe (`Range: bytes=0-0`), блочные
+  `Range`-запросы, перезапуск потока без `Range`, HLS master/media,
+  `#EXT-X-MAP`, сегменты (включая prefetch) и повторные попытки.
+- **Редиректы:** обычные заголовки переносятся через редирект, в том
+  числе на другой хост CDN; для `Referer`/`User-Agent` это требуется
+  RuTube. `Cookie`/`Authorization` так не пробрасываются — для них нужен
+  allowlist хостов отдельным решением.
+- **Логи:** значения заголовков не пишутся в лог (Referer может содержать
+  токен). Флаги CLI видны в списке процессов и истории shell — не для
+  секретов.
+
 ## 3. Контракт
 
 ### 3.1 Команды и события
@@ -305,6 +333,7 @@ vcpkg-FFmpeg нет `https`/`tls`, но есть демуксеры `hls`, `mpeg
 | Команды UI → ядро                | События ядро → UI           |
 | -------------------------------- | --------------------------- |
 | `Open(Source)`                   | `Ready(Box<MediaReady>)`    |
+| `OpenWith { source, http }`      |                             |
 | `Play`                           | `PositionChanged(Duration)` |
 |                                  | `Seeked(Duration)`          |
 | `Pause`                          | `Buffering(bool)`           |
@@ -313,6 +342,11 @@ vcpkg-FFmpeg нет `https`/`tls`, но есть демуксеры `hls`, `mpeg
 | `SetVolume(f32)`                 | `Spectrum(SpectrumBars)`    |
 | `Stop`                           | `Ended`                     |
 |                                  | `Error(String)`             |
+
+`Open` открывает источник с заголовками по умолчанию; `OpenWith` — с
+явными `HttpOptions` (§2.8). Заголовки задаются на всё открытие: probe,
+`Range`-блоки, поток без `Range` и все запросы HLS. `Player::open` — это
+`open_with_options` с `HttpOptions::default()`.
 
 `SeekRelative { forward, step }` считает цель в ядре от текущей позиции:
 удержание `←`/`→` не зависит от задержки `PositionChanged` в UI. Подряд
@@ -346,6 +380,9 @@ pub struct MediaReady {
 
 - `Player::open(source) -> Result<Player, PlayerError>` только запускает
   поток и ставит `Open`; ошибка `Result` — только `StartEngine`.
+- `Player::open_with_options(source, http)` — то же, но с явными
+  заголовками (`HttpOptions`, §2.8); `Player::open` использует
+  `HttpOptions::default()`. Смена заголовков на лету — `Command::OpenWith`.
 - Результат открытия — `Ready` или `Error`; ошибка не убивает поток.
 - `Player::video_info()`/`media_info()` удаляются.
 - `Stop`, новый `Open` и `Drop` взводят флаг отмены до отправки команды.
@@ -379,8 +416,35 @@ pub struct MediaReady {
   снимаются внешние ASCII-кавычки и парные типографские (`“…”`, `‘…’`,
   `«…»`); `https://…` и `file:` не считаются путём; без аргумента
   открывается пустое окно.
+- `vgpu` принимает `--volume <0…100>` и `-h` (`-H`)/`--help`/`/?` в любом
+  месте строки: `--help` побеждает остальные аргументы и печатает справку с
+  кодом `0`. Неизвестный параметр и громкость вне `0…100` — ошибка с `USAGE`
+  и кодом `1`. Повторный позиционный аргумент не ошибка: берётся первый,
+  потому что оболочка Windows дописывает остальные выбранные файлы к
+  `"%1"` (мультивыбор и drag&drop на exe). Громкость задаётся процентами и
+  переводится в `0…1`; она перекрывает `settings.cfg` только на этот запуск и
+  в файл не записывается.
+- `vgpu` и `player-cli` принимают `--referrer <строка>` (алиас
+  `--referer`) и `--user-agent <строка>`; значения проверяются
+  `HttpOptions`. Дубликат флага, отсутствие значения и недопустимые
+  символы — ошибка с `USAGE` и кодом `1`. Пример:
+  `vgpu "<media-url>" --referrer https://rutube.ru/ --user-agent "Mozilla/5.0"`.
+  Заголовки влияют на все запросы источника, включая HLS-сегменты.
+- Справка и ошибки разбора в release печатаются в консоль родителя
+  (`AttachConsole` + `CONOUT$`, UTF-16 через `WriteConsoleW`); при
+  перенаправлении вывода — UTF-8 в унаследованный дескриптор; без консоли
+  (двойной клик) — `MessageBoxW`. В debug — обычные `println!`/`eprintln!`.
 - `player-cli`: первый аргумент — `Source`; метаданные из `Ready`, без
-  второго декодера; `--decode-frames` — через `open_source`.
+  второго декодера; `--decode-frames` — через
+  `VideoDecoder::open_source_with_options` (заголовки работают и в замере);
+  `--volume <0…100>` уходит в `Command::SetVolume` до `Play`;
+  `--referrer`/`--user-agent` — как у `vgpu`; `-h` (`-H`)/`--help`/`/?`
+  печатают справку.
+- Библиотечный запуск: `run_app_source_with(source, PlayerOptions { volume, http })`;
+  `run_app_source` и `run_app` остаются обёртками с `PlayerOptions::default()`.
+  `PlayerOptions` — параметры, которые не сохраняются в `settings.cfg`;
+  `http` — заголовки стартового открытия (§2.8). `VideoPlayer` сохраняет
+  их и для `retry`, и для `Command::OpenWith`.
 - Установщики Inno и MSI добавляют каталог приложения в пользовательский
   `PATH` (`HKCU\Environment`, `REG_EXPAND_SZ`), без UAC и идемпотентно;
   удаление убирает только свою запись. После установки в новой консоли
@@ -394,7 +458,9 @@ pub struct MediaReady {
 - Портативная сборка `PATH` автоматически не меняет;
   `register-associations.cmd path` добавляет/убирает запись вручную.
 - `vgpu` в release — GUI-подсистема: консольный запуск возвращает
-  приглашение сразу и не печатает stderr; ошибки видны в окне плеера.
+  приглашение сразу. Справка и ошибки разбора всё равно печатаются (см.
+  выше) и появляются после приглашения; ошибки открытия источника видны в
+  окне плеера.
 
 ## 4. Ошибки
 
@@ -419,6 +485,10 @@ pub struct MediaReady {
 номер строки или URL сегмента в том же скрытом виде. `UnsupportedHls` —
 только для того, что ещё не реализовано (AES-128, LL-HLS, локальный
 `.m3u8`), чтобы это отличалось от сетевой/форматной ошибки.
+
+`HttpOptionsError` — отдельная ошибка разбора `--referrer`/`--user-agent`
+и `HttpOptions::with_header` (имя или значение заголовка), не
+`PlayerError`: CLI печатает её с `USAGE`, код возврата `1`.
 
 ## 5. UI
 
@@ -495,6 +565,7 @@ pub struct MediaReady {
 | 4   | Трафик и общий кэш                    | 2–4 дня    |
 | 5   | HLS                                   | по решению |
 | 6   | PATH установщиков и запуск из консоли | по решению |
+| 7   | Заголовки HTTP-источника              | 0,5–1 день |
 
 ### Этап 1 — `Source` и потоковый слой
 
@@ -641,6 +712,28 @@ muxed-only и понятная ошибка для раздельных доро
 `vgpu` без аргумента; регрессии этапов 1–5 зелёные; после удаления
 установщика `PATH` содержит ровно прежний набор записей.
 
+### Этап 7 — заголовки HTTP-источника
+
+Полный план — `docs/PLAN.md`. Цель — открывать ссылки, которым нужны
+`Referer`/`User-Agent` (RuTube `play_stream`), без mpv.
+
+- [x] **7.0.1** `HttpOptions`, `HttpConfig.headers` и единый helper;
+      заголовки на probe, `Range`, поток без `Range`, HLS master/media,
+      `#EXT-X-MAP`, сегменты и prefetch.
+- [x] **7.0.2** API: `Player::open_with_options`, `Media::open_with_http`,
+      `VideoDecoder::open_source_with_options`, `Command::OpenWith`.
+- [x] **7.0.3** CLI `vgpu`/`player-cli`: `--referrer` (+`--referer`),
+      `--user-agent`; валидация, справка, тесты.
+- [x] **7.0.4** GUI: `PlayerOptions.http`, `VideoPlayer::open_with_options`.
+- [x] **7.0.5** Приёмка: RuTube `play_stream` в release; Twitch/HLS и
+      локальные файлы без регрессий; версия `0.3.4`; установщики
+      пересобраны. Подтверждено владельцем 2026-11-25.
+
+Приёмка: `vgpu "<rutube-media-url>" --referrer https://rutube.ru/
+--user-agent "Mozilla/5.0"` играет; без флагов поведение не меняется;
+заголовки уходят на все запросы источника; `cargo test`, clippy, fmt
+зелёные; `docs` обновлены.
+
 ## 7. Тесты
 
 - `Source`: URL, `file://`/`file:` (диск/UNC/`localhost`/`%20`),
@@ -674,7 +767,19 @@ muxed-only и понятная ошибка для раздельных доро
 - Кэш: блоки, курсоры, вытеснение, backpressure, seek вперёд/назад,
   ошибка загрузчика, закрытие; лимит памяти 64 МиБ.
 - `vgpu`: имя release-бинарника (`CARGO_BIN_EXE_vgpu`), URL/путь из
-  аргумента, запуск без аргумента.
+  аргумента, запуск без аргумента, `-h`/`--help`/`/?`, `--volume` до и после
+  источника, границы `0…100`, неизвестный параметр, повторный источник
+  (игнорируется, как при мультивыборе в Проводнике); справка и `USAGE`
+  содержат все параметры.
+- `player-cli`: обязательный источник, `--decode-frames`/`--seek`,
+  `--volume`, те же границы и справка.
+- HTTP-заголовки: `HttpOptions` (валидация, дефолты, переопределение),
+  `Referer`/`User-Agent` на probe, `Range`-блоке, потоке без `Range`,
+  HLS master/media/`MAP`/сегментах (включая prefetch); 403 без
+  `Referer` и успешное открытие с ним; парсеры `vgpu`/`player-cli`
+  (алиас, дубликаты, пустые и недопустимые значения).
+- `PlayerOptions`: громкость запуска перекрывает настройку и ограничивается
+  диапазоном `0…1`.
 - Установщики (вручную, чистая Windows): Inno/MSI — установка, обновление,
   удаление; `where vgpu`; `vgpu "<URL>"` и `vgpu` в новой консоли;
   чужие записи `PATH` сохранены, дубликата нет, без UAC; портативно —
@@ -690,9 +795,13 @@ muxed-only и понятная ошибка для раздельных доро
 - `timeout_resolve`/`timeout_connect` 5 с, `timeout_per_read` 2 с;
   `timeout_global`/`timeout_recv_body` не задаём.
 - `http_status_as_error(false)`; `max_redirects(10)`.
-- Заголовки: `User-Agent: vgpu-player/<version>`, `Accept: */*`,
-  `Accept-Encoding: identity`, `Range`. `Referer`/`Cookie` не шлём.
+- Заголовки: по умолчанию `User-Agent: vgpu-player/<version>`,
+  `Accept: */*`, `Accept-Encoding: identity`, `Range`; `Referer` и
+  `User-Agent` переопределяются `HttpOptions` (§2.8). `Cookie` и
+  `Authorization` не шлём.
 - `tiny_http` — только dev-dependency; `tokio`/`axum` не нужны.
+- Консольный вывод release-сборки — без `windows-sys`: нужные функции Win32
+  объявлены напрямую в `player-app` (`kernel32`, `user32`).
 - Лимиты: окно 2 МиБ (этап 3), кэш 64 МиБ, блок 256 КиБ, read-ahead
   8 МиБ, простой 15 с, открытие ≤ 30 с.
 - HLS: без новых crate; ISO-8601 для `PROGRAM-DATE-TIME` — свой мини-парсер.
@@ -730,6 +839,15 @@ muxed-only и понятная ошибка для раздельных доро
   задержать тик и плашку `Buffering` до её завершения, а звук — опустеть.
   Асинхронный prefetch — кандидат на 5.5/этап 6; до него ограничение
   фиксируется в `CURRENT_TASK.md`.
+- Заголовки `Referer`/`User-Agent` уходят и на CDN после cross-host
+  редиректа — для RuTube это нужно. `Cookie`/`Authorization` так не
+  пробрасываем: при необходимости — allowlist хостов отдельным решением.
+- Не-ASCII и управляющие символы в значениях заголовков недопустимы
+  (`HeaderValue`); `Referer` с кириллицей должен быть percent-encoded.
+- Флаги `--referrer`/`--user-agent` видны в списке процессов и истории
+  shell — не для секретов.
+- DRM/авторизация RuTube заголовками не решаются: если `play_stream`
+  отдаёт защищённый поток, это внешний блокер, как YouTube.
 - YouTube watch URL не поддерживается; для live нужен master (или две
   ссылки), `yt-dlp -g` даёт отдельные media-плейлисты. `googlevideo` может
   быть недоступен из-за DPI — приёмка на Twitch/Apple/rtbcdn.

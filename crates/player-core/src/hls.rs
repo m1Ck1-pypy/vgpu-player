@@ -19,8 +19,7 @@ use ureq::ResponseExt;
 
 use crate::cache::CacheCounters;
 use crate::http::{
-    HttpConfig, HttpError, HttpFailure, agent, body_error, header, request_error, status_error,
-    with_retries,
+    HttpConfig, HttpError, HttpFailure, agent, body_error, get, header, status_error, with_retries,
 };
 use crate::reader::{MediaReader, Track};
 use crate::sync::NetworkStats;
@@ -1272,7 +1271,7 @@ fn fetch_playlist_text(
 
         counters.add_request();
         let started = Instant::now();
-        let response = agent.get(url).call().map_err(request_error)?;
+        let response = get(agent, config, url, &[])?;
         let status = response.status().as_u16();
         if status != 200 {
             return Err(status_error(status));
@@ -2165,6 +2164,12 @@ fn fetch_resource(
     range: Option<ByteRange>,
 ) -> Result<Vec<u8>, HttpFailure> {
     let stop = || context.cancel.load(Ordering::Relaxed);
+    let range_header =
+        range.map(|range| format!("bytes={}-{}", range.offset, range.offset + range.length - 1));
+    let extra: Vec<(&str, &str)> = range_header
+        .as_deref()
+        .map(|value| vec![("Range", value)])
+        .unwrap_or_default();
 
     let mut attempt = || {
         if stop() {
@@ -2173,15 +2178,7 @@ fn fetch_resource(
 
         context.counters.add_request();
         let started = Instant::now();
-        let mut request = context.agent.get(url);
-        if let Some(range) = range {
-            request = request.header(
-                "Range",
-                format!("bytes={}-{}", range.offset, range.offset + range.length - 1),
-            );
-        }
-
-        let response = request.call().map_err(request_error)?;
+        let response = get(&context.agent, &context.config, url, &extra)?;
         let status = response.status().as_u16();
         let mut body = response
             .into_body()
@@ -2496,6 +2493,7 @@ mod tests {
     use tiny_http::{Header, Response, StatusCode};
 
     use super::*;
+    use crate::http_options::HttpOptions;
 
     const BASE: &str = "https://cdn.example.com/live/stream/index.m3u8?token=abc";
 
@@ -3190,11 +3188,15 @@ seg.ts
     /// Учёт запросов: путь и заголовок `Range`, если он был.
     type Hits = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+    /// Заголовки каждого запроса: путь и пары «имя: значение».
+    type SeenHeaders = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
+
     /// HTTP-сервер на `127.0.0.1:0` с изменяемыми маршрутами и учётом запросов.
     struct RouteServer {
         base: String,
         routes: Arc<Mutex<HashMap<String, Route>>>,
         hits: Hits,
+        headers: SeenHeaders,
         stop: Arc<AtomicBool>,
     }
 
@@ -3205,16 +3207,18 @@ seg.ts
             let base = format!("http://{address}");
             let routes = Arc::new(Mutex::new(HashMap::new()));
             let hits = Arc::new(Mutex::new(Vec::new()));
+            let headers = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
 
             {
                 let routes = Arc::clone(&routes);
                 let hits = Arc::clone(&hits);
+                let headers = Arc::clone(&headers);
                 let stop = Arc::clone(&stop);
                 std::thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         match server.recv_timeout(Duration::from_millis(20)) {
-                            Ok(Some(request)) => respond(request, &routes, &hits),
+                            Ok(Some(request)) => respond(request, &routes, &hits, &headers),
                             Ok(None) => {}
                             Err(_) => break,
                         }
@@ -3226,6 +3230,7 @@ seg.ts
                 base,
                 routes,
                 hits,
+                headers,
                 stop,
             }
         }
@@ -3299,7 +3304,12 @@ seg.ts
         }
     }
 
-    fn respond(request: tiny_http::Request, routes: &Mutex<HashMap<String, Route>>, hits: &Hits) {
+    fn respond(
+        request: tiny_http::Request,
+        routes: &Mutex<HashMap<String, Route>>,
+        hits: &Hits,
+        headers: &SeenHeaders,
+    ) {
         let url = request.url().to_owned();
         let path = url.split(['?', '#']).next().unwrap_or_default().to_owned();
         let range = request
@@ -3308,6 +3318,17 @@ seg.ts
             .find(|header| header.field.equiv("Range"))
             .map(|header| header.value.as_str().to_owned());
         hits.lock().unwrap().push((path.clone(), range.clone()));
+        let seen: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .map(|header| {
+                (
+                    header.field.to_string().to_ascii_lowercase(),
+                    header.value.as_str().to_owned(),
+                )
+            })
+            .collect();
+        headers.lock().unwrap().push((path.clone(), seen));
 
         let Some(route) = routes.lock().unwrap().get(&path).cloned() else {
             let _ = request.respond(Response::empty(StatusCode(404)));
@@ -3349,6 +3370,13 @@ seg.ts
         let value = value.strip_prefix("bytes=")?;
         let (start, end) = value.split_once('-')?;
         Some((start.parse().ok()?, end.parse().ok()?))
+    }
+
+    fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.as_str())
     }
 
     fn open_hls(server: &RouteServer, path: &str) -> Result<Arc<HlsSource>, PlayerError> {
@@ -4000,5 +4028,60 @@ v/index.m3u8
             .expect("кадр")
             .expect("первый кадр без звука");
         assert!(frame.width > 0);
+    }
+
+    #[test]
+    fn playlist_map_and_segments_send_source_headers() {
+        let server = RouteServer::start();
+        server.set(
+            "/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmedia.m3u8\n",
+        );
+        server.set(
+            "/media.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n",
+        );
+        server.set("/init.mp4", "init");
+        server.set("/seg1.ts", "segment");
+
+        let options = HttpOptions::new()
+            .with_referer("https://rutube.ru/")
+            .expect("Referer")
+            .with_user_agent("Mozilla/5.0")
+            .expect("User-Agent");
+        let source = Source::Url(server.url("/master.m3u8"));
+        let hls = HlsSource::open(
+            &source,
+            HttpConfig::with_http(&options),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("открыть HLS");
+
+        let mut reader = hls.reader(Track::Video).expect("читатель");
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).expect("прочитать ресурсы");
+        assert!(!body.is_empty(), "init и сегмент должны прийти");
+
+        let seen = server.headers.lock().unwrap();
+        for path in ["/master.m3u8", "/media.m3u8", "/init.mp4", "/seg1.ts"] {
+            let requests: Vec<_> = seen
+                .iter()
+                .filter(|(hit, _)| hit == path)
+                .map(|(_, headers)| headers)
+                .collect();
+            assert!(!requests.is_empty(), "нет запроса {path}");
+            for headers in requests {
+                assert_eq!(
+                    header_of(headers, "referer"),
+                    Some("https://rutube.ru/"),
+                    "{path}"
+                );
+                assert_eq!(
+                    header_of(headers, "user-agent"),
+                    Some("Mozilla/5.0"),
+                    "{path}"
+                );
+            }
+        }
     }
 }

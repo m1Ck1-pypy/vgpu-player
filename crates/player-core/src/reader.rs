@@ -124,6 +124,21 @@ pub(crate) fn open_reader(
     cancel: Arc<AtomicBool>,
     shared: Option<&SharedSource>,
 ) -> Result<OpenedReader, PlayerError> {
+    open_reader_with_http(source, track, cancel, shared, &HttpConfig::default())
+}
+
+/// То же, но с настройками HTTP для одиночного читателя.
+///
+/// `shared` важнее: если сетевой источник уже открыт, его заголовки и кэш
+/// сохраняются. `config` нужен только когда читатель открывает свой
+/// `HlsSource`/`HttpSource` (тесты и `VideoDecoder::open_source_with_options`).
+pub(crate) fn open_reader_with_http(
+    source: &Source,
+    track: Track,
+    cancel: Arc<AtomicBool>,
+    shared: Option<&SharedSource>,
+    config: &HttpConfig,
+) -> Result<OpenedReader, PlayerError> {
     match source {
         Source::File(path) => {
             let reader = FileReader::open(path).map_err(|error| PlayerError::OpenFile {
@@ -141,7 +156,7 @@ pub(crate) fn open_reader(
             let hls = match shared {
                 Some(SharedSource::Hls(hls)) => Arc::clone(hls),
                 // Одиночный читатель (тесты, CLI): свой HLS-источник.
-                _ => HlsSource::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
+                _ => HlsSource::open(source, config.clone(), Arc::clone(&cancel))?,
             };
             let reader = hls.reader(track).ok_or_else(|| PlayerError::Hls {
                 target: source.clone(),
@@ -161,7 +176,7 @@ pub(crate) fn open_reader(
             let reader = match shared {
                 Some(SharedSource::Http(shared)) => shared.reader(Arc::clone(&cancel)),
                 // Одиночный читатель (тесты, CLI): свой кэш на источник.
-                _ => HttpReader::open(source, HttpConfig::default(), Arc::clone(&cancel))?,
+                _ => HttpReader::open(source, config.clone(), Arc::clone(&cancel))?,
             };
             let failure = reader.failure_slot();
             let buffering = reader.buffering_flag();

@@ -71,6 +71,9 @@
    - `Client-ID: <TWITCH_WEB_CLIENT_ID>` (публичный Client-ID веб-плеера);
    - `Content-Type: application/json`;
    - `User-Agent` плеера, `Origin`/`Referer` `https://www.twitch.tv`.
+     Заголовки собираются через `HttpOptions` (`docs/SPEC.md` §2.8) и
+     применяются через `HttpConfig::headers()`; отдельной валидации и
+     второй копии списка не заводим.
      Тело — GraphQL `PlaybackAccessToken` (persisted query или полный текст;
      актуальный hash/схему сверить на момент реализации):
 
