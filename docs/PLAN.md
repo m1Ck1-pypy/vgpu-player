@@ -1,8 +1,8 @@
 # PLAN — этап 7.0: заголовки HTTP-источника (`Referer`/`User-Agent`)
 
 **Статус:** реализовано и принято владельцем 2026-11-25; тесты/clippy/fmt
-зелёные, версия `0.3.4`, Inno/MSI и portable пересобраны. Осталось —
-коммит/тег `v0.3.4` по решению владельца.
+зелёные, версия `0.3.4`, Inno/MSI и portable пересобраны. Коммит `2313580`
+и тег `v0.3.4` запушены в `origin`.
 **Требования:** `docs/SPEC.md` §2.3, §2.8, §3.1, §3.4, §7–§9.
 **Текущая задача:** `docs/CURRENT_TASK.md`, раздел 7.0.
 **Версия релиза:** `0.3.4`.
@@ -302,7 +302,8 @@ vgpu "<rutube-media-url>" --referrer https://rutube.ru/ --user-agent "Mozilla/5.
 - [x] **7.0.9 Релиз и приёмка.** Версия `0.3.4`; `just installers`:
       `dist/vgpu-player-0.3.4-setup.exe` (14,0 МБ),
       `dist/vgpu-player-0.3.4.msi` (16,5 МБ), portable `vgpu.exe` (15,1 МБ).
-      Владелец подтвердил RuTube 2026-11-25.
+      Владелец подтвердил RuTube 2026-11-25. Коммит `2313580`, тег `v0.3.4`
+      запушены в `origin`.
   - `just set-version 0.3.4`;
   - `cargo test --workspace`, `clippy -- -D warnings`, `fmt --check`;
   - `just installers`; ручная проверка RuTube и Twitch;
