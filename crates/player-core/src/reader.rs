@@ -152,32 +152,52 @@ pub(crate) fn open_reader_with_http(
                 discontinuity: None,
             })
         }
-        Source::Url(_) if source.is_hls() => {
-            let hls = match shared {
-                Some(SharedSource::Hls(hls)) => Arc::clone(hls),
-                // Одиночный читатель (тесты, CLI): свой HLS-источник.
-                _ => HlsSource::open(source, config.clone(), Arc::clone(&cancel))?,
-            };
-            let reader = hls.reader(track).ok_or_else(|| PlayerError::Hls {
-                target: source.clone(),
-                reason: "у выбранной дорожки нет плейлиста".to_owned(),
-            })?;
-            let failure = reader.failure_slot();
-            let buffering = reader.buffering_flag();
-            let discontinuity = reader.discontinuity_flag();
-            Ok(OpenedReader {
-                reader: Box::new(reader),
-                failure: Some(failure),
-                buffering: Some(buffering),
-                discontinuity: Some(discontinuity),
-            })
-        }
         Source::Url(_) => {
-            let reader = match shared {
-                Some(SharedSource::Http(shared)) => shared.reader(Arc::clone(&cancel)),
-                // Одиночный читатель (тесты, CLI): свой кэш на источник.
-                _ => HttpReader::open(source, config.clone(), Arc::clone(&cancel))?,
-            };
+            // Уже открытый источник важнее расширения: YouTube-манифест
+            // может не заканчиваться на `.m3u8`.
+            if let Some(SharedSource::Hls(hls)) = shared {
+                let reader = hls.reader(track).ok_or_else(|| PlayerError::Hls {
+                    target: source.clone(),
+                    reason: "у выбранной дорожки нет плейлиста".to_owned(),
+                })?;
+                let failure = reader.failure_slot();
+                let buffering = reader.buffering_flag();
+                let discontinuity = reader.discontinuity_flag();
+                return Ok(OpenedReader {
+                    reader: Box::new(reader),
+                    failure: Some(failure),
+                    buffering: Some(buffering),
+                    discontinuity: Some(discontinuity),
+                });
+            }
+            if let Some(SharedSource::Http(http)) = shared {
+                let reader = http.reader(Arc::clone(&cancel));
+                let failure = reader.failure_slot();
+                let buffering = reader.buffering_flag();
+                return Ok(OpenedReader {
+                    reader: Box::new(reader),
+                    failure: Some(failure),
+                    buffering: Some(buffering),
+                    discontinuity: None,
+                });
+            }
+            if source.is_hls() {
+                let hls = HlsSource::open(source, config.clone(), Arc::clone(&cancel))?;
+                let reader = hls.reader(track).ok_or_else(|| PlayerError::Hls {
+                    target: source.clone(),
+                    reason: "у выбранной дорожки нет плейлиста".to_owned(),
+                })?;
+                let failure = reader.failure_slot();
+                let buffering = reader.buffering_flag();
+                let discontinuity = reader.discontinuity_flag();
+                return Ok(OpenedReader {
+                    reader: Box::new(reader),
+                    failure: Some(failure),
+                    buffering: Some(buffering),
+                    discontinuity: Some(discontinuity),
+                });
+            }
+            let reader = HttpReader::open(source, config.clone(), Arc::clone(&cancel))?;
             let failure = reader.failure_slot();
             let buffering = reader.buffering_flag();
             Ok(OpenedReader {

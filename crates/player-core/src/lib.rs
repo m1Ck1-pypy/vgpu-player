@@ -25,9 +25,10 @@ mod spectrum;
 mod sync;
 mod versions;
 mod video;
+mod youtube;
 
 pub use command::Command;
-pub use error::PlayerError;
+pub use error::{PlayerError, YoutubeErrorKind};
 pub use event::Event;
 pub use http_options::{HttpOptions, HttpOptionsError};
 pub use media::{AudioTrackInfo, MediaInfo, MediaReady, VideoTrackInfo};
@@ -37,3 +38,6 @@ pub use spectrum::{SPECTRUM_BARS, SpectrumBars};
 pub use sync::{NetworkStats, SyncStats};
 pub use versions::{FfmpegVersion, FfmpegVersions};
 pub use video::{VideoDecoder, VideoFrame, VideoInfo, preview_frame};
+
+#[doc(hidden)]
+pub use youtube::set_endpoints_for_tests;

@@ -26,8 +26,13 @@ use crate::video::{VideoDecoder, VideoInfo};
 pub(crate) struct Media {
     pub(crate) audio: Option<AudioDecoder>,
     pub(crate) video: Option<VideoDecoder>,
-    /// Исходный адрес: нужен для перемотки HLS и текстов ошибок.
-    source: MediaSource,
+    /// Адрес, с которым работают читатели.
+    ///
+    /// Для YouTube это разрешённый `hlsManifestUrl`, а не ссылка на watch.
+    /// Исходную ссылку движок передаёт в `ready`/`info` отдельно.
+    open_source: MediaSource,
+    /// Название ролика YouTube, если резолвер его вернул.
+    title: Option<String>,
     /// Флаг отмены: читатели переоткрываются при перемотке HLS.
     cancel: Arc<AtomicBool>,
     /// Общий сетевой источник: один кэш и одни счётчики на обе дорожки.
@@ -98,17 +103,52 @@ impl Media {
             });
         }
 
+        // YouTube: получаем HLS-манифест до выбора источника. Исходная
+        // ссылка остаётся для UI и ошибок, а читатели работают с разрешённым
+        // URL, даже если он не заканчивается на `.m3u8`.
+        let youtube = crate::youtube::is_youtube(source);
+        let mut title = None;
+        let open_source = if youtube {
+            match crate::youtube::resolve(source, http, &cancel, cancelled)? {
+                crate::youtube::ResolvedSource::Hls {
+                    source,
+                    title: found,
+                } => {
+                    title = found;
+                    source
+                }
+            }
+        } else {
+            source.clone()
+        };
+        if cancelled() {
+            return Err(PlayerError::Cancelled);
+        }
+
+        // Для HLS-запросов YouTube нужен браузерный User-Agent, если
+        // пользователь не задал свой: URL googlevideo рассчитаны на браузер.
+        let mut open_http = http.clone();
+        if youtube
+            && http.header("User-Agent").is_none()
+            && let Ok(with_ua) = open_http
+                .clone()
+                .with_user_agent(crate::youtube::BROWSER_UA)
+        {
+            open_http = with_ua;
+        }
+
         // Сетевой источник открывается один раз: и звук, и видео читают из
         // общего кэша (или общего HLS-источника), а не качают каждый сам себе.
-        let config = HttpConfig::with_http(http);
-        let shared = match source {
-            MediaSource::Url(_) if source.is_hls() => Some(SharedSource::Hls(HlsSource::open(
-                source,
+        let config = HttpConfig::with_http(&open_http);
+        let hls = youtube || open_source.is_hls();
+        let shared = match &open_source {
+            MediaSource::Url(_) if hls => Some(SharedSource::Hls(HlsSource::open(
+                &open_source,
                 config,
                 Arc::clone(&cancel),
             )?)),
             MediaSource::Url(_) => Some(SharedSource::Http(HttpSource::open(
-                source,
+                &open_source,
                 config,
                 Arc::clone(&cancel),
             )?)),
@@ -127,12 +167,16 @@ impl Media {
             );
         }
 
-        let audio = AudioDecoder::open_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
+        let audio =
+            AudioDecoder::open_with_cancel(&open_source, Arc::clone(&cancel), shared.as_ref());
         if cancelled() {
             return Err(PlayerError::Cancelled);
         }
-        let mut video =
-            VideoDecoder::open_source_with_cancel(source, Arc::clone(&cancel), shared.as_ref());
+        let mut video = VideoDecoder::open_source_with_cancel(
+            &open_source,
+            Arc::clone(&cancel),
+            shared.as_ref(),
+        );
         if let (Some(SharedSource::Hls(hls)), Ok(video)) = (&shared, &mut video) {
             video.set_pts_shift_ms(hls.video_pts_shift_ms());
         }
@@ -183,7 +227,8 @@ impl Media {
         Ok(Self {
             audio,
             video,
-            source: source.clone(),
+            open_source,
+            title,
             cancel,
             shared,
             seekable,
@@ -218,17 +263,26 @@ impl Media {
     /// Переоткрывает обе дорожки на сегменте `position` и отбрасывает сэмплы
     /// раньше неё. Так перемотка обходит отсутствие байтового размера у HLS.
     fn seek_hls(&mut self, hls: &Arc<HlsSource>, position: Duration) -> Result<(), PlayerError> {
-        hls.seek_time(position)?;
+        let starts = hls.seek_time(position)?;
+        debug!(
+            ?position,
+            video_start = ?starts.video,
+            audio_start = ?starts.audio,
+            "HLS: сегменты для перемотки"
+        );
 
         // Старые читатели не должны пережить переоткрытие.
         self.audio = None;
         self.video = None;
         let shared = self.shared.clone();
 
-        let audio =
-            AudioDecoder::open_with_cancel(&self.source, Arc::clone(&self.cancel), shared.as_ref());
+        let audio = AudioDecoder::open_with_cancel(
+            &self.open_source,
+            Arc::clone(&self.cancel),
+            shared.as_ref(),
+        );
         let video = VideoDecoder::open_source_with_cancel(
-            &self.source,
+            &self.open_source,
             Arc::clone(&self.cancel),
             shared.as_ref(),
         );
@@ -258,7 +312,9 @@ impl Media {
             video.skip_to(position)?;
         }
         if let Some(audio) = audio.as_mut() {
-            audio.skip_to(position)?;
+            // У HLS-аудио PTS после переоткрытия может начинаться с нуля:
+            // отбрасываем сэмплы по длительности от начала сегмента.
+            audio.skip_to(position, starts.audio)?;
         }
 
         self.audio = audio;
@@ -303,11 +359,17 @@ impl Media {
         self.video.as_ref().map(|video| *video.info())
     }
 
+    /// Название ролика (только YouTube), если оно известно.
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// Собирает событие `Ready`: всё, что UI нужно узнать об открытом источнике.
     pub(crate) fn ready(&self, source: &MediaSource) -> MediaReady {
         MediaReady {
             media_info: self.info(source),
             video_info: self.video_info(),
+            title: self.title().map(str::to_owned),
             duration: self.duration(),
             seekable: self.seekable,
             live: self.live,
@@ -376,6 +438,8 @@ pub struct MediaReady {
     pub media_info: MediaInfo,
     /// Размеры и частота кадров видеодорожки.
     pub video_info: Option<VideoInfo>,
+    /// Название ролика YouTube, если резолвер его вернул.
+    pub title: Option<String>,
     /// Длительность источника, если она известна.
     pub duration: Option<Duration>,
     /// Поддерживает ли источник перемотку.

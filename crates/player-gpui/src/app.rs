@@ -141,6 +141,9 @@ struct PlayerWindow {
     about_open: bool,
     /// Показана панель «Информация о файле» поверх кадра.
     file_info_open: bool,
+    /// Заголовок, уже установленный окну: `set_window_title` зовём только
+    /// при смене, чтобы не трогать окно каждый кадр.
+    window_title: String,
     /// Панель «Открыть…»: выбор «Файл»/«URL» и поле ввода ссылки.
     open_panel: OpenPanel,
     /// Текст ошибки разбора ссылки: панель остаётся открытой для правки.
@@ -211,6 +214,7 @@ impl PlayerWindow {
             menu_open: false,
             about_open: false,
             file_info_open: false,
+            window_title: WINDOW_TITLE.to_owned(),
             open_panel: OpenPanel::default(),
             open_panel_error: None,
             auto_hide_enabled: settings.auto_hide,
@@ -887,7 +891,7 @@ impl PlayerWindow {
             };
 
             card = card
-                .child(div().text_sm().child("Ссылка на видео или .m3u8"))
+                .child(div().text_sm().child("Ссылка на видео, .m3u8 или YouTube"))
                 .child(field)
                 .child(panel_hint(
                     "Enter — открыть · Ctrl+V — вставить · Esc — закрыть",
@@ -978,6 +982,13 @@ impl Render for PlayerWindow {
         let fullscreen = window.is_fullscreen();
         self.player
             .update(cx, |video, cx| video.set_fullscreen(fullscreen, cx));
+
+        // Заголовок окна — название ролика YouTube, если ядро его прислало.
+        let title = window_title_for(self.player.read(cx).title());
+        if self.window_title != title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
 
         let mut root = div()
             .size_full()
@@ -1392,6 +1403,14 @@ fn initial_volume(settings: f32, from_cli: Option<f32>) -> f32 {
     from_cli.map_or(settings, |volume| volume.clamp(0.0, 1.0))
 }
 
+/// Заголовок окна: название ролика важнее имени продукта.
+fn window_title_for(video_title: Option<&str>) -> String {
+    match video_title {
+        Some(title) if !title.trim().is_empty() => format!("{title} — {WINDOW_TITLE}"),
+        _ => WINDOW_TITLE.to_owned(),
+    }
+}
+
 /// Открывает главное окно в уже запущенном приложении.
 fn open_main_window(
     cx: &mut App,
@@ -1478,6 +1497,13 @@ pub fn run_app(path: Option<PathBuf>) -> Result<(), LaunchError> {
 mod tests {
     use super::*;
     use player_core::FfmpegVersion;
+
+    #[test]
+    fn window_title_uses_video_title() {
+        assert_eq!(window_title_for(Some("Ролик")), "Ролик — VGPU Player");
+        assert_eq!(window_title_for(None), "VGPU Player");
+        assert_eq!(window_title_for(Some("   ")), "VGPU Player");
+    }
 
     #[test]
     fn double_click_asks_for_fullscreen() {

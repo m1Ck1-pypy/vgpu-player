@@ -6,7 +6,7 @@
 для Windows. Учебный проект: цель — понять каждую строку и научиться Rust, а не
 сделать конкурирующий плеер.
 
-Версия 0.3.4. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
+Версия 0.4.0. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
 аудио-часам, управление, надёжность, пул BGRA-буферов, полировка интерфейса,
 библиотека `player-gpui`, установщики, ассоциации файлов, автовоспроизведение,
 сохранение настроек, спектроанализатор для аудиофайлов.
@@ -36,6 +36,9 @@
 - HTTP-заголовки источника (`Referer`, `User-Agent`) для ссылок вроде RuTube
   `play_stream`, которым мало одного URL; они уходят на все запросы,
   включая HLS-сегменты;
+- YouTube VOD по обычной ссылке (`youtube.com/watch?v=…`, `youtu.be/…`,
+  `/shorts/…`) — анонимно, через HLS-манифест; YouTube live, плейлисты,
+  вход и age-restricted пока не поддерживаются;
 - портативная сборка и установщики: Inno Setup и MSI (WiX).
 
 ## Структура
@@ -119,7 +122,9 @@ vgpu "<media-url>" --referrer https://rutube.ru/ --user-agent "Mozilla/5.0"
 
 Аргумент разбирается как источник: путь, `file:` или `https://`. Без
 аргумента открывается пустое окно плеера. Прямые `http(s)`-ссылки на
-MP4/MKV/WebM/MP3 и HLS (`.m3u8`, VOD и live) играют. Окно во время открытия
+MP4/MKV/WebM/MP3 и HLS (`.m3u8`, VOD и live) играют. YouTube VOD
+(`watch?v=`, `youtu.be`, `/shorts/`) открывается анонимно через HLS;
+YouTube live, плейлисты и вход пока не поддерживаются. Окно во время открытия
 показывает «Загрузка…» и не замирает. Формы `file:///D:/…`, `file://D:/…`,
 `file:/D:/…` и `file:D:/…` равнозначны; `file://server/share/…` — UNC,
 `file://localhost/…` — локальный путь.
@@ -210,8 +215,8 @@ volume = 0.8
 
 ```bash
 just portable        # release-exe + dist/vgpu-player/ (exe + DLL)
-just installer-inno  # dist/vgpu-player-0.3.4-setup.exe
-just installer-msi   # dist/vgpu-player-0.3.4.msi
+just installer-inno  # dist/vgpu-player-0.4.0-setup.exe
+just installer-msi   # dist/vgpu-player-0.4.0.msi
 just installers      # portable + оба установщика
 ```
 
