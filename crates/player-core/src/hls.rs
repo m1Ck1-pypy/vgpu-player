@@ -94,6 +94,8 @@ pub(crate) struct AudioRendition {
     pub(crate) default: bool,
     /// `AUTOSELECT=YES`.
     pub(crate) autoselect: bool,
+    /// YouTube-атрибут `acont=original`: оригинальная дорожка.
+    pub(crate) original: bool,
     /// `CHANNELS`: первое число из значения (`2`, `6/JOC`).
     pub(crate) channels: Option<u32>,
     /// Абсолютная ссылка на media-плейлист дорожки; `None` — muxed-аудио.
@@ -314,6 +316,10 @@ fn parse_audio_rendition(
         language: attributes.get("LANGUAGE").map(str::to_owned),
         default: attributes.is_yes("DEFAULT"),
         autoselect: attributes.is_yes("AUTOSELECT"),
+        original: attributes
+            .get("acont")
+            .or_else(|| attributes.get("ACONT"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("original")),
         channels,
         uri: attributes.get("URI").map(|uri| resolve_uri(base, uri)),
     }))
@@ -342,7 +348,10 @@ pub(crate) fn select_variant(master: &MasterPlaylist) -> Result<SelectedPlaylist
         // Всё выше 1080p: берём самое лёгкое, чтобы не тянуть 4K без нужды.
         deduplicated
             .iter()
-            .min_by_key(|variant| variant_score(variant))
+            .min_by_key(|variant| {
+                let (height, width, sdr, bandwidth) = variant_score(variant);
+                (height, width, 1 - sdr, bandwidth)
+            })
             .cloned()
     } else {
         capped
@@ -387,9 +396,26 @@ fn better_variant(candidate: &Variant, existing: &Variant) -> bool {
     }
 }
 
-fn variant_score(variant: &Variant) -> (u32, u32, u64) {
+fn variant_score(variant: &Variant) -> (u32, u32, u8, u64) {
     let (width, height) = variant.resolution.unwrap_or((0, 0));
-    (height, width, variant.bandwidth.unwrap_or(0))
+    // SDR (1) важнее HDR (0): без tone mapping HDR выглядит блёкло.
+    (
+        height,
+        width,
+        u8::from(!is_hdr(variant)),
+        variant.bandwidth.unwrap_or(0),
+    )
+}
+
+fn is_hdr(variant: &Variant) -> bool {
+    variant.codecs.as_deref().is_some_and(|codecs| {
+        codecs.split(',').map(str::trim).any(|codec| {
+            let codec = codec.to_ascii_lowercase();
+            codec.starts_with("vp9.2")
+                || codec.starts_with("vp09.02")
+                || (codec.starts_with("av01") && codec.split('.').nth(3) == Some("10"))
+        })
+    })
 }
 
 fn is_aac(variant: &Variant) -> bool {
@@ -428,9 +454,10 @@ fn select_audio(
         return Ok(None);
     };
 
-    // Порядок предпочтений: DEFAULT=YES, затем 2 канала, затем AUTOSELECT.
+    // Порядок предпочтений: original, DEFAULT=YES, 2 канала, AUTOSELECT.
     let score = |rendition: &AudioRendition| {
         (
+            u8::from(rendition.original),
             u8::from(rendition.default),
             u8::from(rendition.channels == Some(2)),
             u8::from(rendition.autoselect),
@@ -985,6 +1012,16 @@ struct HlsContext {
 /// Открытый HLS-источник: плейлисты дорожек, счётчики и признак live.
 ///
 /// Живёт в `Media`; читатели получают сегменты через [`HlsSource::reader`].
+/// Начало сегментов, выбранных для перемотки.
+///
+/// Нужно декодерам: у HLS-потоков PTS после переоткрытия может начинаться
+/// с нуля, поэтому в целевую позицию переводит длительность от начала
+/// сегмента, а не абсолютный PTS.
+pub(crate) struct SeekStart {
+    pub(crate) video: Duration,
+    pub(crate) audio: Duration,
+}
+
 pub(crate) struct HlsSource {
     source: Source,
     video: Arc<TrackSource>,
@@ -1151,38 +1188,78 @@ impl HlsSource {
     /// Перематывает VOD к целевой позиции: новые читатели начнут с сегмента,
     /// содержащего `position`.
     ///
+    /// Возвращает время начала выбранных сегментов: декодеры отбрасывают
+    /// сэмплы не по абсолютному PTS (у HLS-потоков он может начинаться с 0
+    /// после переоткрытия), а по длительности от начала сегмента.
+    ///
     /// Сами декодеры переоткрывает `Media`: виртуальный поток HLS не имеет
     /// байтового размера, поэтому байтовый `seek` здесь неприменим.
-    pub(crate) fn seek_time(&self, position: Duration) -> Result<(), PlayerError> {
+    pub(crate) fn seek_time(&self, position: Duration) -> Result<SeekStart, PlayerError> {
         if self.live {
             return Err(PlayerError::NotSeekable {
                 target: self.source.clone(),
             });
         }
 
-        let video = self
-            .video
-            .sequence_at(position)
-            .ok_or_else(|| PlayerError::NotSeekable {
-                target: self.source.clone(),
-            })?;
-        self.video.set_start_sequence(video);
-
-        if let Some(audio) = &self.audio {
-            let sequence = audio
-                .sequence_at(position)
+        let (video_sequence, video_start) =
+            self.video
+                .segment_at(position)
                 .ok_or_else(|| PlayerError::NotSeekable {
                     target: self.source.clone(),
                 })?;
-            audio.set_start_sequence(sequence);
-        }
+        self.video.set_start_sequence(video_sequence);
 
-        Ok(())
+        let audio_start = if let Some(audio) = &self.audio {
+            let (sequence, start) =
+                audio
+                    .segment_at(position)
+                    .ok_or_else(|| PlayerError::NotSeekable {
+                        target: self.source.clone(),
+                    })?;
+            audio.set_start_sequence(sequence);
+            start
+        } else {
+            // Muxed: звук и видео читают одну дорожку с одного сегмента.
+            video_start
+        };
+
+        Ok(SeekStart {
+            video: video_start,
+            audio: audio_start,
+        })
     }
 
-    /// Счётчики сети по обеим дорожкам.
+    /// Счётчики сети по обеим дорожкам и занятость окна сегментов.
     pub(crate) fn network_stats(&self) -> NetworkStats {
-        self.counters.snapshot()
+        let mut stats = self.counters.snapshot();
+        stats.window_bytes = self.window_bytes();
+        stats.window_video_bytes = self.video.loaded_bytes() as u64;
+        stats.window_audio_bytes = self
+            .audio
+            .as_ref()
+            .map_or(0, |track| track.loaded_bytes() as u64);
+        stats.buffer_ahead = Some(self.buffer_ahead());
+        stats
+    }
+
+    /// Сколько байт сейчас лежит в окне скачанных сегментов обеих дорожек.
+    pub(crate) fn window_bytes(&self) -> u64 {
+        self.video
+            .loaded_bytes()
+            .saturating_add(self.audio.as_ref().map_or(0, |track| track.loaded_bytes()))
+            as u64
+    }
+
+    /// Сколько секунд сегментов скачано впереди самой ранней позиции.
+    ///
+    /// Для demuxed берём меньшую из дорожек: залипание будет по той,
+    /// у которой запас кончится раньше.
+    pub(crate) fn buffer_ahead(&self) -> Duration {
+        let video = self.video.buffered_ahead();
+        match &self.audio {
+            Some(audio) => video.min(audio.buffered_ahead()),
+            None => video,
+        }
     }
 
     /// Сдвиг PTS видео относительно звука для demuxed live, в миллисекундах.
@@ -1372,8 +1449,24 @@ impl TrackState {
         bytes
     }
 
-    /// Вытесняет сегменты позади всех курсоров, пока окно не влезет в предел.
+    /// Вытесняет сегменты, пока окно не влезет в предел.
     fn evict(&mut self) {
+        self.evict_to(MAX_WINDOW_BYTES);
+    }
+
+    /// Держит окно в `limit` байт.
+    ///
+    /// Сначала выбрасываем сегменты позади всех курсоров. Если этого мало
+    /// (например, после перемотки назад в кэше остался весь ролик),
+    /// выбрасываем и самые дальние сегменты впереди, оставляя запас prefetch.
+    /// Опираться на порядок вставки нельзя: после перемотки назад
+    /// `order.front()` может быть уже впереди курсора, и тогда старый код
+    /// вообще ничего не вытеснял.
+    fn evict_to(&mut self, limit: usize) {
+        if self.loaded_bytes <= limit {
+            return;
+        }
+
         let min_cursor = self
             .cursors
             .iter()
@@ -1381,17 +1474,47 @@ impl TrackState {
             .min()
             .unwrap_or(u64::MAX);
 
-        while self.loaded_bytes > MAX_WINDOW_BYTES {
-            let Some(&sequence) = self.order.front() else {
+        // 1. Позади читателя.
+        self.drop_matching(&mut |sequence| sequence < min_cursor, limit);
+        // 2. Слишком далеко впереди: оставляем окно prefetch от курсора.
+        let keep_ahead = min_cursor.saturating_add(PREFETCH_MAX_SEGMENTS);
+        self.drop_matching(&mut |sequence| sequence > keep_ahead, limit);
+        // 3. Даже ближайшее окно больше лимита: режем самые дальние впереди.
+        while self.loaded_bytes > limit {
+            let Some(index) = self
+                .order
+                .iter()
+                .enumerate()
+                .filter(|&(_, &sequence)| sequence > min_cursor)
+                .max_by_key(|&(_, &sequence)| sequence)
+                .map(|(index, _)| index)
+            else {
                 break;
             };
-            if sequence >= min_cursor {
-                break;
+            self.remove_at(index);
+        }
+    }
+
+    fn drop_matching(&mut self, drop: &mut impl FnMut(u64) -> bool, limit: usize) {
+        let mut index = 0;
+        while index < self.order.len() && self.loaded_bytes > limit {
+            let sequence = self.order[index];
+            if drop(sequence) {
+                self.order.remove(index);
+                if let Some(bytes) = self.fetched.remove(&sequence) {
+                    self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes.len());
+                }
+            } else {
+                index += 1;
             }
-            self.order.pop_front();
-            if let Some(bytes) = self.fetched.remove(&sequence) {
-                self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes.len());
-            }
+        }
+    }
+
+    fn remove_at(&mut self, index: usize) {
+        if let Some(sequence) = self.order.remove(index)
+            && let Some(bytes) = self.fetched.remove(&sequence)
+        {
+            self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes.len());
         }
     }
 }
@@ -1481,6 +1604,33 @@ impl TrackSource {
 
     fn is_buffering(&self) -> bool {
         self.buffering.load(Ordering::Relaxed)
+    }
+
+    /// Сколько байт сегментов сейчас в окне этой дорожки.
+    fn loaded_bytes(&self) -> usize {
+        lock(&self.state).loaded_bytes
+    }
+
+    /// Сколько секунд непрерывно скачанных сегментов лежит впереди читателя.
+    fn buffered_ahead(&self) -> Duration {
+        let state = lock(&self.state);
+        let base = state
+            .cursors
+            .iter()
+            .map(|cursor| cursor.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or_else(|| self.start_sequence());
+
+        let mut total = Duration::ZERO;
+        let mut sequence = base;
+        while let Some((found, segment)) = state.find(sequence) {
+            if !state.fetched.contains_key(&found) {
+                break;
+            }
+            total = total.saturating_add(segment.duration);
+            sequence = sequence.saturating_add(1);
+        }
+        total
     }
 
     fn register_cursor(self: &Arc<Self>, cursor: Arc<AtomicU64>) {
@@ -1830,8 +1980,8 @@ impl TrackSource {
         Arc::clone(&self.buffering)
     }
 
-    /// Сегмент с целевым временем в VOD-плейлисте.
-    fn sequence_at(&self, position: Duration) -> Option<u64> {
+    /// Сегмент с целевым временем в VOD-плейлисте: номер и начало.
+    fn segment_at(&self, position: Duration) -> Option<(u64, Duration)> {
         let state = lock(&self.state);
         if !state.playlist.end_list {
             return None;
@@ -1841,13 +1991,20 @@ impl TrackSource {
         for (index, segment) in state.playlist.segments.iter().enumerate() {
             let end = elapsed.saturating_add(segment.duration);
             if position < end {
-                return Some(state.playlist.media_sequence + index as u64);
+                return Some((state.playlist.media_sequence + index as u64, elapsed));
             }
             elapsed = end;
         }
 
         let last = state.playlist.segments.len().checked_sub(1)?;
-        Some(state.playlist.media_sequence + last as u64)
+        let start = elapsed.saturating_sub(state.playlist.segments[last].duration);
+        Some((state.playlist.media_sequence + last as u64, start))
+    }
+
+    /// Сегмент с целевым временем в VOD-плейлисте (тестовый помощник).
+    #[cfg(test)]
+    fn sequence_at(&self, position: Duration) -> Option<u64> {
+        self.segment_at(position).map(|(sequence, _)| sequence)
     }
 
     /// Начало live-edge по `PROGRAM-DATE-TIME`.
@@ -2496,6 +2653,64 @@ mod tests {
     use crate::http_options::HttpOptions;
 
     const BASE: &str = "https://cdn.example.com/live/stream/index.m3u8?token=abc";
+
+    fn track_state(sequences: &[u64], cursor: Option<u64>) -> TrackState {
+        let playlist = MediaPlaylist {
+            target_duration: None,
+            media_sequence: 0,
+            end_list: true,
+            segments: Vec::new(),
+            total_duration: Duration::ZERO,
+        };
+        let mut state = TrackState {
+            playlist,
+            fetched: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            loaded_bytes: 0,
+            in_flight: std::collections::HashSet::new(),
+            maps: HashMap::new(),
+            cursors: Vec::new(),
+            last_refresh: Instant::now(),
+        };
+        for &sequence in sequences {
+            state.insert(sequence, Arc::new(vec![0_u8; 1]));
+        }
+        if let Some(cursor) = cursor {
+            state.cursors.push(Arc::new(AtomicU64::new(cursor)));
+        }
+        state
+    }
+
+    #[test]
+    fn evict_drops_segments_behind_the_cursor() {
+        let mut state = track_state(&[0, 1, 2, 3, 4, 5], Some(4));
+
+        state.evict_to(4);
+
+        assert!(state.loaded_bytes <= 4, "{}", state.loaded_bytes);
+        assert!(!state.fetched.contains_key(&0), "сегмент позади вытеснен");
+        assert!(
+            state.fetched.contains_key(&4),
+            "сегмент под курсором остаётся"
+        );
+    }
+
+    #[test]
+    fn evict_drops_far_segments_after_backward_jump() {
+        // Порядок вставки из прошлого проигрывания: сначала поздние сегменты,
+        // затем после перемотки назад — ранние. Старый код смотрел только
+        // `order.front()` и не вытеснял ничего.
+        let mut state = track_state(&[10, 11, 12, 13, 0, 1, 2, 3], Some(0));
+
+        state.evict_to(4);
+
+        assert!(state.loaded_bytes <= 4, "{}", state.loaded_bytes);
+        assert!(state.fetched.contains_key(&0), "текущий сегмент остаётся");
+        assert!(
+            !state.fetched.contains_key(&13),
+            "дальний сегмент впереди вытеснен"
+        );
+    }
 
     fn syntax(error: &HlsError) -> (usize, &'static str) {
         match error {

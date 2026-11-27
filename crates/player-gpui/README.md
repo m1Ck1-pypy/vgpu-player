@@ -272,13 +272,13 @@ cargo run -p player-gpui --example embed_in_app -- assets/test/sync_test.mp4
 
 1. Поставить тег, чтобы зависимость была воспроизводимой:
    ```bash
-   git tag v0.3.4
-   git push origin v0.3.4
+   git tag v0.4.0
+   git push origin v0.4.0
    ```
 2. В чужом проекте подключить тег (предпочтительно) или ветку:
    ```toml
    [dependencies]
-   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.3.4", package = "player-gpui" }
+   player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", tag = "v0.4.0", package = "player-gpui" }
    # или
    player-gpui = { git = "https://github.com/m1Ck1-pypy/vgpu-player.git", branch = "main", package = "player-gpui" }
    ```

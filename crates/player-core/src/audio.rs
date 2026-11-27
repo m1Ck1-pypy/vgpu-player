@@ -164,11 +164,19 @@ impl AudioDecoder {
 
     /// Переходит к позиции без байтовой перемотки: HLS-читатель уже стоит на
     /// сегменте целевого времени, остаётся отбросить сэмплы до неё.
-    pub(crate) fn skip_to(&mut self, position: Duration) -> Result<(), PlayerError> {
+    ///
+    /// `segment_start` — время начала этого сегмента: PTS аудио после
+    /// переоткрытия может начинаться с нуля, поэтому отбрасываем по
+    /// длительности от начала сегмента.
+    pub(crate) fn skip_to(
+        &mut self,
+        position: Duration,
+        segment_start: Duration,
+    ) -> Result<(), PlayerError> {
         match self {
             Self::Symphonia(decoder) => decoder.seek(position),
             Self::Ffmpeg(decoder) => {
-                decoder.skip_to(position);
+                decoder.skip_to(position, segment_start);
                 Ok(())
             }
         }
@@ -419,6 +427,10 @@ pub(crate) struct FfmpegDecoder {
     source: Option<(FfmpegSample, ChannelLayout, u32)>,
     /// После перемотки отбрасываем кадры раньше этой позиции.
     discard_until: Option<Duration>,
+    /// Сколько секунд от начала сегмента выбросить (HLS): не зависит от PTS.
+    discard_skip: Option<Duration>,
+    /// Сколько уже выброшено для `discard_skip`.
+    discard_elapsed: Duration,
     /// `send_eof` уже отработал: дальше только дочитываем кадры.
     eof_sent: bool,
     /// Сколько кадров уже сконвертировано (диагностика).
@@ -528,6 +540,8 @@ impl FfmpegDecoder {
             resampler: None,
             source: None,
             discard_until: None,
+            discard_skip: None,
+            discard_elapsed: Duration::ZERO,
             eof_sent: false,
             converted_chunks: 0,
             discontinuity,
@@ -657,19 +671,31 @@ impl FfmpegDecoder {
             .map_err(|error| self.error(error))?;
         self.decoder.flush();
         self.discard_until = Some(position);
+        self.discard_skip = None;
+        self.discard_elapsed = Duration::ZERO;
         self.eof_sent = false;
         Ok(())
     }
 
     /// То же без байтовой перемотки: HLS-читатель уже на нужном сегменте.
-    fn skip_to(&mut self, position: Duration) {
+    fn skip_to(&mut self, position: Duration, segment_start: Duration) {
         self.decoder.flush();
-        self.discard_until = Some(position);
+        self.discard_until = None;
+        self.discard_skip = Some(position.saturating_sub(segment_start));
+        self.discard_elapsed = Duration::ZERO;
         self.eof_sent = false;
     }
 
     /// Нужно ли выбросить кадр: он целиком раньше цели перемотки.
     fn should_discard(&mut self, frame: &FfmpegFrame) -> bool {
+        let length = frame_length(frame);
+
+        // HLS: отбрасываем фиксированную длительность от начала сегмента.
+        // PTS здесь не годится: после переоткрытия он может начинаться с 0.
+        if self.discard_skip.is_some() {
+            return skip_remaining(&mut self.discard_skip, &mut self.discard_elapsed, length);
+        }
+
         let Some(target) = self.discard_until else {
             return false;
         };
@@ -681,12 +707,6 @@ impl FfmpegDecoder {
         else {
             self.discard_until = None;
             return false;
-        };
-
-        let length = if frame.rate() > 0 {
-            Duration::from_secs_f64(f64::from(frame.rate()).recip() * frame.samples() as f64)
-        } else {
-            Duration::ZERO
         };
 
         if pts.saturating_add(length) <= target {
@@ -813,6 +833,34 @@ fn is_eagain(error: &FfmpegError) -> bool {
 }
 
 /// Переводит PTS из временной базы потока в `Duration`.
+/// Длительность одного декодированного аудиокадра.
+fn frame_length(frame: &FfmpegFrame) -> Duration {
+    if frame.rate() > 0 {
+        Duration::from_secs_f64(f64::from(frame.rate()).recip() * frame.samples() as f64)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Решение об отбрасывании по длительности от начала сегмента.
+///
+/// `skip` — сколько ещё выбросить, `elapsed` — сколько уже выброшено.
+/// Возвращает `true`, если кадр нужно выбросить.
+fn skip_remaining(skip: &mut Option<Duration>, elapsed: &mut Duration, length: Duration) -> bool {
+    let Some(target) = *skip else {
+        return false;
+    };
+    let end = elapsed.saturating_add(length);
+    if end <= target {
+        *elapsed = end;
+        true
+    } else {
+        *skip = None;
+        *elapsed = Duration::ZERO;
+        false
+    }
+}
+
 fn timestamp_to_duration(timestamp: i64, time_base: Rational) -> Option<Duration> {
     let numerator = i128::from(time_base.numerator());
     let denominator = i128::from(time_base.denominator());
@@ -854,6 +902,51 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn hls_skip_discards_exactly_the_segment_offset() {
+        let frame = Duration::from_millis(250);
+        let mut skip = Some(Duration::from_millis(1_000));
+        let mut elapsed = Duration::ZERO;
+
+        for _ in 0..4 {
+            assert!(
+                skip_remaining(&mut skip, &mut elapsed, frame),
+                "первые четыре кадра до цели отбрасываются"
+            );
+        }
+        assert!(
+            !skip_remaining(&mut skip, &mut elapsed, frame),
+            "первый кадр на цели/после неё остаётся"
+        );
+        assert_eq!(skip, None, "решение принимается один раз");
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn hls_skip_keeps_everything_when_offset_is_zero() {
+        let frame = Duration::from_millis(250);
+        let mut skip = Some(Duration::ZERO);
+        let mut elapsed = Duration::ZERO;
+
+        assert!(!skip_remaining(&mut skip, &mut elapsed, frame));
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn hls_skip_is_cleared_after_the_last_discarded_frame() {
+        let frame = Duration::from_millis(100);
+        let mut skip = Some(Duration::from_millis(250));
+        let mut elapsed = Duration::ZERO;
+
+        assert!(skip_remaining(&mut skip, &mut elapsed, frame));
+        assert!(skip_remaining(&mut skip, &mut elapsed, frame));
+        assert!(
+            !skip_remaining(&mut skip, &mut elapsed, frame),
+            "третий кадр уже пересёк цель"
+        );
+        assert_eq!(skip, None);
+    }
 
     const SAMPLE_RATE: u32 = 8_000;
     const CHANNELS: u16 = 2;

@@ -144,8 +144,18 @@ impl VideoDecoder {
         source: &Source,
         http: HttpOptions,
     ) -> Result<Self, PlayerError> {
+        // `--decode-frames` идёт мимо `Media`, поэтому YouTube-ссылку
+        // резолвим здесь отдельно.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let open_source = if crate::youtube::is_youtube(source) {
+            match crate::youtube::resolve(source, &http, &cancel, &|| false)? {
+                crate::youtube::ResolvedSource::Hls { source, .. } => source,
+            }
+        } else {
+            source.clone()
+        };
         let config = HttpConfig::with_http(&http);
-        Self::open_source_with_cancel_http(source, Arc::new(AtomicBool::new(false)), None, &config)
+        Self::open_source_with_cancel_http(&open_source, cancel, None, &config)
     }
 
     /// Открывает источник с отменой сетевого читателя.

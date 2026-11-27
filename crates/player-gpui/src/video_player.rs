@@ -6,7 +6,7 @@
 //! приложению не нужно знать про команды и события ядра.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, DevicePixels, DynamicTexture, Entity,
@@ -113,10 +113,16 @@ pub struct VideoPlayer {
     video_info: Option<VideoInfo>,
     /// Контейнер, кодеки и параметры звука открытого файла.
     media_info: Option<MediaInfo>,
+    /// Название ролика YouTube, если ядро его прислало.
+    title: Option<String>,
     frame: Option<VideoFrame>,
     frame_serial: u64,
     texture: Option<VideoTexture>,
     stats: Option<SyncStats>,
+    /// Текущая скорость чтения сети, байт/с (производная от `Stats`).
+    network_speed: f32,
+    /// Последний образец счётчика байт и время его получения.
+    network_sample: Option<(Instant, u64)>,
     /// Последние уровни спектроанализатора (файлы без видео).
     ///
     /// Ядро присылает их ~30 раз в секунду; UI только рисует.
@@ -169,10 +175,13 @@ impl VideoPlayer {
             error: None,
             video_info: None,
             media_info: None,
+            title: None,
             frame: None,
             frame_serial: 0,
             texture: None,
             stats: None,
+            network_speed: 0.0,
+            network_sample: None,
             spectrum: None,
             stats_visible: false,
             fullscreen: false,
@@ -243,12 +252,16 @@ impl VideoPlayer {
         self.spectrum = None;
         self.video_info = None;
         self.media_info = None;
+        self.title = None;
         self.duration = None;
         self.position = Duration::ZERO;
         self.seekable = false;
         self.buffering = false;
         self.live = false;
         self.error = None;
+        self.stats = None;
+        self.network_speed = 0.0;
+        self.network_sample = None;
         self.state = PlaybackState::Loading;
 
         // Одно ядро на плеер: живой поток получает `Command::OpenWith`, а
@@ -357,6 +370,9 @@ impl VideoPlayer {
         }
         if self.send(Command::Pause, cx) {
             self.state = PlaybackState::Paused;
+            // На паузе `Stats` не приходят: старое значение скорости устареет.
+            self.network_speed = 0.0;
+            self.network_sample = None;
             cx.notify();
         }
     }
@@ -492,7 +508,10 @@ impl VideoPlayer {
         self.live = false;
         self.video_info = None;
         self.media_info = None;
+        self.title = None;
         self.stats = None;
+        self.network_speed = 0.0;
+        self.network_sample = None;
         self.spectrum = None;
         cx.notify();
     }
@@ -603,6 +622,11 @@ impl VideoPlayer {
         self.media_info.as_ref()
     }
 
+    /// Название ролика YouTube; `None` для файлов и обычных URL.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// Последний полученный кадр.
     pub fn frame(&self) -> Option<&VideoFrame> {
         self.frame.as_ref()
@@ -611,6 +635,11 @@ impl VideoPlayer {
     /// Последняя статистика синхронизации, если ядро её прислало.
     pub fn stats(&self) -> Option<SyncStats> {
         self.stats
+    }
+
+    /// Текущая скорость чтения сети в байтах в секунду (0, пока нет двух срезов).
+    pub fn network_speed(&self) -> f32 {
+        self.network_speed
     }
 
     /// Последние уровни спектроанализатора.
@@ -857,6 +886,30 @@ impl VideoPlayer {
         }
     }
 
+    /// Пересчитывает скорость сети по приросту байт между срезами `Stats`.
+    fn update_network_speed(&mut self, bytes: Option<u64>) {
+        let Some(bytes) = bytes else {
+            self.network_speed = 0.0;
+            self.network_sample = None;
+            return;
+        };
+
+        let now = Instant::now();
+        if let Some((at, previous)) = self.network_sample {
+            let elapsed = now.saturating_duration_since(at);
+            if elapsed >= Duration::from_millis(100) {
+                self.network_speed = if bytes >= previous {
+                    (bytes - previous) as f32 / elapsed.as_secs_f32()
+                } else {
+                    0.0
+                };
+                self.network_sample = Some((now, bytes));
+            }
+        } else {
+            self.network_sample = Some((now, bytes));
+        }
+    }
+
     /// Забирает накопившиеся события и самый свежий кадр. Перерисовку просим
     /// только если что-то действительно изменилось.
     fn drain_events(&mut self, cx: &mut Context<Self>) {
@@ -886,6 +939,7 @@ impl VideoPlayer {
                     );
                     self.video_info = ready.video_info;
                     self.media_info = Some(ready.media_info);
+                    self.title = ready.title;
                     self.duration = ready.duration;
                     self.seekable = ready.seekable;
                     self.live = ready.live;
@@ -936,6 +990,7 @@ impl VideoPlayer {
                         network = ?stats.network,
                         "синхронизация"
                     );
+                    self.update_network_speed(stats.network.map(|network| network.bytes));
                     self.stats = Some(stats);
                 }
                 Event::Spectrum(bars) => self.spectrum = Some(bars),

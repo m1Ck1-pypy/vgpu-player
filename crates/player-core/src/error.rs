@@ -14,6 +14,42 @@ use symphonia::core::errors::Error as SymphoniaError;
 
 use crate::{Source, SourceError};
 
+/// Виды ошибок YouTube-резолвера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YoutubeErrorKind {
+    /// Ссылка ведёт на плейлист, канал или содержит неверный id.
+    NotAVideo,
+    /// Live пока не поддерживается: этап 8 — только VOD.
+    LiveUnsupported,
+    /// YouTube требует вход или проверку «вы не бот».
+    LoginRequired,
+    /// Видео с возрастным ограничением.
+    AgeRestricted,
+    /// Приватное, удалённое или недоступное в регионе видео.
+    Unavailable,
+    /// Ответ `/player` не содержит `hlsManifestUrl`.
+    NoHlsManifest,
+    /// Сеть, HTTP-статус или разбор JSON.
+    Api(String),
+    /// Открытие отменено.
+    Cancelled,
+}
+
+impl std::fmt::Display for YoutubeErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAVideo => formatter.write_str("ссылка не является видео"),
+            Self::LiveUnsupported => formatter.write_str("live пока не поддерживается"),
+            Self::LoginRequired => formatter.write_str("требуется вход или проверка"),
+            Self::AgeRestricted => formatter.write_str("видео с возрастным ограничением"),
+            Self::Unavailable => formatter.write_str("видео недоступно"),
+            Self::NoHlsManifest => formatter.write_str("не удалось получить HLS-манифест"),
+            Self::Api(reason) => write!(formatter, "ошибка API: {reason}"),
+            Self::Cancelled => formatter.write_str("открытие отменено"),
+        }
+    }
+}
+
 /// Что именно не удалось сделать с источником или устройством вывода.
 #[derive(Debug, thiserror::Error)]
 pub enum PlayerError {
@@ -96,6 +132,14 @@ pub enum PlayerError {
         target: Source,
         /// Причина в готовом для показа виде.
         reason: String,
+    },
+    /// Ошибка YouTube-резолвера.
+    #[error("YouTube: {kind}: {target}")]
+    Youtube {
+        /// Исходная ссылка YouTube (query скрывается `log_name`).
+        target: Source,
+        /// Вид ошибки.
+        kind: YoutubeErrorKind,
     },
     /// Сетевой источник ещё не подключён (этап 3).
     #[error("источник пока не поддерживается: {target}")]
@@ -232,6 +276,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "HLS: сегмент не скачался: https://example.com/v/index.m3u8?…"
+        );
+    }
+
+    #[test]
+    fn youtube_errors_name_the_kind_and_hide_query() {
+        let error = PlayerError::Youtube {
+            target: Source::Url("https://youtu.be/id?secret=1".to_owned()),
+            kind: YoutubeErrorKind::NotAVideo,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "YouTube: ссылка не является видео: https://youtu.be/id?…"
         );
     }
 

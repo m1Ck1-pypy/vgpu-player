@@ -14,3 +14,4 @@ Thumbs.db
 # Скрипт генерации — в assets/test/README.md.
 /assets/test/*
 !/assets/test/README.md
+docs

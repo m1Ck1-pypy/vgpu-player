@@ -11,11 +11,13 @@
 //! # }
 //! ```
 
+use std::time::Duration;
+
 use gpui::{
     App, Bounds, Div, Entity, Pixels, Rgba, SharedString, Stateful, canvas, div, point, prelude::*,
     px, relative, size,
 };
-use player_core::{SpectrumBars, SyncStats};
+use player_core::{MediaInfo, SpectrumBars, SyncStats, VideoInfo};
 
 use crate::VideoPlayer;
 use crate::icons::{Icon, LARGE_ICON_SIZE, icon};
@@ -53,11 +55,18 @@ enum Action {
 pub fn video_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
     let (state, has_video, has_frame, stats_text, can_retry, placeholder, spectrum, buffering) = {
         let video = player.read(cx);
+        let details = OverlayDetails {
+            position: video.position(),
+            duration: video.duration(),
+            video_info: video.video_info(),
+            media_info: video.media_info(),
+            speed: video.network_speed(),
+        };
         (
             video.state(),
             video.video_info().is_some(),
             video.frame().is_some(),
-            stats_overlay(video.stats(), video.stats_visible()),
+            stats_overlay(video.stats(), video.stats_visible(), &details),
             video.can_retry(),
             describe(video.state(), video.error()),
             video.spectrum(),
@@ -354,6 +363,135 @@ fn format_stats(stats: SyncStats) -> String {
     text
 }
 
+/// Что показать во втором блоке оверлея: контекст источника.
+struct OverlayDetails<'a> {
+    position: Duration,
+    duration: Option<Duration>,
+    video_info: Option<VideoInfo>,
+    media_info: Option<&'a MediaInfo>,
+    /// Текущая скорость сети, байт/с; 0 — ещё нет двух срезов.
+    speed: f32,
+}
+
+/// Собирает полный текст оверлея: счётчики и второй блок с контекстом.
+fn format_overlay(stats: SyncStats, details: &OverlayDetails<'_>) -> String {
+    let mut text = format_stats(stats);
+    let extra = format_details(stats, details);
+    if !extra.is_empty() {
+        text.push('\n');
+        text.push_str(&extra);
+    }
+    text
+}
+
+/// Второй блок: позиция/длительность, кодек, скорость, окно и буфер.
+fn format_details(stats: SyncStats, details: &OverlayDetails<'_>) -> String {
+    let mut lines = Vec::new();
+
+    let mut position = format!("pos {}", format_clock(details.position));
+    if let Some(duration) = details.duration {
+        position.push_str(&format!(" / {}", format_clock(duration)));
+    }
+    position.push_str(&format!(" · shown {}", stats.shown));
+    if details.speed > 0.0 {
+        position.push_str(&format!(" · {}", format_speed(details.speed)));
+    }
+    lines.push(position);
+
+    if let Some(codec) = format_codecs(details) {
+        lines.push(codec);
+    }
+
+    if let Some(network) = stats.network {
+        let mut media = Vec::new();
+        if network.window_bytes > 0 {
+            media.push(format!(
+                "window v {} / a {}",
+                format_mb(network.window_video_bytes),
+                format_mb(network.window_audio_bytes)
+            ));
+        }
+        if let Some(buffer) = network.buffer_ahead {
+            media.push(format!("buf {:.1} s", buffer.as_secs_f64()));
+        }
+        if !media.is_empty() {
+            lines.push(media.join(" · "));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// `h264 1920x1080@25 · aac 2ch 44.1 kHz`; пропускает неизвестные части.
+fn format_codecs(details: &OverlayDetails<'_>) -> Option<String> {
+    let mut parts = Vec::new();
+
+    let video = details.media_info.and_then(|media| media.video.as_ref());
+    let width = video
+        .map(|track| track.width)
+        .or(details.video_info.map(|info| info.width));
+    let height = video
+        .map(|track| track.height)
+        .or(details.video_info.map(|info| info.height));
+    let frame_rate = video
+        .and_then(|track| track.frame_rate)
+        .or(details.video_info.and_then(|info| info.frame_rate));
+    if let (Some(width), Some(height)) = (width, height) {
+        let mut part = String::new();
+        if let Some(codec) = video.and_then(|track| track.codec.as_deref()) {
+            part.push_str(codec);
+            part.push(' ');
+        }
+        part.push_str(&format!("{width}x{height}"));
+        if let Some(fps) = frame_rate {
+            part.push_str(&format!("@{}", format_fps(fps)));
+        }
+        parts.push(part);
+    }
+
+    if let Some(audio) = details.media_info.and_then(|media| media.audio.as_ref()) {
+        let mut part = String::new();
+        if let Some(codec) = audio.codec.as_deref() {
+            part.push_str(codec);
+            part.push(' ');
+        }
+        part.push_str(&format!("{}ch", audio.channels));
+        if audio.sample_rate > 0 {
+            part.push_str(&format!(" {:.1} kHz", audio.sample_rate as f64 / 1000.0));
+        }
+        parts.push(part);
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// `m:ss` до часа и `h:mm:ss` дальше.
+fn format_clock(position: Duration) -> String {
+    let total = position.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Байты в секунду как `12.3 MB/s`.
+fn format_speed(bytes_per_second: f32) -> String {
+    format!("{:.1} MB/s", bytes_per_second as f64 / (1024.0 * 1024.0))
+}
+
+/// Целая частота кадров без дробной части: `25`, `29.97`.
+fn format_fps(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.05 {
+        format!("{:.0}", fps)
+    } else {
+        format!("{fps:.2}")
+    }
+}
+
 /// Байты в мегабайтах с одним знаком: `12.3 MB`.
 fn format_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -363,11 +501,15 @@ fn format_mb(bytes: u64) -> String {
 ///
 /// Выключенный оверлей не просто прозрачен — строки нет вовсе, иначе она
 /// продолжала бы занимать место в разметке и мешать кадру.
-fn stats_overlay(stats: Option<SyncStats>, visible: bool) -> Option<String> {
+fn stats_overlay(
+    stats: Option<SyncStats>,
+    visible: bool,
+    details: &OverlayDetails<'_>,
+) -> Option<String> {
     if !visible {
         return None;
     }
-    stats.map(format_stats)
+    stats.map(|stats| format_overlay(stats, details))
 }
 
 /// Прямоугольник кадра внутри `bounds` с сохранением пропорций.
@@ -434,7 +576,17 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use player_core::NetworkStats;
+    use player_core::{AudioTrackInfo, MediaInfo, NetworkStats, VideoTrackInfo};
+
+    fn details<'a>(media: Option<&'a MediaInfo>) -> OverlayDetails<'a> {
+        OverlayDetails {
+            position: Duration::ZERO,
+            duration: None,
+            video_info: None,
+            media_info: media,
+            speed: 0.0,
+        }
+    }
 
     fn bounds(width: f32, height: f32) -> Bounds<Pixels> {
         Bounds {
@@ -510,11 +662,86 @@ mod tests {
                 retries: 1,
                 restarts: 0,
                 cache_bytes: 26_000_000,
+                window_bytes: 0,
+                window_video_bytes: 0,
+                window_audio_bytes: 0,
+                buffer_ahead: None,
             }),
         };
         assert_eq!(
             format_stats(stats),
             "60.0 fps · drop 40 · lag 0 ms\nnet: 14 req · 24.8 MB · slow 9 (2.5 s) · retries 1\ncache: 24.8 MB"
+        );
+    }
+
+    #[test]
+    fn hls_window_and_buffer_get_their_own_line() {
+        let stats = SyncStats {
+            shown: 100,
+            dropped: 0,
+            lag: Duration::ZERO,
+            fps: 58.6,
+            network: Some(NetworkStats {
+                requests: 21,
+                bytes: 21_600_000,
+                slow_reads: 18,
+                slow_ms: 19_400,
+                retries: 0,
+                restarts: 0,
+                cache_bytes: 0,
+                window_bytes: 12_300_000,
+                window_video_bytes: 9_400_000,
+                window_audio_bytes: 2_900_000,
+                buffer_ahead: Some(Duration::from_secs_f64(12.4)),
+            }),
+        };
+
+        let text = format_overlay(stats, &details(None));
+        assert!(
+            text.contains("window v 9.0 MB / a 2.8 MB · buf 12.4 s"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn details_show_position_codecs_and_speed() {
+        let media = MediaInfo {
+            container: Some("HLS".to_owned()),
+            video: Some(VideoTrackInfo {
+                codec: Some("h264".to_owned()),
+                width: 1920,
+                height: 1080,
+                frame_rate: Some(25.0),
+            }),
+            audio: Some(AudioTrackInfo {
+                codec: Some("aac".to_owned()),
+                channels: 2,
+                sample_rate: 44_100,
+            }),
+        };
+        let stats = SyncStats {
+            shown: 1450,
+            dropped: 0,
+            lag: Duration::ZERO,
+            fps: 60.0,
+            network: None,
+        };
+        let details = OverlayDetails {
+            position: Duration::from_secs(83),
+            duration: Some(Duration::from_secs(296)),
+            video_info: None,
+            media_info: Some(&media),
+            speed: 4.2 * 1024.0 * 1024.0,
+        };
+
+        let text = format_overlay(stats, &details);
+        assert!(
+            text.contains("pos 1:23 / 4:56 · shown 1450 · 4.2 MB/s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("h264 1920x1080@25 · aac 2ch 44.1 kHz"),
+            "{text}"
         );
     }
 
@@ -533,6 +760,10 @@ mod tests {
                 retries: 0,
                 restarts: 2,
                 cache_bytes: 0,
+                window_bytes: 0,
+                window_video_bytes: 0,
+                window_audio_bytes: 0,
+                buffer_ahead: None,
             }),
         };
         assert!(format_stats(stats).contains("restarts 2"));
@@ -547,12 +778,13 @@ mod tests {
             fps: 30.0,
             network: None,
         };
+        let details = details(None);
         assert_eq!(
-            stats_overlay(Some(stats), true).as_deref(),
-            Some("30.0 fps · drop 0 · lag 0 ms")
+            stats_overlay(Some(stats), true, &details).as_deref(),
+            Some("30.0 fps · drop 0 · lag 0 ms\npos 0:00 · shown 100")
         );
-        assert_eq!(stats_overlay(Some(stats), false), None);
-        assert_eq!(stats_overlay(None, true), None);
+        assert_eq!(stats_overlay(Some(stats), false, &details), None);
+        assert_eq!(stats_overlay(None, true, &details), None);
     }
 
     #[test]

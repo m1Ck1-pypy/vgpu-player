@@ -186,6 +186,10 @@ fn demuxed_hls_vod_opens_both_tracks_and_counts_traffic() {
     assert!(network.requests >= 5, "{network:?}");
     assert!(network.bytes > 0, "{network:?}");
     assert_eq!(network.cache_bytes, 0, "у HLS нет блочного кэша");
+    assert!(
+        network.window_bytes > 0,
+        "у HLS занято окно сегментов: {network:?}"
+    );
 
     let target = Duration::from_millis(500);
     player.send(Command::Seek(target)).expect("Seek");
@@ -238,6 +242,70 @@ fn demuxed_hls_vod_opens_both_tracks_and_counts_traffic() {
 }
 
 #[test]
+fn demuxed_hls_seek_forward_then_back_resumes() {
+    let Some(directory) = generate_demuxed_long() else {
+        eprintln!("ffmpeg недоступен — пропускаем перемотку вперёд-назад");
+        return;
+    };
+    let server = AssetServer::start(directory);
+    let player = Player::open(Source::Url(server.url("/master.m3u8"))).expect("поток ядра");
+    let mut pump = Pump::default();
+
+    let ready = pump.ready(&player, READY_TIMEOUT);
+    assert!(ready.seekable, "длинный VOD перематывается");
+
+    player.send(Command::Play).expect("Play");
+    assert!(
+        pump.wait_frames(&player, 3, PLAY_TIMEOUT),
+        "кадры до перемотки не пришли; последняя ошибка: {:?}",
+        pump.last_error
+    );
+
+    let forward = Duration::from_secs(20);
+    player.send(Command::Seek(forward)).expect("Seek вперёд");
+    match pump.pump_until(&player, PLAY_TIMEOUT, |event| {
+        matches!(event, Event::Seeked(_))
+    }) {
+        Some(Event::Seeked(position)) => assert!(
+            position >= forward.saturating_sub(Duration::from_millis(250)),
+            "Seeked {position:?}, цель {forward:?}"
+        ),
+        other => panic!(
+            "Seeked вперёд не пришёл: {other:?}; последняя ошибка: {:?}",
+            pump.last_error
+        ),
+    }
+    let after_forward = pump.frames;
+    assert!(
+        pump.wait_frames(&player, after_forward + 2, PLAY_TIMEOUT),
+        "кадры после перемотки вперёд не пришли; последняя ошибка: {:?}",
+        pump.last_error
+    );
+
+    let back = Duration::from_secs(2);
+    player.send(Command::Seek(back)).expect("Seek назад");
+    match pump.pump_until(&player, PLAY_TIMEOUT, |event| {
+        matches!(event, Event::Seeked(_))
+    }) {
+        Some(Event::Seeked(position)) => assert!(
+            position >= back.saturating_sub(Duration::from_millis(250)),
+            "Seeked {position:?}, цель {back:?}"
+        ),
+        other => panic!(
+            "Seeked назад не пришёл: {other:?}; последняя ошибка: {:?}",
+            pump.last_error
+        ),
+    }
+    let after_back = pump.frames;
+    assert!(
+        pump.wait_frames(&player, after_back + 2, PLAY_TIMEOUT),
+        "кадры после перемотки назад не пришли (баг); последняя ошибка: {:?}",
+        pump.last_error
+    );
+    let _ = player.send(Command::Stop);
+}
+
+#[test]
 fn demuxed_fmp4_hls_plays_and_seeks() {
     let Some(directory) = generate_demuxed_fmp4() else {
         eprintln!("ffmpeg недоступен — пропускаем demuxed fMP4");
@@ -283,6 +351,70 @@ fn demuxed_fmp4_hls_plays_and_seeks() {
 
     assert_eq!(server.hits("/v/init.mp4"), 1, "видео-init один раз");
     assert_eq!(server.hits("/a/init.mp4"), 1, "аудио-init один раз");
+}
+
+#[test]
+fn demuxed_fmp4_seek_forward_then_back_resumes() {
+    let Some(directory) = generate_demuxed_fmp4_long() else {
+        eprintln!("ffmpeg недоступен — пропускаем fMP4 вперёд-назад");
+        return;
+    };
+    let server = AssetServer::start(directory);
+    let player = Player::open(Source::Url(server.url("/master.m3u8"))).expect("поток ядра");
+    let mut pump = Pump::default();
+
+    let ready = pump.ready(&player, READY_TIMEOUT);
+    assert!(ready.seekable, "длинный fMP4 VOD перематывается");
+
+    player.send(Command::Play).expect("Play");
+    assert!(
+        pump.wait_frames(&player, 3, PLAY_TIMEOUT),
+        "fMP4-кадры до перемотки не пришли; последняя ошибка: {:?}",
+        pump.last_error
+    );
+
+    let forward = Duration::from_secs(20);
+    player.send(Command::Seek(forward)).expect("Seek вперёд");
+    match pump.pump_until(&player, PLAY_TIMEOUT, |event| {
+        matches!(event, Event::Seeked(_))
+    }) {
+        Some(Event::Seeked(position)) => assert!(
+            position >= forward.saturating_sub(Duration::from_millis(250)),
+            "Seeked {position:?}, цель {forward:?}"
+        ),
+        other => panic!(
+            "Seeked вперёд не пришёл: {other:?}; последняя ошибка: {:?}",
+            pump.last_error
+        ),
+    }
+    let after_forward = pump.frames;
+    assert!(
+        pump.wait_frames(&player, after_forward + 2, PLAY_TIMEOUT),
+        "fMP4-кадры после перемотки вперёд не пришли; последняя ошибка: {:?}",
+        pump.last_error
+    );
+
+    let back = Duration::from_secs(2);
+    player.send(Command::Seek(back)).expect("Seek назад");
+    match pump.pump_until(&player, PLAY_TIMEOUT, |event| {
+        matches!(event, Event::Seeked(_))
+    }) {
+        Some(Event::Seeked(position)) => assert!(
+            position >= back.saturating_sub(Duration::from_millis(250)),
+            "Seeked {position:?}, цель {back:?}"
+        ),
+        other => panic!(
+            "Seeked назад не пришёл: {other:?}; последняя ошибка: {:?}",
+            pump.last_error
+        ),
+    }
+    let after_back = pump.frames;
+    assert!(
+        pump.wait_frames(&player, after_back + 2, PLAY_TIMEOUT),
+        "fMP4-кадры после перемотки назад не пришли (баг); последняя ошибка: {:?}",
+        pump.last_error
+    );
+    let _ = player.send(Command::Stop);
 }
 
 #[test]
@@ -727,6 +859,11 @@ fn generate_demuxed() -> Option<PathBuf> {
     generate_demuxed_ts(&directory, "2").then_some(directory)
 }
 
+fn generate_demuxed_long() -> Option<PathBuf> {
+    let directory = unique_dir("demuxed-long");
+    generate_demuxed_ts(&directory, "30").then_some(directory)
+}
+
 fn generate_demuxed_live_source() -> Option<PathBuf> {
     let directory = unique_dir("demuxed-live");
     generate_demuxed_ts(&directory, "30").then_some(directory)
@@ -765,8 +902,20 @@ fn generate_demuxed_ts(directory: &Path, seconds: &str) -> bool {
 
 fn generate_demuxed_fmp4() -> Option<PathBuf> {
     let directory = unique_dir("demuxed-fmp4");
-    std::fs::create_dir_all(directory.join("v")).ok()?;
-    std::fs::create_dir_all(directory.join("a")).ok()?;
+    generate_demuxed_fmp4_into(&directory, "2").then_some(directory)
+}
+
+fn generate_demuxed_fmp4_long() -> Option<PathBuf> {
+    let directory = unique_dir("demuxed-fmp4-long");
+    generate_demuxed_fmp4_into(&directory, "30").then_some(directory)
+}
+
+fn generate_demuxed_fmp4_into(directory: &Path, seconds: &str) -> bool {
+    if std::fs::create_dir_all(directory.join("v")).is_err()
+        || std::fs::create_dir_all(directory.join("a")).is_err()
+    {
+        return false;
+    }
 
     let fmp4 = [
         "-hls_segment_type",
@@ -775,27 +924,27 @@ fn generate_demuxed_fmp4() -> Option<PathBuf> {
         "init.mp4",
     ];
     if !run_ffmpeg(
-        &directory,
+        directory,
         "v/index.m3u8",
         &["-an"],
         Some("v/seg%03d.m4s"),
-        "2",
+        seconds,
         &fmp4,
     ) {
-        return None;
+        return false;
     }
     if !run_ffmpeg(
-        &directory,
+        directory,
         "a/index.m3u8",
         &["-vn"],
         Some("a/seg%03d.m4s"),
-        "2",
+        seconds,
         &fmp4,
     ) {
-        return None;
+        return false;
     }
 
-    write_demuxed_master(&directory).then_some(directory)
+    write_demuxed_master(directory)
 }
 
 fn write_demuxed_master(directory: &Path) -> bool {

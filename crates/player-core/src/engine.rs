@@ -800,6 +800,7 @@ impl<'a> Engine<'a> {
                 slow_ms = network.map(|stats| stats.slow_ms),
                 retries = network.map(|stats| stats.retries),
                 cache_bytes = network.map(|stats| stats.cache_bytes),
+                window_bytes = network.map(|stats| stats.window_bytes),
                 "состояние синхронизации"
             );
             let _ = self.events.send(Event::Stats(snapshot));

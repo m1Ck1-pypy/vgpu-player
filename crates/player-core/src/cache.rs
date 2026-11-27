@@ -156,6 +156,11 @@ impl CacheCounters {
             restarts: self.restarts.load(Ordering::Relaxed),
             // Занятость кэша знает только `Cache::network_stats`.
             cache_bytes: 0,
+            // Окно HLS знает только `HlsSource::network_stats`.
+            window_bytes: 0,
+            window_video_bytes: 0,
+            window_audio_bytes: 0,
+            buffer_ahead: None,
         }
     }
 }
