@@ -6,7 +6,7 @@
 для Windows. Учебный проект: цель — понять каждую строку и научиться Rust, а не
 сделать конкурирующий плеер.
 
-Версия 0.4.0. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
+Версия 0.4.1. Этапы 0–13 приняты: звук и видео, A/V-синхронизация по
 аудио-часам, управление, надёжность, пул BGRA-буферов, полировка интерфейса,
 библиотека `player-gpui`, установщики, ассоциации файлов, автовоспроизведение,
 сохранение настроек, спектроанализатор для аудиофайлов.
@@ -215,8 +215,8 @@ volume = 0.8
 
 ```bash
 just portable        # release-exe + dist/vgpu-player/ (exe + DLL)
-just installer-inno  # dist/vgpu-player-0.4.0-setup.exe
-just installer-msi   # dist/vgpu-player-0.4.0.msi
+just installer-inno  # dist/vgpu-player-0.4.1-setup.exe
+just installer-msi   # dist/vgpu-player-0.4.1.msi
 just installers      # portable + оба установщика
 ```
 

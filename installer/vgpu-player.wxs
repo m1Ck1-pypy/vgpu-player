@@ -9,7 +9,7 @@
         Id="*"
         Name="VGPU Player"
         Language="1033"
-        Version="0.4.0"
+        Version="0.4.1"
         Manufacturer="VGPU Player"
         UpgradeCode="{C2D7A4F0-5B8E-4A31-9C6D-3F1E8B2A7D90}"
     >

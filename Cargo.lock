@@ -4344,7 +4344,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "player-app"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -4355,7 +4355,7 @@ dependencies = [
 
 [[package]]
 name = "player-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "player-core",
@@ -4365,7 +4365,7 @@ dependencies = [
 
 [[package]]
 name = "player-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam-channel",
  "ffmpeg-next",
@@ -4382,7 +4382,7 @@ dependencies = [
 
 [[package]]
 name = "player-gpui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "gpui-fast",
  "gpui-fast-platform",
