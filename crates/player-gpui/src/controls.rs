@@ -31,6 +31,12 @@ const VOLUME_SLIDER_WIDTH: f32 = 120.0;
 /// попасть мышью.
 const MIN_PROGRESS_WIDTH: f32 = 120.0;
 
+/// Ширина подсказки времени над полосой прогресса.
+///
+/// Ширина фиксирована, чтобы центрировать подсказку по доле без доступа к
+/// реальным размерам текста при раскладке: время всегда `чч:мм:сс`.
+const SEEK_TOOLTIP_WIDTH: f32 = 60.0;
+
 /// Диаметр бегунка ползунка громкости.
 const KNOB_SIZE: f32 = 12.0;
 
@@ -103,6 +109,13 @@ fn progress_ratio(position: Duration, duration: Option<Duration>) -> f32 {
     (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0) as f32
 }
 
+/// Время, на которое перемотает клик по доле полосы.
+///
+/// Без известной длительности подсказка бессмысленна: `None`.
+fn seek_time(ratio: f32, duration: Option<Duration>) -> Option<Duration> {
+    duration.map(|duration| duration.mul_f32(ratio.clamp(0.0, 1.0)))
+}
+
 /// Можно ли тащить полосу прогресса.
 ///
 /// Без известной длительности и без перемотки слайдер бесполезен: ядро всё
@@ -132,6 +145,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         duration,
         fullscreen,
         volume_hover,
+        progress_hover,
         seekable,
         volume_panel_open,
     ) = {
@@ -144,6 +158,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
             video.duration(),
             video.fullscreen(),
             video.volume_hover(),
+            video.progress_hover(),
             video.seekable(),
             video.volume_panel_open(),
         )
@@ -157,6 +172,10 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
         None => format_clock(position),
     };
     let effective_volume = if muted { 0.0 } else { volume };
+
+    // Текст подсказки над полосой: время под курсором, если оно известно.
+    let seek_tooltip = progress_hover
+        .and_then(|ratio| seek_time(ratio, duration).map(|time| (ratio, format_clock(time))));
 
     let play_pause_target = player.clone();
     let (play_pause_icon, play_pause_label) = match state {
@@ -228,6 +247,7 @@ pub fn controls_view(player: &Entity<VideoPlayer>, cx: &App) -> Div {
                 player,
                 SliderKind::Progress,
                 progress_enabled(state, seekable, duration),
+                seek_tooltip,
             )
             .flex_1()
             .min_w(px(MIN_PROGRESS_WIDTH)),
@@ -324,8 +344,15 @@ fn volume_panel(
                 }),
         )
         .child(
-            slider("vgpu-volume", volume, player, SliderKind::Volume, true)
-                .w(px(VOLUME_SLIDER_WIDTH)),
+            slider(
+                "vgpu-volume",
+                volume,
+                player,
+                SliderKind::Volume,
+                true,
+                None,
+            )
+            .w(px(VOLUME_SLIDER_WIDTH)),
         )
         .child(
             div()
@@ -371,12 +398,16 @@ fn icon_button(
 ///
 /// У ползунка громкости дополнительно обновляется hover-процент и очищается
 /// при уходе курсора — по нему панель показывает процент под курсором.
+///
+/// `tooltip` — готовый текст времени под курсором и его доля: он нужен только
+/// полосе прогресса, поэтому громкость передаёт `None`.
 fn slider(
     id: &'static str,
     ratio: f32,
     player: &Entity<VideoPlayer>,
     kind: SliderKind,
     enabled: bool,
+    tooltip: Option<(f32, String)>,
 ) -> Stateful<Div> {
     let ratio = ratio.clamp(0.0, 1.0);
     let top = (SLIDER_HEIGHT - SLIDER_TRACK_HEIGHT) / 2.0;
@@ -430,15 +461,26 @@ fn slider(
             if event.dragging() {
                 drag_entity.update(cx, |video, cx| drag(video, event.position.x, cx));
             }
-            if matches!(kind, SliderKind::Volume) {
-                hover_entity.update(cx, |video, cx| {
+            match kind {
+                SliderKind::Progress => hover_entity.update(cx, |video, cx| {
+                    video.hover_progress_from_x(event.position.x, cx);
+                }),
+                SliderKind::Volume => hover_entity.update(cx, |video, cx| {
                     video.hover_volume_from_x(event.position.x, cx);
-                });
+                }),
             }
         })
         .on_hover(move |hovered, _, cx: &mut App| {
-            if !hovered && matches!(kind, SliderKind::Volume) {
-                hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
+            if *hovered {
+                return;
+            }
+            match kind {
+                SliderKind::Progress => {
+                    hover_out_entity.update(cx, |video, cx| video.set_progress_hover(None, cx));
+                }
+                SliderKind::Volume => {
+                    hover_out_entity.update(cx, |video, cx| video.set_volume_hover(None, cx));
+                }
             }
         })
         .on_mouse_up(MouseButton::Left, move |_, _, cx: &mut App| {
@@ -490,7 +532,7 @@ fn slider(
         );
     }
 
-    root.child(
+    root = root.child(
         div().absolute().top_0().left_0().size_full().child(
             canvas(
                 move |bounds, _window, cx| {
@@ -500,7 +542,31 @@ fn slider(
             )
             .size_full(),
         ),
-    )
+    );
+
+    if let Some((hover_ratio, text)) = tooltip {
+        // Подсказка стоит над слайдером и центрирована по доле курсора.
+        // Ширина фиксирована, поэтому сдвиг на половину ширины достаточен.
+        root = root.child(
+            div()
+                .absolute()
+                .left(relative(hover_ratio))
+                .bottom(px(SLIDER_HEIGHT))
+                .ml(px(-SEEK_TOOLTIP_WIDTH / 2.0))
+                .w(px(SEEK_TOOLTIP_WIDTH))
+                .py_1()
+                .rounded_sm()
+                .bg(gpui::rgba(theme::NOTICE_BG))
+                .text_color(gpui::rgb(theme::TEXT))
+                .text_xs()
+                .whitespace_nowrap()
+                .flex()
+                .justify_center()
+                .child(text),
+        );
+    }
+
+    root
 }
 
 #[cfg(test)]
@@ -556,6 +622,17 @@ mod tests {
             progress_ratio(Duration::from_secs(5), Some(Duration::ZERO)),
             0.0
         );
+    }
+
+    #[test]
+    fn seek_tooltip_maps_ratio_to_time() {
+        let duration = Some(Duration::from_secs(200));
+        assert_eq!(seek_time(0.0, duration), Some(Duration::ZERO));
+        assert_eq!(seek_time(0.5, duration), Some(Duration::from_secs(100)));
+        // Доля за краем полосы ограничивается концом файла.
+        assert_eq!(seek_time(1.5, duration), Some(Duration::from_secs(200)));
+        // Без длительности подсказка не имеет смысла.
+        assert_eq!(seek_time(0.5, None), None);
     }
 
     #[test]

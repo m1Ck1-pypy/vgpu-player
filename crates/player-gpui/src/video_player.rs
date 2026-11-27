@@ -140,6 +140,10 @@ pub struct VideoPlayer {
     /// Доля громкости под курсором, пока он над ползунком: предпросмотр
     /// процента в выдвижной панели. `None` — курсор вне ползунка.
     volume_hover: Option<f32>,
+    /// Доля полосы прогресса под курсором: время для подсказки над слайдером.
+    /// `None` — курсор вне полосы. Хранится долей, а не временем, чтобы
+    /// подсказка оставалась верной, пока UI пересчитывает длительность.
+    progress_hover: Option<f32>,
     /// Открыта ли выдвижная панель громкости (значок динамика в панели).
     volume_panel_open: bool,
     muted: bool,
@@ -186,6 +190,7 @@ impl VideoPlayer {
             stats_visible: false,
             fullscreen: false,
             volume_hover: None,
+            progress_hover: None,
             volume_panel_open: false,
             muted: false,
             autoplay: true,
@@ -714,6 +719,28 @@ impl VideoPlayer {
         self.volume_hover
     }
 
+    /// Доля полосы прогресса под курсором (`0..=1`), пока он над ней.
+    pub(crate) fn progress_hover(&self) -> Option<f32> {
+        self.progress_hover
+    }
+
+    /// Обновляет время подсказки по координате курсора над полосой прогресса.
+    pub(crate) fn hover_progress_from_x(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(bounds) = self.progress_bounds else {
+            return;
+        };
+        self.set_progress_hover(Some(ratio_at(bounds, x)), cx);
+    }
+
+    /// Включает и выключает подсказку времени при входе/уходе курсора.
+    pub(crate) fn set_progress_hover(&mut self, ratio: Option<f32>, cx: &mut Context<Self>) {
+        let ratio = ratio.map(|value| value.clamp(0.0, 1.0));
+        if self.progress_hover != ratio {
+            self.progress_hover = ratio;
+            cx.notify();
+        }
+    }
+
     /// Показывает процент громкости для позиции курсора над ползунком.
     pub(crate) fn hover_volume_from_x(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some(bounds) = self.volume_bounds else {
@@ -799,6 +826,7 @@ impl VideoPlayer {
         self.seek_hint = None;
         self.volume_scrubbing = false;
         self.volume_hover = None;
+        self.progress_hover = None;
         self.volume_panel_open = false;
     }
 
